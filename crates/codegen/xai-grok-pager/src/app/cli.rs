@@ -759,6 +759,7 @@ pub struct PagerArgs {
     pub no_leader: bool,
     // oc-build: opencode backend
     /// Run the TUI against an opencode v2 server (`opencode serve`) at URL instead of the built-in agent.
+    /// Setting env `OPENCODE_URL` alone (without this flag) also enables opencode mode.
     /// The server password is read from `OPENCODE_PASSWORD`.
     #[arg(long = "opencode-url", value_name = "URL", env = "OPENCODE_URL")]
     pub opencode_url: Option<String>,
