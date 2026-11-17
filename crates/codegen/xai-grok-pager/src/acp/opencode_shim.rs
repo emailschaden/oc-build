@@ -9,15 +9,21 @@
 //! `session/update` notifications until the execution ends, `session/cancel`
 //! interrupts it, and `permission.asked` becomes `session/request_permission`.
 //!
-//! `x.ai/*` extension calls are answered with stubs; each one is appended to
-//! `$TMPDIR/oc-shim-ext.log` (see [`ext_log`]) so the set the TUI really uses
-//! can be audited.
+//! The model list comes from `GET /api/model` and `session/set_model` switches the
+//! opencode session's model. A rejected permission is replied with a message (the
+//! user's feedback or [`DEFAULT_REJECT_MESSAGE`]) so the model continues the turn.
+//!
+//! `x.ai/*` extension calls are answered with stubs. Each call and turn step is
+//! logged at debug level (target `oc_shim`) and, when env `OC_SHIM_LOG=<path>`
+//! is set, appended to that file (see [`ext_log`]) so the set the TUI really
+//! uses can be audited.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::{self as acp, Client as _};
@@ -38,6 +44,12 @@ pub const DEFAULT_MODEL: &str = "opencode/big-pickle";
 /// Auth method advertised so the pager's eager-auth step succeeds without a login screen
 /// (an empty list is treated as "needs login").
 const AUTH_METHOD_ID: &str = "opencode";
+/// Sent with a reject that has no typed feedback. opencode ends the run on a bare
+/// reject; with a message the model gets it as the tool error and continues.
+const DEFAULT_REJECT_MESSAGE: &str =
+    "The user rejected this tool call. Do not retry it; ask the user how to proceed.";
+/// Shown in the rejected tool block.
+const REJECTED_LABEL: &str = "Rejected by user";
 /// How long a cancelled turn waits for `session.execution.interrupted` before giving up.
 const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
 
@@ -65,14 +77,7 @@ async fn spawn_opencode_shim(
     cancel: &CancellationToken,
     config: OpencodeConfig,
 ) -> Result<SpawnedAgent> {
-    let (provider_id, model_id) = config
-        .model
-        .split_once('/')
-        .context("--opencode-model must be provider/id")?;
-    let model = Model {
-        id: model_id.to_owned(),
-        provider_id: provider_id.to_owned(),
-    };
+    let model = parse_model_id(&config.model).context("--opencode-model must be provider/id")?;
     let client = Client::new(config.url.clone(), config.password.clone())
         .context("failed to build the opencode client")?;
     let directory = std::env::current_dir().context("failed to resolve cwd")?;
@@ -102,6 +107,8 @@ async fn spawn_opencode_shim(
                 model,
                 model_label: config.model,
                 directory,
+                catalog: RefCell::new(None),
+                session_models: RefCell::new(HashMap::new()),
                 active: RefCell::new(HashMap::new()),
                 started: Instant::now(),
             }));
@@ -129,27 +136,44 @@ struct OpencodeShim {
     model: Model,
     model_label: String,
     directory: PathBuf,
+    /// `GET /api/model`, fetched once.
+    catalog: RefCell<Option<Vec<acp::ModelInfo>>>,
+    /// Model id (`provider/id`) chosen via `session/set_model`, keyed by session id.
+    session_models: RefCell<HashMap<String, String>>,
     /// Cancel token of the running turn, keyed by session id.
     active: RefCell<HashMap<String, CancellationToken>>,
     started: Instant,
 }
 
 impl OpencodeShim {
-    fn model_state(&self) -> acp::SessionModelState {
-        acp::SessionModelState::new(
-            self.model_label.clone(),
-            vec![acp::ModelInfo::new(
-                self.model_label.clone(),
-                self.model_label.clone(),
-            )],
-        )
+    /// The model picker state for `session_id` (or a new session when `None`).
+    async fn model_state(&self, session_id: Option<&str>) -> acp::SessionModelState {
+        let current = session_id
+            .and_then(|sid| self.session_models.borrow().get(sid).cloned())
+            .unwrap_or_else(|| self.model_label.clone());
+        acp::SessionModelState::new(current, self.available_models().await)
+    }
+
+    async fn available_models(&self) -> Vec<acp::ModelInfo> {
+        if let Some(models) = self.catalog.borrow().as_ref() {
+            return models.clone();
+        }
+        let listed = match self.client.list_models().await {
+            Ok(listed) => listed,
+            Err(err) => {
+                // Not cached, so a later session retries.
+                tracing::warn!(error = %err, "opencode list_models failed");
+                return model_infos(&[], &self.model_label);
+            }
+        };
+        let models = model_infos(&listed, &self.model_label);
+        self.log(&format!("models: {} listed", models.len()));
+        *self.catalog.borrow_mut() = Some(models.clone());
+        models
     }
 
     fn log(&self, line: &str) {
-        ext_log(&format!(
-            "+{:.3}s {line}",
-            self.started.elapsed().as_secs_f64()
-        ));
+        log_since(self.started, line);
     }
 
     fn notify(
@@ -176,22 +200,24 @@ impl OpencodeShim {
         let mut events = Box::pin(self.client.events().await.map_err(oc_error)?);
         self.client.prompt(&sid, text).await.map_err(oc_error)?;
 
-        let mut tools: HashMap<String, ToolState> = HashMap::new();
-        let mut started = false;
+        let mut turn = TurnState::new(
+            sid.clone(),
+            self.directory.display().to_string(),
+            self.started,
+        );
         let interrupt_deadline = tokio::time::sleep(Duration::MAX);
         tokio::pin!(interrupt_deadline);
-        let mut cancelling = false;
 
         loop {
             let event = tokio::select! {
-                () = cancel.cancelled(), if !cancelling => {
-                    cancelling = true;
+                () = cancel.cancelled(), if !turn.cancelling => {
+                    turn.cancelling = true;
                     interrupt_deadline
                         .as_mut()
                         .reset(tokio::time::Instant::now() + INTERRUPT_GRACE);
                     continue;
                 }
-                () = &mut interrupt_deadline, if cancelling => {
+                () = &mut interrupt_deadline, if turn.cancelling => {
                     self.log("turn: no interrupted event within grace; reporting cancelled");
                     return Ok(acp::StopReason::Cancelled);
                 }
@@ -204,199 +230,30 @@ impl OpencodeShim {
                     None => return Err(acp_error("opencode event stream ended")),
                 },
             };
-            if event.session_id() != Some(sid.as_str()) {
-                continue;
-            }
-            match event {
-                Event::ExecutionStarted { .. } => started = true,
-                Event::ExecutionSucceeded { .. } => {
-                    return Ok(if cancelling {
-                        acp::StopReason::Cancelled
-                    } else {
-                        acp::StopReason::EndTurn
-                    });
-                }
-                Event::ExecutionInterrupted { reason, .. } => {
-                    self.log(&format!("turn: interrupted reason={reason:?}"));
-                    return Ok(acp::StopReason::Cancelled);
-                }
-                Event::ExecutionFailed { error, .. } => {
-                    let message = error
-                        .map(|e| format!("{}: {}", e.kind, e.message))
-                        .unwrap_or_else(|| "unknown error".to_owned());
-                    return Err(acp_error(&format!("opencode execution failed: {message}")));
-                }
-                Event::Idle { .. } if started => {
-                    return Ok(if cancelling {
-                        acp::StopReason::Cancelled
-                    } else {
-                        acp::StopReason::EndTurn
-                    });
-                }
-                // After a cancel, stop painting new output.
-                _ if cancelling => {}
-                Event::TextDelta { delta, .. } => self.notify(
-                    session_id,
-                    &meta,
-                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(delta.into())),
-                ),
-                Event::ReasoningDelta { delta, .. } => self.notify(
-                    session_id,
-                    &meta,
-                    acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(delta.into())),
-                ),
-                Event::ToolInputStarted { id, name, .. } => {
-                    tools.insert(
-                        id,
-                        ToolState {
-                            name,
-                            command: None,
-                        },
-                    );
-                }
-                Event::ToolCalled { id, input, .. } => {
-                    let state = tools.entry(id.clone()).or_insert_with(|| ToolState {
-                        name: String::new(),
-                        command: None,
-                    });
-                    let kind = tool_kind(&state.name);
-                    let (title, raw_input) = if kind == acp::ToolKind::Execute {
-                        let command = input
-                            .get("command")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_owned();
-                        state.command = Some(command.clone());
-                        let raw = match input.get("description") {
-                            Some(desc) => {
-                                serde_json::json!({ "command": command, "description": desc })
-                            }
-                            None => serde_json::json!({ "command": command }),
-                        };
-                        (command, raw)
-                    } else {
-                        (format!("{} {}", state.name, compact(&input)), input)
-                    };
-                    self.log(&format!(
-                        "tool_call {id} {} kind={kind:?}: {title}",
-                        state.name
-                    ));
-                    self.notify(
-                        session_id,
-                        &meta,
-                        acp::SessionUpdate::ToolCall(
-                            acp::ToolCall::new(id, title)
-                                .kind(kind)
-                                .status(acp::ToolCallStatus::InProgress)
-                                .raw_input(raw_input),
-                        ),
-                    );
-                }
-                Event::ToolSuccess { id, content, .. } => {
-                    let output = tool_text(&content);
-                    self.log(&format!(
-                        "tool_success {id} output={}",
-                        compact(&output.as_str().into())
-                    ));
-                    let update = self.tool_result(tools.get(&id), &output, true);
-                    self.notify(
-                        session_id,
-                        &meta,
-                        acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(id, update)),
-                    );
-                }
-                Event::ToolFailed {
-                    id, error, content, ..
+            match turn.on_event(event) {
+                TurnStep::Ignore => {}
+                TurnStep::Update(update) => self.notify(session_id, &meta, update),
+                TurnStep::Permission {
+                    request_id,
+                    tool_call,
                 } => {
-                    let mut output = tool_text(&content);
-                    if !error.message.is_empty() {
-                        if !output.is_empty() {
-                            output.push('\n');
-                        }
-                        output.push_str(&error.message);
-                    }
-                    self.log(&format!(
-                        "tool_failed {id} output={}",
-                        compact(&output.as_str().into())
-                    ));
-                    let update = self.tool_result(tools.get(&id), &output, false);
-                    self.notify(
-                        session_id,
-                        &meta,
-                        acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(id, update)),
-                    );
-                }
-                Event::PermissionAsked {
-                    id,
-                    action,
-                    resources,
-                    source,
-                    ..
-                } => {
-                    let tool_call_id = source.and_then(|s| s.id).unwrap_or_else(|| id.clone());
-                    let tool = tools.get(&tool_call_id);
-                    let kind = tool.map_or_else(|| tool_kind(&action), |t| tool_kind(&t.name));
-                    let command = tool
-                        .and_then(|t| t.command.clone())
-                        .unwrap_or_else(|| resources.join(" "));
-                    let mut fields = acp::ToolCallUpdateFields::new()
-                        .kind(kind)
-                        .title(command.clone());
-                    if kind == acp::ToolKind::Execute {
-                        fields = fields.raw_input(serde_json::json!({ "command": command }));
-                    }
                     let request = acp::RequestPermissionRequest::new(
                         session_id.clone(),
-                        acp::ToolCallUpdate::new(tool_call_id, fields),
+                        tool_call,
                         permission_options(),
                     );
                     let shim = Rc::clone(self);
                     let sid = sid.clone();
                     tokio::task::spawn_local(async move {
-                        shim.ask_permission(sid, id, request).await;
+                        shim.ask_permission(sid, request_id, request).await;
                     });
                 }
-                _ => {}
+                TurnStep::Stop(reason) => return Ok(reason),
+                TurnStep::Fail(message) => {
+                    return Err(acp_error(&format!("opencode execution failed: {message}")));
+                }
             }
         }
-    }
-
-    fn tool_result(
-        &self,
-        tool: Option<&ToolState>,
-        output: &str,
-        success: bool,
-    ) -> acp::ToolCallUpdateFields {
-        let status = if success {
-            acp::ToolCallStatus::Completed
-        } else {
-            acp::ToolCallStatus::Failed
-        };
-        let mut fields = acp::ToolCallUpdateFields::new()
-            .status(status)
-            .content(vec![output.to_owned().into()]);
-        if let Some(command) = tool.and_then(|t| t.command.clone()) {
-            // The execute block renders its output from a Bash `raw_output`.
-            let bash = BashOutput {
-                output: output.as_bytes().to_vec(),
-                output_for_prompt: String::new(),
-                exit_code: if success { 0 } else { 1 },
-                command,
-                truncated: false,
-                signal: None,
-                timed_out: false,
-                description: None,
-                current_dir: self.directory.display().to_string(),
-                output_file: String::new(),
-                total_bytes: output.len(),
-                output_delta: None,
-                was_bare_echo: false,
-            };
-            if let Ok(value) = serde_json::to_value(ToolOutput::Bash(bash)) {
-                fields = fields.raw_output(value);
-            }
-        }
-        fields
     }
 
     async fn ask_permission(
@@ -405,26 +262,19 @@ impl OpencodeShim {
         request_id: String,
         request: acp::RequestPermissionRequest,
     ) {
-        let decision = match self.gateway.request_permission(request).await {
-            Ok(resp) => match resp.outcome {
-                acp::RequestPermissionOutcome::Selected(selected) => {
-                    match selected.option_id.0.as_ref() {
-                        "allow-once" => Decision::Once,
-                        "allow-always" => Decision::Always,
-                        _ => Decision::Reject,
-                    }
-                }
-                _ => Decision::Reject,
-            },
+        let (decision, message) = match self.gateway.request_permission(request).await {
+            Ok(resp) => permission_reply(&resp),
             Err(err) => {
                 tracing::warn!(error = %err, "request_permission failed; rejecting");
-                Decision::Reject
+                (Decision::Reject, None)
             }
         };
-        self.log(&format!("permission {request_id} -> {decision:?}"));
+        self.log(&format!(
+            "permission {request_id} -> {decision:?} message={message:?}"
+        ));
         if let Err(err) = self
             .client
-            .reply_permission(&sid, &request_id, decision, None)
+            .reply_permission(&sid, &request_id, decision, message.as_deref())
             .await
         {
             tracing::warn!(error = %err, "opencode reply_permission failed");
@@ -448,6 +298,308 @@ struct ToolState {
     command: Option<String>,
 }
 
+/// What the turn loop should do with one opencode event.
+#[derive(Debug)]
+enum TurnStep {
+    Ignore,
+    Update(acp::SessionUpdate),
+    /// Ask the TUI; `request_id` is the opencode permission id to reply to.
+    Permission {
+        request_id: String,
+        tool_call: acp::ToolCallUpdate,
+    },
+    Stop(acp::StopReason),
+    /// The execution failed; the turn ends with an error carrying this message.
+    Fail(String),
+}
+
+/// Per-turn translation state: opencode events in, [`TurnStep`]s out. No I/O
+/// besides [`ext_log`], so it is unit-testable.
+struct TurnState {
+    session_id: String,
+    /// Shown as the execute block's working directory.
+    directory: String,
+    log_epoch: Instant,
+    tools: HashMap<String, ToolState>,
+    started: bool,
+    /// Set once the TUI cancelled; new output is dropped from then on.
+    cancelling: bool,
+    /// Set once a tool call was rejected by the user.
+    rejected: bool,
+}
+
+impl TurnState {
+    fn new(session_id: String, directory: String, log_epoch: Instant) -> Self {
+        Self {
+            session_id,
+            directory,
+            log_epoch,
+            tools: HashMap::new(),
+            started: false,
+            cancelling: false,
+            rejected: false,
+        }
+    }
+
+    fn log(&self, line: &str) {
+        log_since(self.log_epoch, line);
+    }
+
+    fn end_reason(&self) -> acp::StopReason {
+        if self.cancelling {
+            acp::StopReason::Cancelled
+        } else {
+            acp::StopReason::EndTurn
+        }
+    }
+
+    fn on_event(&mut self, event: Event) -> TurnStep {
+        if event.session_id() != Some(self.session_id.as_str()) {
+            return TurnStep::Ignore;
+        }
+        match event {
+            Event::ExecutionStarted { .. } => {
+                self.started = true;
+                TurnStep::Ignore
+            }
+            Event::ExecutionSucceeded { .. } => TurnStep::Stop(self.end_reason()),
+            Event::ExecutionInterrupted { reason, .. } => {
+                self.log(&format!("turn: interrupted reason={reason:?}"));
+                // A bare reject makes opencode end the run with `shutdown`; that is
+                // the user's answer, not a cancelled turn.
+                if self.rejected && !self.cancelling && reason.as_deref() == Some("shutdown") {
+                    TurnStep::Stop(acp::StopReason::EndTurn)
+                } else {
+                    TurnStep::Stop(acp::StopReason::Cancelled)
+                }
+            }
+            Event::ExecutionFailed { error, .. } => TurnStep::Fail(
+                error
+                    .map(|e| format!("{}: {}", e.kind, e.message))
+                    .unwrap_or_else(|| "unknown error".to_owned()),
+            ),
+            Event::Idle { .. } if self.started => TurnStep::Stop(self.end_reason()),
+            // After a cancel, stop painting new output.
+            _ if self.cancelling => TurnStep::Ignore,
+            Event::TextDelta { delta, .. } => TurnStep::Update(
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(delta.into())),
+            ),
+            Event::ReasoningDelta { delta, .. } => TurnStep::Update(
+                acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(delta.into())),
+            ),
+            Event::ToolInputStarted { id, name, .. } => {
+                self.tools.insert(
+                    id,
+                    ToolState {
+                        name,
+                        command: None,
+                    },
+                );
+                TurnStep::Ignore
+            }
+            Event::ToolCalled { id, input, .. } => {
+                let state = self.tools.entry(id.clone()).or_insert_with(|| ToolState {
+                    name: String::new(),
+                    command: None,
+                });
+                let kind = tool_kind(&state.name);
+                let (title, raw_input) = if kind == acp::ToolKind::Execute {
+                    let command = input
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                    state.command = Some(command.clone());
+                    let raw = match input.get("description") {
+                        Some(desc) => {
+                            serde_json::json!({ "command": command, "description": desc })
+                        }
+                        None => serde_json::json!({ "command": command }),
+                    };
+                    (command, raw)
+                } else {
+                    (format!("{} {}", state.name, compact(&input)), input)
+                };
+                let line = format!("tool_call {id} {} kind={kind:?}: {title}", state.name);
+                self.log(&line);
+                TurnStep::Update(acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new(id, title)
+                        .kind(kind)
+                        .status(acp::ToolCallStatus::InProgress)
+                        .raw_input(raw_input),
+                ))
+            }
+            Event::ToolSuccess { id, content, .. } => {
+                let output = tool_text(&content);
+                self.log(&format!(
+                    "tool_success {id} output={}",
+                    compact(&output.as_str().into())
+                ));
+                let update = self.tool_result(&id, &output, true);
+                TurnStep::Update(acp::SessionUpdate::ToolCallUpdate(
+                    acp::ToolCallUpdate::new(id, update),
+                ))
+            }
+            Event::ToolFailed { id, error, .. } if error.kind == "permission.rejected" => {
+                self.rejected = true;
+                let mut output = REJECTED_LABEL.to_owned();
+                if !error.message.is_empty() && error.message != DEFAULT_REJECT_MESSAGE {
+                    output.push_str(": ");
+                    output.push_str(&error.message);
+                }
+                self.log(&format!("tool_rejected {id}"));
+                let update = self.tool_result(&id, &output, false);
+                TurnStep::Update(acp::SessionUpdate::ToolCallUpdate(
+                    acp::ToolCallUpdate::new(id, update),
+                ))
+            }
+            Event::ToolFailed {
+                id, error, content, ..
+            } => {
+                let mut output = tool_text(&content);
+                if !error.message.is_empty() {
+                    if !output.is_empty() {
+                        output.push('\n');
+                    }
+                    output.push_str(&error.message);
+                }
+                self.log(&format!(
+                    "tool_failed {id} output={}",
+                    compact(&output.as_str().into())
+                ));
+                let update = self.tool_result(&id, &output, false);
+                TurnStep::Update(acp::SessionUpdate::ToolCallUpdate(
+                    acp::ToolCallUpdate::new(id, update),
+                ))
+            }
+            Event::PermissionAsked {
+                id,
+                action,
+                resources,
+                source,
+                ..
+            } => {
+                let tool_call_id = source.and_then(|s| s.id).unwrap_or_else(|| id.clone());
+                let tool = self.tools.get(&tool_call_id);
+                let kind = tool.map_or_else(|| tool_kind(&action), |t| tool_kind(&t.name));
+                let command = tool
+                    .and_then(|t| t.command.clone())
+                    .unwrap_or_else(|| resources.join(" "));
+                let mut fields = acp::ToolCallUpdateFields::new()
+                    .kind(kind)
+                    .title(command.clone());
+                if kind == acp::ToolKind::Execute {
+                    fields = fields.raw_input(serde_json::json!({ "command": command }));
+                }
+                TurnStep::Permission {
+                    request_id: id,
+                    tool_call: acp::ToolCallUpdate::new(tool_call_id, fields),
+                }
+            }
+            _ => TurnStep::Ignore,
+        }
+    }
+
+    fn tool_result(&self, id: &str, output: &str, success: bool) -> acp::ToolCallUpdateFields {
+        let status = if success {
+            acp::ToolCallStatus::Completed
+        } else {
+            acp::ToolCallStatus::Failed
+        };
+        let mut fields = acp::ToolCallUpdateFields::new()
+            .status(status)
+            .content(vec![output.to_owned().into()]);
+        if let Some(command) = self.tools.get(id).and_then(|t| t.command.clone()) {
+            // The execute block renders its output from a Bash `raw_output`.
+            let bash = BashOutput {
+                output: output.as_bytes().to_vec(),
+                output_for_prompt: String::new(),
+                exit_code: if success { 0 } else { 1 },
+                command,
+                truncated: false,
+                signal: None,
+                timed_out: false,
+                description: None,
+                current_dir: self.directory.clone(),
+                output_file: String::new(),
+                total_bytes: output.len(),
+                output_delta: None,
+                was_bare_echo: false,
+            };
+            if let Ok(value) = serde_json::to_value(ToolOutput::Bash(bash)) {
+                fields = fields.raw_output(value);
+            }
+        }
+        fields
+    }
+}
+
+/// Map the TUI's permission answer to an opencode reply. Anything but an allow
+/// option rejects. A selected reject carries a message so the model continues:
+/// the TUI's typed feedback (`_meta.followup_message`) or
+/// [`DEFAULT_REJECT_MESSAGE`]. A cancelled modal (Esc, turn cancel) rejects bare,
+/// which ends the opencode run.
+fn permission_reply(resp: &acp::RequestPermissionResponse) -> (Decision, Option<String>) {
+    let acp::RequestPermissionOutcome::Selected(selected) = &resp.outcome else {
+        return (Decision::Reject, None);
+    };
+    match selected.option_id.0.as_ref() {
+        "allow-once" => (Decision::Once, None),
+        "allow-always" => (Decision::Always, None),
+        _ => {
+            let feedback = resp
+                .meta
+                .as_ref()
+                .and_then(|m| m.get("followup_message"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let message = feedback.unwrap_or(DEFAULT_REJECT_MESSAGE);
+            (Decision::Reject, Some(message.to_owned()))
+        }
+    }
+}
+
+/// Split a picker model id `provider/id`.
+fn parse_model_id(model_id: &str) -> Option<Model> {
+    let (provider_id, id) = model_id.split_once('/')?;
+    (!provider_id.is_empty() && !id.is_empty()).then(|| Model {
+        id: id.to_owned(),
+        provider_id: provider_id.to_owned(),
+    })
+}
+
+/// The picker entries for opencode's model list, ids `provider/id`. `configured`
+/// is kept (first) when the server does not list it, so `current` always resolves.
+fn model_infos(listed: &[oc_opencode_client::ModelInfo], configured: &str) -> Vec<acp::ModelInfo> {
+    let mut models: Vec<acp::ModelInfo> = listed
+        .iter()
+        .map(|m| {
+            let id = format!("{}/{}", m.provider_id, m.id);
+            let name = if m.name.is_empty() {
+                id.clone()
+            } else {
+                m.name.clone()
+            };
+            let meta = m.limit.as_ref().and_then(|l| l.context).and_then(|tokens| {
+                serde_json::json!({ "totalContextTokens": tokens })
+                    .as_object()
+                    .cloned()
+            });
+            acp::ModelInfo::new(id.clone(), name)
+                .description(id)
+                .meta(meta)
+        })
+        .collect();
+    if !models.iter().any(|m| m.model_id.0.as_ref() == configured) {
+        models.insert(
+            0,
+            acp::ModelInfo::new(configured.to_owned(), configured.to_owned()),
+        );
+    }
+    models
+}
+
 #[async_trait::async_trait(?Send)]
 impl acp::Agent for ShimAgent {
     async fn initialize(
@@ -456,7 +608,7 @@ impl acp::Agent for ShimAgent {
     ) -> acp::Result<acp::InitializeResponse> {
         self.log("initialize");
         let meta = serde_json::json!({
-            "modelState": self.model_state(),
+            "modelState": self.model_state(None).await,
             // No server-side rewind; keep the cancelled turn on screen.
             "cancelRewind": false,
         });
@@ -511,7 +663,7 @@ impl acp::Agent for ShimAgent {
             session.id,
             directory.display()
         ));
-        Ok(acp::NewSessionResponse::new(session.id).models(self.model_state()))
+        Ok(acp::NewSessionResponse::new(session.id).models(self.model_state(None).await))
     }
 
     async fn load_session(
@@ -520,7 +672,8 @@ impl acp::Agent for ShimAgent {
     ) -> acp::Result<acp::LoadSessionResponse> {
         // No history replay yet: the TUI continues on the opencode session id.
         self.log(&format!("session/load {} (no replay)", args.session_id.0));
-        Ok(acp::LoadSessionResponse::new().models(self.model_state()))
+        let models = self.model_state(Some(&args.session_id.0)).await;
+        Ok(acp::LoadSessionResponse::new().models(models))
     }
 
     async fn set_session_mode(
@@ -535,7 +688,17 @@ impl acp::Agent for ShimAgent {
         &self,
         args: acp::SetSessionModelRequest,
     ) -> acp::Result<acp::SetSessionModelResponse> {
-        self.log(&format!("session/set_model {} (ignored)", args.model_id.0));
+        let sid = args.session_id.0.to_string();
+        let label = args.model_id.0.to_string();
+        let model = parse_model_id(&label).ok_or_else(|| {
+            acp::Error::invalid_params().data(format!("model id {label:?} is not provider/id"))
+        })?;
+        self.client
+            .switch_model(&sid, &model)
+            .await
+            .map_err(oc_error)?;
+        self.log(&format!("session/set_model {sid} -> {label}"));
+        self.session_models.borrow_mut().insert(sid, label);
         Ok(acp::SetSessionModelResponse::new())
     }
 
@@ -655,15 +818,32 @@ fn oc_error(err: oc_opencode_client::Error) -> acp::Error {
     acp_error(&format!("opencode: {err}"))
 }
 
-/// Append one line to `$TMPDIR/oc-shim-ext.log` and mirror it to tracing.
+/// [`ext_log`] with the time since `epoch` as prefix.
+fn log_since(epoch: Instant, line: &str) {
+    ext_log(&format!("+{:.3}s {line}", epoch.elapsed().as_secs_f64()));
+}
+
+/// Emit one diagnostic line at `debug` level (target `oc_shim`, visible with
+/// `--debug-file`) and, if env `OC_SHIM_LOG=<path>` is set, append it there.
+/// No file is written otherwise.
 fn ext_log(line: &str) {
-    tracing::info!(target: "opencode_shim", "{line}");
-    let path = std::env::temp_dir().join("oc-shim-ext.log");
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    static LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    tracing::debug!(target: "oc_shim", "{line}");
+    let path = LOG_PATH.get_or_init(|| {
+        std::env::var_os("OC_SHIM_LOG")
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+    });
+    if let Some(path) = path
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
     {
         let _ = writeln!(file, "{line}");
     }
 }
+
+#[cfg(test)]
+#[path = "opencode_shim_tests.rs"]
+mod tests;

@@ -94,6 +94,8 @@ fn route(req: &Request) -> (&'static str, &'static str, String) {
         ("POST", "/api/session") => ("200 OK", JSON, r#"{"data":{"id":"ses_1","title":"t","time":{"created":1,"updated":1}}}"#.into()),
         ("POST", "/api/session/ses_1/prompt") => ("200 OK", JSON, r#"{"data":{"id":"msg_1","type":"user"}}"#.into()),
         ("POST", "/api/session/ses_1/permission/per_1/reply") => ("204 No Content", JSON, String::new()),
+        ("POST", "/api/session/ses_1/model") => ("204 No Content", JSON, String::new()),
+        ("GET", "/api/model") => ("200 OK", JSON, r#"{"location":{"directory":"/tmp/x"},"data":[{"id":"big-pickle","providerID":"opencode","name":"Big Pickle","type":"chat","limit":{"context":200000,"output":32000}},{"id":"glm-5.3-flash-free","providerID":"opencode","name":"GLM-5.3-Flash Free"}]}"#.into()),
         ("POST", "/api/session/ses_1/interrupt") => ("200 OK", JSON, r#"{"interrupted":true}"#.into()),
         ("GET", "/api/event") => (
             "200 OK",
@@ -201,4 +203,57 @@ async fn errors_surface_status_and_body() {
         Err(Error::Api { status: 400, body }) => assert!(body.contains("InvalidRequestError")),
         other => panic!("expected 400, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn lists_and_switches_models() {
+    let (url, log) = mock_server().await;
+    let client = Client::new(url, Some("secret".into())).unwrap();
+
+    let models = client.list_models().await.unwrap();
+    assert_eq!(models.len(), 2);
+    assert_eq!(
+        (models[0].provider_id.as_str(), models[0].id.as_str()),
+        ("opencode", "big-pickle")
+    );
+    assert_eq!(models[0].name, "Big Pickle");
+    assert_eq!(
+        models[0].limit.as_ref().and_then(|l| l.context),
+        Some(200_000)
+    );
+    assert!(models[1].limit.is_none());
+
+    client
+        .switch_model(
+            "ses_1",
+            &Model {
+                id: "glm-5.3-flash-free".into(),
+                provider_id: "opencode".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        client
+            .switch_model(
+                "ses_missing",
+                &Model {
+                    id: "x".into(),
+                    provider_id: "y".into()
+                }
+            )
+            .await,
+        Err(Error::Api { status: 400, .. })
+    ));
+
+    let reqs = log.lock().unwrap().clone();
+    assert_eq!(
+        (reqs[0].method.as_str(), reqs[0].path.as_str()),
+        ("GET", "/api/model")
+    );
+    assert_eq!(reqs[1].path, "/api/session/ses_1/model");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&reqs[1].body).unwrap(),
+        serde_json::json!({"model": {"id": "glm-5.3-flash-free", "providerID": "opencode"}})
+    );
 }

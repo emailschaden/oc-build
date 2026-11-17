@@ -94,6 +94,25 @@ pub struct Session {
     pub title: Option<String>,
 }
 
+/// One entry of `GET /api/model` (only the fields the clients need).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    #[serde(rename = "providerID")]
+    pub provider_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub limit: Option<ModelLimit>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ModelLimit {
+    /// Context window in tokens.
+    pub context: Option<u64>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct InterruptResponse {
     /// `false` when the session was already idle.
@@ -157,6 +176,25 @@ impl Client {
                 "/api/session/{session_id}/permission/{request_id}/reply"
             ))
             .json(&serde_json::json!({ "decision": decision, "message": message }))
+            .send()
+            .await?;
+        check(resp).await.map(drop)
+    }
+
+    /// Chat models the server offers, ordered by release date.
+    pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        let resp = self
+            .request(reqwest::Method::GET, "/api/model")
+            .send()
+            .await?;
+        json_data(resp).await
+    }
+
+    /// Switch the model used by the session's subsequent provider turns.
+    pub async fn switch_model(&self, session_id: &str, model: &Model) -> Result<()> {
+        let resp = self
+            .post(&format!("/api/session/{session_id}/model"))
+            .json(&serde_json::json!({ "model": model }))
             .send()
             .await?;
         check(resp).await.map(drop)
