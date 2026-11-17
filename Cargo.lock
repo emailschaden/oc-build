@@ -7189,6 +7189,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "oc-opencode-client"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "eventsource-stream",
+ "futures-util",
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "office_oxide"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

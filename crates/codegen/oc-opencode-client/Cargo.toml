@@ -1,0 +1,24 @@
+[package]
+license = "Apache-2.0"
+name = "oc-opencode-client"
+version = "0.1.0"
+edition.workspace = true
+description = "Minimal async client for the opencode v2 HTTP/SSE server (`opencode serve`)"
+publish = false
+
+[[bin]]
+name = "oc-probe"
+path = "src/bin/oc-probe.rs"
+
+[dependencies]
+clap = { workspace = true }
+eventsource-stream = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
