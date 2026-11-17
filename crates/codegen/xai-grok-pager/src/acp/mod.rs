@@ -6,6 +6,8 @@ pub(crate) const MAX_PLAN_FILE_BYTES: usize = 256 * 1024;
 pub mod leader_bridge;
 pub mod meta;
 pub mod model_state;
+// oc-build: opencode backend
+pub mod opencode_shim;
 pub(crate) mod skills_listing;
 pub mod spawn;
 pub(crate) mod subagent_label_registry;

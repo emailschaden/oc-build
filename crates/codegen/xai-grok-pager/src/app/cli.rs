@@ -757,6 +757,18 @@ pub struct PagerArgs {
     /// Run standalone even when leader mode is configured.
     #[arg(long, conflicts_with = "leader", hide = true)]
     pub no_leader: bool,
+    // oc-build: opencode backend
+    /// Run the TUI against an opencode v2 server (`opencode serve`) at URL instead of the built-in agent.
+    /// The server password is read from `OPENCODE_PASSWORD`.
+    #[arg(long = "opencode-url", value_name = "URL", env = "OPENCODE_URL")]
+    pub opencode_url: Option<String>,
+    /// opencode model as `provider/id` (default `opencode/big-pickle`). Only used with `--opencode-url`.
+    #[arg(
+        long = "opencode-model",
+        value_name = "PROVIDER/ID",
+        requires = "opencode_url"
+    )]
+    pub opencode_model: Option<String>,
     /// Initial prompt for the interactive session, e.g. `grok "fix the bug"` or `grok --worktree=feat "create this feature"`.
     #[arg(
         value_name = "PROMPT",
@@ -804,6 +816,21 @@ fn strip_cur_dir(path: PathBuf) -> PathBuf {
         .collect()
 }
 impl PagerArgs {
+    // oc-build: opencode backend
+    /// `Some` when the TUI should talk to an opencode server instead of the built-in agent.
+    pub fn opencode_config(&self) -> Option<crate::acp::opencode_shim::OpencodeConfig> {
+        let url = self.opencode_url.as_ref().filter(|u| !u.is_empty())?;
+        Some(crate::acp::opencode_shim::OpencodeConfig {
+            url: url.clone(),
+            password: std::env::var("OPENCODE_PASSWORD")
+                .ok()
+                .filter(|p| !p.is_empty()),
+            model: self
+                .opencode_model
+                .clone()
+                .unwrap_or_else(|| crate::acp::opencode_shim::DEFAULT_MODEL.to_owned()),
+        })
+    }
     pub fn memory_enabled_override(&self) -> Option<bool> {
         if self.experimental_memory {
             Some(true)

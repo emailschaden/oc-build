@@ -712,6 +712,8 @@ pub async fn run(
 ) -> anyhow::Result<bool> {
     let screen_mode_override = screen_mode_relaunch::take_screen_mode_env_override();
     let cancel = CancellationToken::new();
+    // oc-build: opencode backend; skips xAI login, auth refresh, settings prefetch and leader mode.
+    let opencode = args.opencode_config();
     let startup_start = std::time::Instant::now();
     let raw_config = xai_grok_shell::config::load_effective_config()
         .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
@@ -726,25 +728,30 @@ pub async fn run(
                 )
             }
         };
-    if let xai_grok_login::PreTuiLoginOutcome::SignedIn(auth) =
-        xai_grok_login::maybe_run_pre_tui_external_login(
-            &grok_com_config,
-            proxy_base_url.clone(),
-            args.force_login,
-            io::stdin().is_terminal(),
-        )
-        .await?
+    if opencode.is_none()
+        && let xai_grok_login::PreTuiLoginOutcome::SignedIn(auth) =
+            xai_grok_login::maybe_run_pre_tui_external_login(
+                &grok_com_config,
+                proxy_base_url.clone(),
+                args.force_login,
+                io::stdin().is_terminal(),
+            )
+            .await?
     {
         xai_grok_shell::agent::init::apply_post_login_config(*auth).await?;
         args.force_login = false;
     }
     xai_tty_utils::redirect_native_stderr();
-    let refreshed_auth = tokio::time::timeout(
-        xai_grok_shell::http::STARTUP_AUTH_REFRESH_TIMEOUT,
-        xai_grok_login::try_ensure_fresh_auth(&grok_com_config, proxy_base_url),
-    )
-    .await
-    .unwrap_or(None);
+    let refreshed_auth = if opencode.is_some() {
+        None
+    } else {
+        tokio::time::timeout(
+            xai_grok_shell::http::STARTUP_AUTH_REFRESH_TIMEOUT,
+            xai_grok_login::try_ensure_fresh_auth(&grok_com_config, proxy_base_url),
+        )
+        .await
+        .unwrap_or(None)
+    };
     let settings_query = xai_grok_shell::agent::remote_config::settings_get::SettingsQuery::resolve(
         refreshed_auth,
         Some(grok_com_config.clone()),
@@ -813,6 +820,7 @@ pub async fn run(
         true,
         requested_confinement,
     );
+    let use_leader = use_leader && opencode.is_none(); // oc-build: opencode backend
     tracing::info!(
         use_leader,
         ?policy_disable_reason,
@@ -1093,6 +1101,10 @@ pub async fn run(
         startup_failure::ConnectAttempt::First,
         &timer,
         async {
+            // oc-build: opencode backend
+            if let Some(oc) = opencode {
+                return crate::acp::opencode_shim::connect(&cancel, connect_flags, oc).await;
+            }
             match primary_target {
                 crate::acp::AgentKind::Leader => {
                     crate::acp::connect_via_leader(&cancel, connect_flags, &raw_config).await

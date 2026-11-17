@@ -2175,7 +2175,8 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
             }
         }
     }
-    if command_needs_pre_sandbox_policy_heal(args.command.as_ref()) {
+    // oc-build: opencode backend skips the xAI managed-policy heal.
+    if command_needs_pre_sandbox_policy_heal(args.command.as_ref()) && args.opencode_url.is_none() {
         match xai_grok_shell::config::load_agent_config_disk_only() {
             Ok(agent_cfg) => {
                 let auth_manager =
@@ -2508,7 +2509,9 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
     type UpdateWaitHandle = tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>>;
     let bg_update_wait: std::sync::Arc<tokio::sync::Mutex<Option<UpdateWaitHandle>>> =
         std::sync::Arc::new(tokio::sync::Mutex::new(None));
-    let check_updates = should_check_for_updates(args.no_auto_update);
+    // oc-build: opencode backend skips the xAI auto-update check.
+    let check_updates =
+        should_check_for_updates(args.no_auto_update) && args.opencode_url.is_none();
     let bg_update_rx: Option<tokio::sync::oneshot::Receiver<Option<auto_update::UpdateAvailable>>> =
         if check_updates {
             let update_config = update_config.clone();
