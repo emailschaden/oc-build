@@ -235,16 +235,152 @@ fn cancel_suppresses_further_output() {
     assert!(matches!(step, TurnStep::Ignore), "{step:?}");
 }
 
+fn reply(option_id: &str, followup: Option<&str>) -> (Decision, Option<String>) {
+    let meta = followup.and_then(|text| {
+        serde_json::json!({ "followup_message": text })
+            .as_object()
+            .cloned()
+    });
+    permission_reply(
+        &acp::RequestPermissionResponse::new(acp::RequestPermissionOutcome::Selected(
+            acp::SelectedPermissionOutcome::new(option_id.to_owned()),
+        ))
+        .meta(meta),
+    )
+}
+
 #[test]
 fn permission_outcome_maps_to_decision() {
-    let selected = |id: &str| {
-        acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(id.to_owned()))
-    };
-    assert_eq!(decision_for(&selected("allow-once")), Decision::Once);
-    assert_eq!(decision_for(&selected("allow-always")), Decision::Always);
-    assert_eq!(decision_for(&selected("reject")), Decision::Reject);
+    assert_eq!(reply("allow-once", None), (Decision::Once, None));
+    assert_eq!(reply("allow-always", None), (Decision::Always, None));
     assert_eq!(
-        decision_for(&acp::RequestPermissionOutcome::Cancelled),
-        Decision::Reject
+        permission_reply(&acp::RequestPermissionResponse::new(
+            acp::RequestPermissionOutcome::Cancelled
+        )),
+        (Decision::Reject, None)
     );
+}
+
+#[test]
+fn reject_sends_feedback_or_default_message() {
+    assert_eq!(
+        reply("reject", Some("  no shell please  ")),
+        (Decision::Reject, Some("no shell please".to_owned()))
+    );
+    for blank in [None, Some(""), Some("   ")] {
+        assert_eq!(
+            reply("reject", blank),
+            (Decision::Reject, Some(DEFAULT_REJECT_MESSAGE.to_owned()))
+        );
+    }
+}
+
+fn rejected(turn: &mut TurnState, message: &str) -> acp::ToolCallUpdate {
+    tool_update(turn.on_event(event(
+        "session.tool.failed",
+        serde_json::json!({
+            "sessionID": SID, "assistantMessageID": MSG, "id": TOOL,
+            "error": { "type": "permission.rejected", "message": message },
+        }),
+    )))
+}
+
+#[test]
+fn rejected_tool_shows_rejected_with_feedback() {
+    let mut turn = turn();
+    shell_called(&mut turn);
+    let u = rejected(&mut turn, "no shell please");
+    assert_eq!(u.fields.status, Some(acp::ToolCallStatus::Failed));
+    assert_eq!(content_text(&u), "Rejected by user: no shell please");
+
+    let mut turn = self::turn();
+    shell_called(&mut turn);
+    let u = rejected(&mut turn, DEFAULT_REJECT_MESSAGE);
+    assert_eq!(content_text(&u), "Rejected by user");
+}
+
+#[test]
+fn shutdown_after_reject_ends_turn_not_cancelled() {
+    let interrupted = |turn: &mut TurnState, reason: &str| {
+        turn.on_event(event(
+            "session.execution.interrupted",
+            serde_json::json!({ "sessionID": SID, "reason": reason }),
+        ))
+    };
+    let mut turn = turn();
+    shell_called(&mut turn);
+    rejected(&mut turn, "");
+    assert!(matches!(
+        interrupted(&mut turn, "shutdown"),
+        TurnStep::Stop(acp::StopReason::EndTurn)
+    ));
+    // A real cancel still reads as cancelled.
+    turn.cancelling = true;
+    assert!(matches!(
+        interrupted(&mut turn, "shutdown"),
+        TurnStep::Stop(acp::StopReason::Cancelled)
+    ));
+    let mut fresh = self::turn();
+    assert!(matches!(
+        interrupted(&mut fresh, "shutdown"),
+        TurnStep::Stop(acp::StopReason::Cancelled)
+    ));
+}
+
+fn listed(
+    provider: &str,
+    id: &str,
+    name: &str,
+    context: Option<u64>,
+) -> oc_opencode_client::ModelInfo {
+    serde_json::from_value(serde_json::json!({
+        "id": id, "providerID": provider, "name": name,
+        "limit": context.map(|c| serde_json::json!({ "context": c })),
+    }))
+    .expect("model info")
+}
+
+#[test]
+fn model_list_uses_provider_slash_id() {
+    let models = model_infos(
+        &[
+            listed("opencode", "big-pickle", "Big Pickle", Some(200_000)),
+            listed("opencode", "glm-5.3-flash-free", "", None),
+        ],
+        "opencode/big-pickle",
+    );
+    let ids: Vec<&str> = models.iter().map(|m| m.model_id.0.as_ref()).collect();
+    assert_eq!(ids, ["opencode/big-pickle", "opencode/glm-5.3-flash-free"]);
+    assert_eq!(models[0].name, "Big Pickle");
+    assert_eq!(models[1].name, "opencode/glm-5.3-flash-free");
+    assert_eq!(
+        models[0]
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("totalContextTokens"))
+            .and_then(|v| v.as_u64()),
+        Some(200_000)
+    );
+}
+
+#[test]
+fn configured_model_is_listed_even_if_server_omits_it() {
+    let models = model_infos(
+        &[listed("opencode", "big-pickle", "Big Pickle", None)],
+        "local/custom",
+    );
+    assert_eq!(models[0].model_id.0.as_ref(), "local/custom");
+    assert_eq!(models.len(), 2);
+    assert_eq!(model_infos(&[], "a/b").len(), 1);
+}
+
+#[test]
+fn model_id_parses_provider_and_id() {
+    let model = parse_model_id("opencode/glm-5.3-flash-free").expect("valid");
+    assert_eq!(
+        (model.provider_id.as_str(), model.id.as_str()),
+        ("opencode", "glm-5.3-flash-free")
+    );
+    assert!(parse_model_id("big-pickle").is_none());
+    assert!(parse_model_id("/x").is_none());
 }

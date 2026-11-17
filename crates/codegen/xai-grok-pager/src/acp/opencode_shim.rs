@@ -9,6 +9,10 @@
 //! `session/update` notifications until the execution ends, `session/cancel`
 //! interrupts it, and `permission.asked` becomes `session/request_permission`.
 //!
+//! The model list comes from `GET /api/model` and `session/set_model` switches the
+//! opencode session's model. A rejected permission is replied with a message (the
+//! user's feedback or [`DEFAULT_REJECT_MESSAGE`]) so the model continues the turn.
+//!
 //! `x.ai/*` extension calls are answered with stubs. Each call and turn step is
 //! logged at debug level (target `oc_shim`) and, when env `OC_SHIM_LOG=<path>`
 //! is set, appended to that file (see [`ext_log`]) so the set the TUI really
@@ -40,6 +44,12 @@ pub const DEFAULT_MODEL: &str = "opencode/big-pickle";
 /// Auth method advertised so the pager's eager-auth step succeeds without a login screen
 /// (an empty list is treated as "needs login").
 const AUTH_METHOD_ID: &str = "opencode";
+/// Sent with a reject that has no typed feedback. opencode ends the run on a bare
+/// reject; with a message the model gets it as the tool error and continues.
+const DEFAULT_REJECT_MESSAGE: &str =
+    "The user rejected this tool call. Do not retry it; ask the user how to proceed.";
+/// Shown in the rejected tool block.
+const REJECTED_LABEL: &str = "Rejected by user";
 /// How long a cancelled turn waits for `session.execution.interrupted` before giving up.
 const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
 
@@ -67,14 +77,7 @@ async fn spawn_opencode_shim(
     cancel: &CancellationToken,
     config: OpencodeConfig,
 ) -> Result<SpawnedAgent> {
-    let (provider_id, model_id) = config
-        .model
-        .split_once('/')
-        .context("--opencode-model must be provider/id")?;
-    let model = Model {
-        id: model_id.to_owned(),
-        provider_id: provider_id.to_owned(),
-    };
+    let model = parse_model_id(&config.model).context("--opencode-model must be provider/id")?;
     let client = Client::new(config.url.clone(), config.password.clone())
         .context("failed to build the opencode client")?;
     let directory = std::env::current_dir().context("failed to resolve cwd")?;
@@ -104,6 +107,8 @@ async fn spawn_opencode_shim(
                 model,
                 model_label: config.model,
                 directory,
+                catalog: RefCell::new(None),
+                session_models: RefCell::new(HashMap::new()),
                 active: RefCell::new(HashMap::new()),
                 started: Instant::now(),
             }));
@@ -131,20 +136,40 @@ struct OpencodeShim {
     model: Model,
     model_label: String,
     directory: PathBuf,
+    /// `GET /api/model`, fetched once.
+    catalog: RefCell<Option<Vec<acp::ModelInfo>>>,
+    /// Model id (`provider/id`) chosen via `session/set_model`, keyed by session id.
+    session_models: RefCell<HashMap<String, String>>,
     /// Cancel token of the running turn, keyed by session id.
     active: RefCell<HashMap<String, CancellationToken>>,
     started: Instant,
 }
 
 impl OpencodeShim {
-    fn model_state(&self) -> acp::SessionModelState {
-        acp::SessionModelState::new(
-            self.model_label.clone(),
-            vec![acp::ModelInfo::new(
-                self.model_label.clone(),
-                self.model_label.clone(),
-            )],
-        )
+    /// The model picker state for `session_id` (or a new session when `None`).
+    async fn model_state(&self, session_id: Option<&str>) -> acp::SessionModelState {
+        let current = session_id
+            .and_then(|sid| self.session_models.borrow().get(sid).cloned())
+            .unwrap_or_else(|| self.model_label.clone());
+        acp::SessionModelState::new(current, self.available_models().await)
+    }
+
+    async fn available_models(&self) -> Vec<acp::ModelInfo> {
+        if let Some(models) = self.catalog.borrow().as_ref() {
+            return models.clone();
+        }
+        let listed = match self.client.list_models().await {
+            Ok(listed) => listed,
+            Err(err) => {
+                // Not cached, so a later session retries.
+                tracing::warn!(error = %err, "opencode list_models failed");
+                return model_infos(&[], &self.model_label);
+            }
+        };
+        let models = model_infos(&listed, &self.model_label);
+        self.log(&format!("models: {} listed", models.len()));
+        *self.catalog.borrow_mut() = Some(models.clone());
+        models
     }
 
     fn log(&self, line: &str) {
@@ -237,17 +262,19 @@ impl OpencodeShim {
         request_id: String,
         request: acp::RequestPermissionRequest,
     ) {
-        let decision = match self.gateway.request_permission(request).await {
-            Ok(resp) => decision_for(&resp.outcome),
+        let (decision, message) = match self.gateway.request_permission(request).await {
+            Ok(resp) => permission_reply(&resp),
             Err(err) => {
                 tracing::warn!(error = %err, "request_permission failed; rejecting");
-                Decision::Reject
+                (Decision::Reject, None)
             }
         };
-        self.log(&format!("permission {request_id} -> {decision:?}"));
+        self.log(&format!(
+            "permission {request_id} -> {decision:?} message={message:?}"
+        ));
         if let Err(err) = self
             .client
-            .reply_permission(&sid, &request_id, decision, None)
+            .reply_permission(&sid, &request_id, decision, message.as_deref())
             .await
         {
             tracing::warn!(error = %err, "opencode reply_permission failed");
@@ -297,6 +324,8 @@ struct TurnState {
     started: bool,
     /// Set once the TUI cancelled; new output is dropped from then on.
     cancelling: bool,
+    /// Set once a tool call was rejected by the user.
+    rejected: bool,
 }
 
 impl TurnState {
@@ -308,6 +337,7 @@ impl TurnState {
             tools: HashMap::new(),
             started: false,
             cancelling: false,
+            rejected: false,
         }
     }
 
@@ -335,7 +365,13 @@ impl TurnState {
             Event::ExecutionSucceeded { .. } => TurnStep::Stop(self.end_reason()),
             Event::ExecutionInterrupted { reason, .. } => {
                 self.log(&format!("turn: interrupted reason={reason:?}"));
-                TurnStep::Stop(acp::StopReason::Cancelled)
+                // A bare reject makes opencode end the run with `shutdown`; that is
+                // the user's answer, not a cancelled turn.
+                if self.rejected && !self.cancelling && reason.as_deref() == Some("shutdown") {
+                    TurnStep::Stop(acp::StopReason::EndTurn)
+                } else {
+                    TurnStep::Stop(acp::StopReason::Cancelled)
+                }
             }
             Event::ExecutionFailed { error, .. } => TurnStep::Fail(
                 error
@@ -400,6 +436,19 @@ impl TurnState {
                     compact(&output.as_str().into())
                 ));
                 let update = self.tool_result(&id, &output, true);
+                TurnStep::Update(acp::SessionUpdate::ToolCallUpdate(
+                    acp::ToolCallUpdate::new(id, update),
+                ))
+            }
+            Event::ToolFailed { id, error, .. } if error.kind == "permission.rejected" => {
+                self.rejected = true;
+                let mut output = REJECTED_LABEL.to_owned();
+                if !error.message.is_empty() && error.message != DEFAULT_REJECT_MESSAGE {
+                    output.push_str(": ");
+                    output.push_str(&error.message);
+                }
+                self.log(&format!("tool_rejected {id}"));
+                let update = self.tool_result(&id, &output, false);
                 TurnStep::Update(acp::SessionUpdate::ToolCallUpdate(
                     acp::ToolCallUpdate::new(id, update),
                 ))
@@ -485,17 +534,70 @@ impl TurnState {
     }
 }
 
-/// Map the TUI's permission answer to an opencode reply; anything but an allow
-/// option (including a cancelled modal) rejects.
-fn decision_for(outcome: &acp::RequestPermissionOutcome) -> Decision {
-    match outcome {
-        acp::RequestPermissionOutcome::Selected(selected) => match selected.option_id.0.as_ref() {
-            "allow-once" => Decision::Once,
-            "allow-always" => Decision::Always,
-            _ => Decision::Reject,
-        },
-        _ => Decision::Reject,
+/// Map the TUI's permission answer to an opencode reply. Anything but an allow
+/// option rejects. A selected reject carries a message so the model continues:
+/// the TUI's typed feedback (`_meta.followup_message`) or
+/// [`DEFAULT_REJECT_MESSAGE`]. A cancelled modal (Esc, turn cancel) rejects bare,
+/// which ends the opencode run.
+fn permission_reply(resp: &acp::RequestPermissionResponse) -> (Decision, Option<String>) {
+    let acp::RequestPermissionOutcome::Selected(selected) = &resp.outcome else {
+        return (Decision::Reject, None);
+    };
+    match selected.option_id.0.as_ref() {
+        "allow-once" => (Decision::Once, None),
+        "allow-always" => (Decision::Always, None),
+        _ => {
+            let feedback = resp
+                .meta
+                .as_ref()
+                .and_then(|m| m.get("followup_message"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let message = feedback.unwrap_or(DEFAULT_REJECT_MESSAGE);
+            (Decision::Reject, Some(message.to_owned()))
+        }
     }
+}
+
+/// Split a picker model id `provider/id`.
+fn parse_model_id(model_id: &str) -> Option<Model> {
+    let (provider_id, id) = model_id.split_once('/')?;
+    (!provider_id.is_empty() && !id.is_empty()).then(|| Model {
+        id: id.to_owned(),
+        provider_id: provider_id.to_owned(),
+    })
+}
+
+/// The picker entries for opencode's model list, ids `provider/id`. `configured`
+/// is kept (first) when the server does not list it, so `current` always resolves.
+fn model_infos(listed: &[oc_opencode_client::ModelInfo], configured: &str) -> Vec<acp::ModelInfo> {
+    let mut models: Vec<acp::ModelInfo> = listed
+        .iter()
+        .map(|m| {
+            let id = format!("{}/{}", m.provider_id, m.id);
+            let name = if m.name.is_empty() {
+                id.clone()
+            } else {
+                m.name.clone()
+            };
+            let meta = m.limit.as_ref().and_then(|l| l.context).and_then(|tokens| {
+                serde_json::json!({ "totalContextTokens": tokens })
+                    .as_object()
+                    .cloned()
+            });
+            acp::ModelInfo::new(id.clone(), name)
+                .description(id)
+                .meta(meta)
+        })
+        .collect();
+    if !models.iter().any(|m| m.model_id.0.as_ref() == configured) {
+        models.insert(
+            0,
+            acp::ModelInfo::new(configured.to_owned(), configured.to_owned()),
+        );
+    }
+    models
 }
 
 #[async_trait::async_trait(?Send)]
@@ -506,7 +608,7 @@ impl acp::Agent for ShimAgent {
     ) -> acp::Result<acp::InitializeResponse> {
         self.log("initialize");
         let meta = serde_json::json!({
-            "modelState": self.model_state(),
+            "modelState": self.model_state(None).await,
             // No server-side rewind; keep the cancelled turn on screen.
             "cancelRewind": false,
         });
@@ -561,7 +663,7 @@ impl acp::Agent for ShimAgent {
             session.id,
             directory.display()
         ));
-        Ok(acp::NewSessionResponse::new(session.id).models(self.model_state()))
+        Ok(acp::NewSessionResponse::new(session.id).models(self.model_state(None).await))
     }
 
     async fn load_session(
@@ -570,7 +672,8 @@ impl acp::Agent for ShimAgent {
     ) -> acp::Result<acp::LoadSessionResponse> {
         // No history replay yet: the TUI continues on the opencode session id.
         self.log(&format!("session/load {} (no replay)", args.session_id.0));
-        Ok(acp::LoadSessionResponse::new().models(self.model_state()))
+        let models = self.model_state(Some(&args.session_id.0)).await;
+        Ok(acp::LoadSessionResponse::new().models(models))
     }
 
     async fn set_session_mode(
@@ -585,7 +688,17 @@ impl acp::Agent for ShimAgent {
         &self,
         args: acp::SetSessionModelRequest,
     ) -> acp::Result<acp::SetSessionModelResponse> {
-        self.log(&format!("session/set_model {} (ignored)", args.model_id.0));
+        let sid = args.session_id.0.to_string();
+        let label = args.model_id.0.to_string();
+        let model = parse_model_id(&label).ok_or_else(|| {
+            acp::Error::invalid_params().data(format!("model id {label:?} is not provider/id"))
+        })?;
+        self.client
+            .switch_model(&sid, &model)
+            .await
+            .map_err(oc_error)?;
+        self.log(&format!("session/set_model {sid} -> {label}"));
+        self.session_models.borrow_mut().insert(sid, label);
         Ok(acp::SetSessionModelResponse::new())
     }
 
