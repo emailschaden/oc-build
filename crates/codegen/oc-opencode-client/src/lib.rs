@@ -113,6 +113,23 @@ pub struct ModelLimit {
     pub context: Option<u64>,
 }
 
+/// One entry of `GET /api/agent` (only the fields the clients need).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentInfo {
+    /// e.g. `build`, `plan`.
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// `primary` (selectable for a session), `subagent` or `all`.
+    #[serde(default)]
+    pub mode: String,
+    /// Internal agents (compaction, title, summary).
+    #[serde(default)]
+    pub hidden: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct InterruptResponse {
     /// `false` when the session was already idle.
@@ -195,6 +212,25 @@ impl Client {
         let resp = self
             .post(&format!("/api/session/{session_id}/model"))
             .json(&serde_json::json!({ "model": model }))
+            .send()
+            .await?;
+        check(resp).await.map(drop)
+    }
+
+    /// Agents the server offers (primary and subagents, including hidden ones).
+    pub async fn list_agents(&self) -> Result<Vec<AgentInfo>> {
+        let resp = self
+            .request(reqwest::Method::GET, "/api/agent")
+            .send()
+            .await?;
+        json_data(resp).await
+    }
+
+    /// Switch the agent used by the session's subsequent provider turns.
+    pub async fn switch_agent(&self, session_id: &str, agent: &str) -> Result<()> {
+        let resp = self
+            .post(&format!("/api/session/{session_id}/agent"))
+            .json(&serde_json::json!({ "agent": agent }))
             .send()
             .await?;
         check(resp).await.map(drop)

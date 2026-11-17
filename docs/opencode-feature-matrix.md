@@ -33,7 +33,8 @@ in-process ACP shim (`src/acp/opencode_shim.rs`).
   `session.reasoning.delta` becomes `AgentThoughtChunk`, and `session.tool.*` becomes
   `ToolCall`/`ToolCallUpdate`. Only `shell`/`bash` is typed as `Execute`; every other tool is `Other`.
 - Stubs: `session/load` returns OK but replays nothing. `session/set_mode` and
-  `session/set_model` return OK and are ignored.
+  `session/set_model` return OK and are ignored. (feat/oc-modes-agents: `session/set_mode`
+  switches the opencode agent; `session/new`/`session/load` return modes.)
 - Every `x.ai/*` method returns `method_not_found`, and every `x.ai/*` notification is dropped.
 - (feat/oc-hide-xai-only) `x.ai/plugins/list`, `x.ai/skills/list` and `x.ai/mcp/list` return
   `method_not_found` with the message "not available in opencode mode yet". In opencode mode
@@ -43,7 +44,7 @@ in-process ACP shim (`src/acp/opencode_shim.rs`).
 - `initialize` sends `_meta.modelState` with exactly one model (`--opencode-model`, default
   `opencode/big-pickle`) and `cancelRewind:false`.
 - Prompt content blocks other than `Text` are dropped. A `ResourceLink` is sent as its URI text.
-- No `AvailableCommandsUpdate`, no modes, and no tool list are ever sent. Gated commands
+- No `AvailableCommandsUpdate`, no modes (until feat/oc-modes-agents), and no tool list are ever sent. Gated commands
   (`/loop`, `/imagine*`, `/memory`, `/flush`, `/dream`, `/auto`, `/dashboard`, `/recap`, `/voice`)
   therefore stay hidden.
 - Headless `-p` (`src/headless.rs`) is not wired to `--opencode-url`. Only the interactive TUI
@@ -94,13 +95,13 @@ opencode endpoints are under `/api/*` in `/workspace/research/oc2-openapi.json`.
 
 | Feature | TUI backend call | opencode v2 equivalent | Status |
 |---|---|---|---|
-| Plan mode (`/plan`, `Shift+Tab`, plan nudge) | `session/set_mode {"plan"}` (`app/dispatch/modes.rs`), `x.ai/toggle_plan_mode` | `POST /api/session/{id}/agent {"agent":"plan"}`. Back to Normal is `{"agent":"build"}`. Advertise modes in `session/new` `modes` from `GET /api/agent` (primary agents) and emit `CurrentModeUpdate` on `session.agent.selected` | mappable (today the UI flips but the backend stays on `build`) |
-| `/plan <description>` (enter plan and prompt) | `Effect::SetModeThenPrompt` = `set_mode` + `prompt` | agent switch + prompt | mappable |
-| Plan approval card (exit plan mode) | `x.ai/exit_plan_mode` client request, `PlanExecuting`/`PlanKept`/`PlanCleared` | none. opencode `plan` is an agent without an exit tool. Approximate with "switch to `build` and prompt `execute the plan`" (`Effect::ExecutePlan`) | partial |
+| Plan mode (`/plan`, `Shift+Tab`, plan nudge) | `session/set_mode {"plan"}` (`app/dispatch/modes.rs`), `x.ai/toggle_plan_mode` | `POST /api/session/{id}/agent {"agent":"plan"}`. Back to Normal is `{"agent":"build"}`. Advertise modes in `session/new` `modes` from `GET /api/agent` (primary agents) and emit `CurrentModeUpdate` on `session.agent.selected` | verified live (feat/oc-modes-agents): modes `default`=Build, `plan`=Plan from `GET /api/agent`; `set_mode` → `POST …/agent`, confirmed with `CurrentModeUpdate`; `x.ai/toggle_plan_mode` toggles plan↔build |
+| `/plan <description>` (enter plan and prompt) | `Effect::SetModeThenPrompt` = `set_mode` + `prompt` | agent switch + prompt | mapped (feat/oc-modes-agents): same `set_mode` path, then the prompt |
+| Plan approval card (exit plan mode) | `x.ai/exit_plan_mode` client request, `PlanExecuting`/`PlanKept`/`PlanCleared` | none. opencode `plan` is an agent without an exit tool. Approximate with "switch to `build` and prompt `execute the plan`" (`Effect::ExecutePlan`) | mapped (feat/oc-modes-agents): a prompt with `_meta.executePlan` switches to `build` and prompts "implement the approved plan" + the plan text. Unreachable today: the approval card only opens on `PlanKept`, which needs the xAI plan-file tools |
 | `/view-plan` | `SessionUpdate::Plan` (stored plan) | `todowrite` tool input (a todo list, not a plan document) | partial |
-| Always-approve / YOLO (`Ctrl+O`, `/always-approve`) | `session/set_mode` `bypass_permissions` + `x.ai/settings/update`, `x.ai/yolo_mode_changed` | `PATCH /api/session/{id} {"permissions":[{action:"*",resource:"*",effect:"allow"}]}`, or the shim auto-replies `once` to `permission.asked` | mappable |
-| Auto-review mode (`/auto`, classifier) | `permission_mode = "auto"`, shell-side classifier | none (no classifier). Keep hidden | no equivalent |
-| Mode cycle (`Shift+Tab`: Normal → Plan → Auto → Always) | local cycle + `session/set_mode` | `build`/`plan` agents + permission ruleset | mappable |
+| Always-approve / YOLO (`Ctrl+O`, `/always-approve`) | `session/set_mode` `bypass_permissions` + `x.ai/settings/update`, `x.ai/yolo_mode_changed` | `PATCH /api/session/{id} {"permissions":[{action:"*",resource:"*",effect:"allow"}]}`, or the shim auto-replies `once` to `permission.asked` | verified live (feat/oc-modes-agents): `_meta.yoloMode` on `session/new` and `x.ai/yolo_mode_changed` set a per-session flag; while on, the shim replies `once` itself (the pager also auto-allows). No ruleset change, so turning it off just asks again |
+| Auto-review mode (`/auto`, classifier) | `permission_mode = "auto"`, shell-side classifier | none (no classifier). Keep hidden | hidden in opencode mode (feat/oc-modes-agents): `auto_mode_gate` is off, so Auto is not in the Shift+Tab cycle |
+| Mode cycle (`Shift+Tab`: Normal → Plan → Auto → Always) | local cycle + `session/set_mode` | `build`/`plan` agents + permission ruleset | verified live (feat/oc-modes-agents): Build → Plan → Always-Approve → Build |
 | Agent / persona picker (`/config-agents`, `/personas`) | bundle `x.ai/bundle/status`, roster `x.ai/sessions/list` | `GET /api/agent` (primary and subagent, `Agent.Info`), `POST /api/session/{id}/agent` | mappable |
 | Model picker (`Ctrl+M`, `/model`) | list from `initialize._meta.modelState` + `x.ai/models/update`; switch with `session/set_model` | `GET /api/model` (+ `GET /api/provider`) for the list, `POST /api/session/{id}/model {"model":{id,providerID}}` to switch | mapped in #4 (list from `GET /api/model`, switch via `POST …/model`) |
 | `/model <name>` set default | `Effect::PersistPreferredModel` (local `~/.grok/config.toml`) + `set_model` | local persist + `POST …/model` | partial |
@@ -277,7 +278,7 @@ call an `x.ai/*` method and get `method_not_found`.
 | `/hooks` | Hidden (feat/oc-hide-xai-only): command, Hooks tab and palette entry removed; `FetchHooksList` skipped | Hide the tab ("opencode uses plugins") |
 | `/workflows`, `/workflow` | Hidden (feat/oc-hide-xai-only): commands, Workflows tab and palette entry removed; `FetchWorkflowsList` skipped | Hide |
 | `/memory`, `/flush`, `/dream`, `/remember` | `/memory`/`/flush`/`/dream` hidden (`SHELL_GATED_COMMANDS`, no catalog). `/remember` hidden (feat/oc-hide-xai-only) | Hide `/remember` too |
-| `/auto` (classifier auto-review) | Hidden (`set_auto_mode_available` never true) | Keep hidden |
+| `/auto` (classifier auto-review) | Hidden (`set_auto_mode_available` never true); Auto also left out of the Shift+Tab cycle (feat/oc-modes-agents) | Keep hidden |
 | `/context-window` | Hidden (feat/oc-hide-xai-only) | Hide, or message "fixed per model in opencode" |
 | `/imagine-video` | Hidden (tool `image_to_video` not advertised) | Keep hidden |
 | `/voice` | Visible once the voice gate resolves (seen live); now hidden (feat/oc-hide-xai-only) | Keep hidden. Optional later work on `/api/experimental/voice/*` |

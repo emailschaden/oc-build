@@ -240,4 +240,15 @@ fn spec_only_events() {
     assert!(
         matches!(Event::parse(status).unwrap(), Event::Status { status, .. } if status["type"] == "busy")
     );
+    let agent = r#"{"id":"e","created":1,"type":"session.agent.selected","data":{"sessionID":"ses_1","agent":"plan","previous":"build"}}"#;
+    let event = Event::parse(agent).unwrap();
+    assert_eq!(event.session_id(), Some("ses_1"));
+    assert_eq!(
+        event,
+        Event::AgentSelected {
+            session_id: "ses_1".into(),
+            agent: "plan".into(),
+            previous: Some("build".into())
+        }
+    );
 }
