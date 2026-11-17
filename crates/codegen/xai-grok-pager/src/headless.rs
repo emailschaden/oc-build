@@ -3,7 +3,7 @@
 //! Runs the agent in-process and drives the ACP lifecycle (init, auth, session, prompt).
 //! Streams to stdout and exits via `CancellationToken`.
 use crate::acp::model_state::{EffortTokenError, ModelState};
-use crate::acp::spawn::{AgentShutdownGuard, SpawnedAgent, spawn_grok_shell};
+use crate::acp::spawn::AgentShutdownGuard;
 use crate::app::prompt_ack::{PromptAckDeadlines, PromptAckWatch};
 use crate::app::subagent::{
     SubagentLifecycleEffect, SubagentLifecycleReduction, SubagentLifecycleState,
@@ -51,6 +51,8 @@ pub(crate) use cli::{ResolvedAgent, resolve_agent_arg};
 use cli::{apply_agent_flag, parse_cli_agents, parse_comma_list, parse_permission_rules_strict};
 #[derive(Debug, Clone)]
 pub struct HeadlessOptions {
+    // oc-build: opencode backend
+    pub opencode: crate::acp::opencode_shim::OpencodeConfig,
     pub session_id: Option<String>,
     pub resume: Option<String>,
     /// Resume was pinned pre-sandbox; materialization must not re-run title selection.
@@ -424,15 +426,6 @@ fn auth_required_message(interactive: bool) -> String {
     }
 }
 /// The same backend switch the TUI applies; the shell unless another backend is enabled.
-async fn spawn_agent(
-    agent_config: AgentConfig,
-    cancel: &CancellationToken,
-    memory_config: Option<xai_grok_shell::config::MemoryConfig>,
-    options: &HeadlessOptions,
-) -> Result<SpawnedAgent> {
-    let _ = options;
-    spawn_grok_shell(agent_config, cancel, memory_config).await
-}
 /// Authenticate via the agent's `defaultAuthMethodId`, failing closed when none is available.
 /// Returns whether the selected method is API-key auth.
 async fn authenticate(
@@ -806,6 +799,7 @@ pub async fn run_single_turn(
     verbatim: bool,
     options: HeadlessOptions,
 ) -> Result<()> {
+    crate::acp::opencode_shim::set_active(); // oc-build: opencode backend
     let signals = HeadlessSignals::install().await?;
     xai_grok_shell::http::set_process_client_mode_headless();
     let cwd = match options.cwd {
@@ -821,63 +815,11 @@ pub async fn run_single_turn(
         );
     }
     let t_spawn = Instant::now();
-    let raw_config = xai_grok_shell::config::load_effective_config()
-        .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
-    let mut agent_config = AgentConfig::new_from_toml_cfg(&raw_config)
-        .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
-    if let Some(ref token) = options.reasoning_effort
-        && let Some(effort) = parse_canonical_effort_token(token)
-    {
-        agent_config.reasoning_effort_override = Some(effort);
-    }
-    if let Some(ref model) = options.model {
-        agent_config.default_model_override = Some(model.clone());
-    }
-    agent_config.resolve_runtime_fields(&xai_grok_shell::agent::config::RuntimeResolutionContext {
-        raw_config: &raw_config,
-        remote_settings: None,
-        is_headless: true,
-        cli_subagents: None,
-        cli_web_search_model: None,
-        cli_session_summary_model: None,
-        memory_enabled_override: options.memory_enabled_override,
-        disable_web_search: options.disable_web_search,
-        todo_gate: false,
-        laziness_debug_log: None,
-        storage_mode: None,
-    });
-    agent_config.mode = xai_grok_shell::agent::config::AgentMode::Headless;
-    agent_config.default_yolo_mode = options.yolo;
-    agent_config.default_auto_mode = xai_grok_shell::util::config::effective_auto_for_launch(
-        options.yolo,
-        options.permission_mode_flag.as_deref(),
-        None,
-        xai_grok_shell::util::config::PermissionMode::Ask,
-    );
-    apply_agent_flag(&options.agent, &mut agent_config);
-    if let Some(ref json) = options.agents_json {
-        agent_config.cli_agents = parse_cli_agents(json)?;
-    }
-    agent_config.cli_agent_overrides = xai_grok_shell::agent::config::CliAgentOverrides {
-        tools: parse_comma_list(options.cli_tools.as_deref()),
-        disallowed_tools: parse_comma_list(options.cli_disallowed_tools.as_deref()),
-        permission_rules: parse_permission_rules_strict(&options.allow_rules, &options.deny_rules)?,
-        max_turns: options.max_turns,
-        permission_mode: options
-            .permission_mode_flag
-            .as_deref()
-            .map(|s| {
-                serde_json::from_value(serde_json::Value::String(s.to_string()))
-                    .map_err(|e| anyhow::anyhow!("--permission-mode: invalid value: {e}"))
-            })
-            .transpose()?,
-    };
     if options.trust {
         use xai_grok_workspace::folder_trust::{grant_folder_trust, report_cli_trust_grant};
         report_cli_trust_grant(&grant_folder_trust(&cwd));
     }
     let cancel = CancellationToken::new();
-    let memory_config = agent_config.memory_config.clone();
     let mut pending_startup = Some(PendingStartup::new());
     let timer = xai_grok_telemetry::startup::begin(crate::acp::Owner::Client);
     let mut report_startup_failure = |timer: &crate::acp::StartupTimer| {
@@ -889,15 +831,18 @@ pub async fn run_single_turn(
         );
         PendingStartup::finish_held(&mut pending_startup, crate::acp::StartupOutcome::Error);
     };
-    let spawned = match spawn_agent(agent_config, &cancel, memory_config, &options).await {
-        Ok(s) => s,
-        Err(e) => {
-            report_startup_failure(&timer);
-            let msg = format!("Couldn't start session: {e}");
-            emitter.on_error(&msg, None);
-            anyhow::bail!("{msg}");
-        }
-    };
+    let spawned =
+        match crate::acp::opencode_shim::spawn_opencode_shim(&cancel, options.opencode.clone())
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                report_startup_failure(&timer);
+                let msg = format!("Couldn't start session: {e}");
+                emitter.on_error(&msg, None);
+                anyhow::bail!("{msg}");
+            }
+        };
     let agent_guard = AgentShutdownGuard::new(cancel.clone(), Some(spawned.thread_handle));
     let (acp_tx, mut acp_rx) = (spawned.channel.tx, spawned.channel.rx);
     crate::unified_log::init(acp_tx.clone());

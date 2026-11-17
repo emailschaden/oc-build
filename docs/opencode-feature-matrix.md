@@ -3,8 +3,17 @@
 # TUI feature matrix: Grok Build backend vs opencode v2
 
 This document lists the user-facing features of the pager TUI (`crates/codegen/xai-grok-pager`)
-and maps each one to the opencode v2 server that `--opencode-url` connects to through the
-in-process ACP shim (`src/acp/opencode_shim.rs`).
+and maps each one to the opencode v2 server it talks to through the in-process ACP shim
+(`src/acp/opencode_shim.rs`).
+
+**opencode is the only backend (feat/oc-only-backend).** The TUI and headless `-p` always connect
+through the shim; the in-process GrokShell agent, leader mode and the pre-TUI xAI login are
+removed. Server URL: `--opencode-url`, then env `OPENCODE_URL`, then `[opencode] url` in
+`~/.grok/config.toml`, then `http://127.0.0.1:4096`. Password: `OPENCODE_PASSWORD` (optional).
+Model: `--opencode-model` (default `opencode/big-pickle`). The rest of the xAI code paths
+(auth, billing, telemetry, cloud config, managed policy, update, marketplace, feedback, share)
+and the `opencode_shim::is_active()` gate go in the follow-up PRs. "In opencode mode" below now
+means every run.
 
 **How the TUI reaches the backend.** Every feature goes through one of three paths:
 
@@ -50,8 +59,9 @@ in-process ACP shim (`src/acp/opencode_shim.rs`).
 - No `AvailableCommandsUpdate`, no modes (until feat/oc-modes-agents), and no tool list are ever sent. Gated commands
   (`/loop`, `/imagine*`, `/memory`, `/flush`, `/dream`, `/auto`, `/dashboard`, `/recap`, `/voice`)
   therefore stay hidden.
-- Headless `-p` (`src/headless.rs`) is not wired to `--opencode-url`. Only the interactive TUI
-  path in `src/app/mod.rs` is.
+- Headless `-p` (`src/headless.rs`) runs through the same shim (feat/oc-only-backend).
+- An unreachable server or a wrong password fails startup with "can't reach the opencode server
+  at URL" (probe: `GET /api/agent`), for both the TUI and `-p` (feat/oc-only-backend).
 
 **Status legend**
 
@@ -73,7 +83,9 @@ opencode endpoints are under `/api/*` in `/workspace/research/oc2-openapi.json`.
 | Feature | TUI backend call | opencode v2 equivalent | Status |
 |---|---|---|---|
 | Startup handshake / capabilities | `initialize` (+ `_meta.modelState`, `cancelRewind`) | `GET /api/info`, `GET /api/model/default` | works |
-| Auth gate on startup | `authenticate`; `app/mod.rs` skips xAI login when `--opencode-url` is set | server password (basic auth), already handled by `oc-opencode-client` | works |
+| Auth gate on startup | `authenticate` (shim's `opencode` method); the pre-TUI xAI login, auth refresh, managed-policy heal and update check are deleted from startup | server password (basic auth), already handled by `oc-opencode-client` | removed (feat/oc-only-backend) |
+| Server URL / password | `--opencode-url` > `OPENCODE_URL` > `[opencode] url` > `http://127.0.0.1:4096`; `OPENCODE_PASSWORD`; startup probe | `GET /api/agent` (probe) | verified live (feat/oc-only-backend) |
+| Built-in in-process agent (GrokShell) | `acp::connect` / `spawn_grok_shell` | the shim is the only agent | removed (feat/oc-only-backend) |
 | New session (startup, `/new`, `Ctrl+N`) | `session/new` (`Effect::CreateSession`) | `POST /api/session` | works |
 | Send prompt (Enter) | `session/prompt` (`Effect::SendPrompt`/`SendPromptBlocks`) | `POST /api/session/{id}/prompt` | works |
 | Streaming assistant text | `session/update` `AgentMessageChunk` | `session.text.delta` | works |
@@ -187,7 +199,7 @@ opencode endpoints are under `/api/*` in `/workspace/research/oc2-openapi.json`.
 | Background tasks pane (`Ctrl+G`, `/tasks`) | `TaskBackgrounded`/`TaskCompleted`, `x.ai/task_backgrounded`, `x.ai/task/kill` | `GET /api/shell`, `GET /api/shell/{id}/output`, `DELETE /api/shell/{id}`; `shell.created`/`exited` events; `GET /api/experimental/job` | mappable |
 | Send command to background (`Ctrl+B`) | `x.ai/terminal/background` | `POST /api/session/{id}/background` | mappable |
 | Monitor events | `MonitorEvent`, `x.ai/monitor_event` | `watch_mcp_event` tool / `experimental.mcp.event` | no equivalent (niche) |
-| Agent dashboard (`Ctrl+\`, `/dashboard`) | `x.ai/sessions/list` roster, `x.ai/session/list`, leader multi-session (`src/views/dashboard`); disabled in opencode mode (`use_leader && opencode.is_none()`) | `GET /api/session/active`, `GET /api/session`, `session.status` events, multi-session through one `/api/event` stream | mappable (L) |
+| Agent dashboard (`Ctrl+\`, `/dashboard`) | `x.ai/sessions/list` roster, `x.ai/session/list`, (`src/views/dashboard`); the leader roster path is removed (feat/oc-only-backend) | `GET /api/session/active`, `GET /api/session`, `session.status` events, multi-session through one `/api/event` stream | mappable (L) |
 | Dashboard actions (rename, pin, stop, always-approve per row, location picker `/cd`) | `x.ai/session/rename`, `session/cancel`, settings, `x.ai/local_workspace` | `PATCH /api/session/{id}`, `…/interrupt`, `POST /api/session/{id}/move` | mappable (after dashboard) |
 | `/btw` overlay | `x.ai/btw` | see Slash commands | mappable |
 
@@ -198,7 +210,7 @@ opencode endpoints are under `/api/*` in `/workspace/research/oc2-openapi.json`.
 | Diff / review of session edits (hunk tracker) | `x.ai/hunk-tracker/*`, `x.ai/hunkTracker` meta | `GET /api/session/{id}/diff`; `GET /api/vcs/diff`, `/api/vcs/status` | mappable |
 | Review comments | `x.ai/review/comment` | none (the opencode `review` command runs a review prompt) | no equivalent |
 | Git branch / HEAD in status line | local `git_info.rs`, `x.ai/git_head_changed` | `GET /api/vcs`, `vcs.branch.updated` | local |
-| Worktrees (`Ctrl+W` dialog, `Ctrl+N` in worktree, `grok worktree …`) | `x.ai/git/worktree/{create,list,show,remove,gc,detach,salvage,resume_session,…}` | `GET/POST/DELETE /api/worktree`, `POST /api/worktree/refresh`; `worktree.updated`/`resolved`; `POST /api/session/{id}/move` | partial (list/create/remove map; salvage/gc/db have no equivalent) |
+| Worktrees (`Ctrl+W` dialog, `Ctrl+N` in worktree; the `grok worktree …` CLI is removed in feat/oc-only-backend) | `x.ai/git/worktree/{create,list,show,remove,gc,detach,salvage,resume_session,…}` | `GET/POST/DELETE /api/worktree`, `POST /api/worktree/refresh`; `worktree.updated`/`resolved`; `POST /api/session/{id}/move` | partial (list/create/remove map; salvage/gc/db have no equivalent) |
 | Working directory / `/cd` | `session/new` `cwd`, `x.ai/session/add_local_workspace` | `Location.directory` on create; `POST /api/session/{id}/move` | partial (cwd at create works) |
 | Code navigation (goto definition) | `x.ai/code/*` | none in the API (LSP is internal) | no equivalent |
 | PR status | `x.ai/pr/status` | none | no equivalent |
@@ -242,10 +254,10 @@ opencode endpoints are under `/api/*` in `/workspace/research/oc2-openapi.json`.
 | `/feedback` + drafts + trace upload | `x.ai/feedback`, `x.ai/feedback/drafts/*`, `x.ai/feedback/upload-trace`, `x.ai/feedback/dismiss` | none | hidden in opencode mode (feat/oc-hide-xai-only) |
 | Rollout survey | `x.ai/rollout/survey` | none | no equivalent |
 | Announcements, release notes | `x.ai/announcements/update`; release notes are local/bundled | none | no equivalent / local |
-| Remote settings / feature gates | `x.ai/settings/update`, remote config fetch (skipped in opencode mode, `app/mod.rs:715`) | `GET /api/config`, `PATCH /api/experimental/config`, `config.updated` | no equivalent (gates use local defaults) |
+| Remote settings / feature gates | `x.ai/settings/update`; the startup remote config fetch is gone (feat/oc-only-backend) | `GET /api/config`, `PATCH /api/experimental/config`, `config.updated` | no equivalent (gates use local defaults) |
 | Bundle sync (personas, roles) | `x.ai/bundle/status`, `x.ai/bundle/sync` | `GET /api/agent` covers agents | no equivalent; `x.ai/bundle/status` skipped in opencode mode (feat/oc-hide-xai-only) |
 | Cloud environments / remote workspaces | `x.ai/cloud/env/*`, `x.ai/cloud_server_id`, `x.ai/cloud_existing_workspace` | none | no equivalent |
-| Leader mode (multi-client daemon) | `x.ai/leader*` | the opencode server already supports multiple clients | no equivalent (disabled in opencode mode) |
+| Leader mode (multi-client daemon) | `x.ai/leader*`; TUI `--leader`/`--no-leader`, `connect_via_leader`, leader bridge and reconnect handling deleted (the `grok leader`/`agent leader` subcommands remain until PR b) | the opencode server already supports multiple clients | removed (feat/oc-only-backend) |
 
 ### Local UI (no backend)
 
@@ -287,12 +299,13 @@ call an `x.ai/*` method and get `method_not_found`.
 | `/voice` | Visible once the voice gate resolves (seen live); now hidden (feat/oc-hide-xai-only) | Keep hidden. Optional later work on `/api/experimental/voice/*` |
 | Prompt suggestions, `/btw`-free follow-ups, shell autocomplete (`x.ai/suggest*`, `x.ai/follow_ups`) | `FetchPromptSuggestion` / `FetchShellSuggestions` skipped (feat/oc-hide-xai-only); follow-ups untouched | Skip the effects in opencode mode (saves round-trips). Optional later work on `POST …/generate` |
 | Code navigation (`x.ai/code/*`), PR status, review comments | Fail silently | Hide the affordances |
-| Worktree salvage / gc / db / clean-artifacts (`grok worktree …`) | CLI subcommands talk to the local shell, not opencode | Leave the CLI as is; don't expose these in opencode mode |
+| Worktree salvage / gc / db / clean-artifacts (`grok worktree …`) | The CLI needed the in-process agent | removed (feat/oc-only-backend) |
 | MCP per-tool toggle | `x.ai/mcp/toggle_tool` fails | Hide the toggle in the MCP tab |
 | Announcements, rollout survey, remote config, bundle sync, telemetry upload | Skipped or failing quietly | Skip the effects |
-| Cloud environments, leader / multi-client daemon | Leader disabled (`app/mod.rs:823`); cloud never reached | Nothing to do |
+| Cloud environments, leader / multi-client daemon | Leader: removed (feat/oc-only-backend); cloud never reached | Nothing to do |
 | Monitor events | Not produced | Nothing to do |
-| Headless `-p` | Ignores `--opencode-url` and uses the built-in agent | Out of scope here. If wanted, reuse the shim in `headless.rs` (`--opencode-url` → `opencode_shim::connect`) |
+| Headless `-p` | Runs through the shim (`opencode_shim::spawn_opencode_shim`); text and `--output-format json` work | verified live (feat/oc-only-backend) |
+| `grok models` | Lists `GET /api/model` (was: the in-process agent's catalog) | verified live (feat/oc-only-backend) |
 
 Suggested mechanism: add a single `BackendKind::Opencode` flag (or reuse `args.opencode_config()`)
 to the `CommandRegistry` deny list (`set_restricted_commands`) and to the extensions-modal tab

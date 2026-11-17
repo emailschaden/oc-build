@@ -75,7 +75,6 @@ fn process_identity(command: Option<&Command>, is_interactive: bool) -> Option<P
             | Command::Update { .. }
             | Command::Version { .. }
             | Command::Completions { .. }
-            | Command::Worktree(_)
             | Command::DiskUsage(_)
             | Command::Workspace(_),
         ) => (Entrypoint::Cli, Interactivity::Unattended),
@@ -87,38 +86,6 @@ fn process_identity(command: Option<&Command>, is_interactive: bool) -> Option<P
         leader: Standalone,
         interactivity,
     })
-}
-/// True when this command later boots an agent (`spawn_grok_shell` / agent subcommand) that heals managed policy after `apply_sandbox`.
-fn command_needs_pre_sandbox_policy_heal(command: Option<&Command>) -> bool {
-    match command {
-        None
-        | Some(Command::Agent(_))
-        | Some(Command::Dashboard)
-        | Some(Command::Models)
-        | Some(Command::Worktree(_)) => true,
-        Some(
-            Command::Inspect { .. }
-            | Command::Doctor(_)
-            | Command::Leader(_)
-            | Command::Logout
-            | Command::Login { .. }
-            | Command::Mcp(_)
-            | Command::Plugin(_)
-            | Command::Memory(_)
-            | Command::Sessions(_)
-            | Command::Usage(_)
-            | Command::Setup { .. }
-            | Command::Share(_)
-            | Command::Wrap(_)
-            | Command::Export(_)
-            | Command::Trace(_)
-            | Command::Update { .. }
-            | Command::Version { .. }
-            | Command::Completions { .. }
-            | Command::DiskUsage(_)
-            | Command::Workspace(_),
-        ) => false,
-    }
 }
 use std::env;
 use xai_grok_update::enforce_version_policy_or_exit;
@@ -2175,31 +2142,6 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
             }
         }
     }
-    // oc-build: opencode backend skips the xAI managed-policy heal.
-    if command_needs_pre_sandbox_policy_heal(args.command.as_ref()) && args.opencode_url.is_none() {
-        match xai_grok_shell::config::load_agent_config_disk_only() {
-            Ok(agent_cfg) => {
-                let auth_manager =
-                    std::sync::Arc::new(xai_grok_login::AuthManager::new_with_proxy_base_url(
-                        &xai_grok_shell::util::grok_home::grok_home(),
-                        agent_cfg.grok_com_config.clone(),
-                        agent_cfg.endpoints.proxy_url(),
-                    ));
-                auth_manager.configure_refresher(
-                    agent_cfg.grok_com_config.auth_provider_command.clone(),
-                    None,
-                );
-                xai_grok_cloud_config::managed_config::ensure_managed_policy_present(&auth_manager)
-                    .await;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "managed policy: skipped session-start heal (disk config load failed)"
-                );
-            }
-        }
-    }
     xai_grok_shell::config::apply_sandbox(
         None,
         sandbox_profile_arg.as_deref(),
@@ -2227,17 +2169,6 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
                 return Ok(());
             }
             Command::Agent(agent_args) => {
-                if args.leader || args.no_leader {
-                    let flag = if args.leader {
-                        "--leader"
-                    } else {
-                        "--no-leader"
-                    };
-                    anyhow::bail!(
-                        "top-level {flag} applies to the pager TUI, not the agent subcommand. \
-                         Use `grok-pager agent {flag}` instead."
-                    );
-                }
                 enforce_version_policy_or_exit();
                 return run_agent_command(
                     agent_args,
@@ -2275,22 +2206,17 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
             Command::Models => {
                 init_tracing_simple("cli");
                 let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
-                let agent_config = xai_grok_shell::config::load_agent_config_disk_only()
-                    .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
-                return xai_grok_pager::models::list_available_models(&agent_config).await;
+                // oc-build: opencode backend
+                let raw_config = xai_grok_shell::config::load_effective_config()?;
+                return xai_grok_pager::models::list_available_models(
+                    &args.opencode_config(&raw_config),
+                )
+                .await;
             }
             Command::Leader(leader_args) => {
                 init_tracing_simple("cli");
                 let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
                 return run_leader_mgmt(leader_args).await;
-            }
-            Command::Worktree(worktree_args) => {
-                init_tracing_simple("cli");
-                let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
-                let agent_config = xai_grok_shell::config::load_agent_config_disk_only()
-                    .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
-                let result = xai_grok_pager::worktree_cmd::run(worktree_args, &agent_config).await;
-                return result;
             }
             Command::DiskUsage(disk_usage_args) => {
                 init_tracing_simple("cli");
@@ -2463,10 +2389,13 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
         }
         let memory_enabled_override = args.memory_enabled_override();
         let memory_flush = args.memory_flush;
+        // oc-build: opencode backend
+        let opencode = args.opencode_config(&xai_grok_shell::config::load_effective_config()?);
         return xai_grok_pager::headless::run_single_turn(
             headless_prompt,
             args.verbatim,
             xai_grok_pager::headless::HeadlessOptions {
+                opencode,
                 session_id: args.session_id.clone(),
                 resume: args.resume_session.or(args.load_session),
                 resume_title_pinned: args.resume_target_pinned,
@@ -2506,35 +2435,13 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
     }
     enforce_version_policy_or_exit();
     let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
-    type UpdateWaitHandle = tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>>;
-    let bg_update_wait: std::sync::Arc<tokio::sync::Mutex<Option<UpdateWaitHandle>>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(None));
-    // oc-build: opencode backend skips the xAI auto-update check.
-    let check_updates =
-        should_check_for_updates(args.no_auto_update) && args.opencode_url.is_none();
-    let bg_update_rx: Option<tokio::sync::oneshot::Receiver<Option<auto_update::UpdateAvailable>>> =
-        if check_updates {
-            let update_config = update_config.clone();
-            let wait_slot = bg_update_wait.clone();
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            tokio::spawn(async move {
-                let check = auto_update::check_update_background(&update_config).await;
-                if let Some(mut child) = check.download {
-                    *wait_slot.lock().await = Some(tokio::spawn(async move { child.wait().await }));
-                }
-                let _ = tx.send(check.update);
-            });
-            Some(rx)
-        } else {
-            None
-        };
-    let result = xai_grok_pager::app::run(args, bg_update_rx).await;
+    // oc-build: opencode backend; no background update check at startup.
+    let result = xai_grok_pager::app::run(args).await;
     xai_grok_sandbox::flush();
     match result {
         Ok(true) => {
-            let adopted = bg_update_wait.lock().await.take();
             let grok = "grok";
-            if finish_update_on_exit(adopted, &update_config).await {
+            if finish_update_on_exit(None, &update_config).await {
                 eprintln!("Update installed. Run `{grok}` to start.");
             } else {
                 eprintln!("Update did not complete. Run `{grok} update` to retry.");
@@ -2813,37 +2720,6 @@ async fn signal_leaders_to_relaunch(installed_version: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn embedded_agent_commands_heal_managed_policy_before_sandboxing() {
-        for args in [
-            vec!["grok"],
-            vec!["grok", "agent", "stdio"],
-            vec!["grok", "dashboard"],
-            vec!["grok", "models"],
-            vec!["grok", "worktree", "list"],
-        ] {
-            let args = PagerArgs::try_parse_from(args).unwrap();
-            assert!(
-                command_needs_pre_sandbox_policy_heal(args.command.as_ref()),
-                "{args:?}"
-            );
-        }
-    }
-    #[test]
-    fn utility_commands_skip_managed_policy_heal() {
-        for args in [
-            vec!["grok", "inspect"],
-            vec!["grok", "mcp", "list"],
-            vec!["grok", "sessions", "list"],
-            vec!["grok", "version"],
-        ] {
-            let args = PagerArgs::try_parse_from(args).unwrap();
-            assert!(
-                !command_needs_pre_sandbox_policy_heal(args.command.as_ref()),
-                "{args:?}"
-            );
-        }
-    }
     #[test]
     fn default_caps_the_core_count() {
         let nz = |n| NonZeroUsize::new(n).unwrap();
@@ -3153,14 +3029,12 @@ mod tests {
     }
     use clap::Parser as _;
     /// `grok dashboard` flags the startup hook without forcing leader mode.
-    /// The dashboard is independent of leader mode, so the launch keeps whatever leader setting the user (or config) chose.
+    /// `grok dashboard` is consumed and launches the interactive TUI with the dashboard open.
     #[serial_test::serial(GROK_AGENT_DASHBOARD)]
     #[test]
-    fn dashboard_subcommand_flags_startup_without_forcing_leader() {
+    fn dashboard_subcommand_flags_startup() {
         let mut args = PagerArgs::try_parse_from(["grok", "dashboard"]).unwrap();
-        assert!(!args.leader, "fixture: no explicit --leader");
         flag_dashboard_at_startup_if_requested(&mut args).unwrap();
-        assert!(!args.leader, "dashboard must NOT force leader mode");
         assert!(
             args.command.is_none(),
             "soft subcommand must be consumed so the interactive path runs",
@@ -3173,26 +3047,6 @@ mod tests {
         unsafe { std::env::remove_var("GROK_OPEN_DASHBOARD_AT_STARTUP") };
     }
     /// `grok dashboard --no-leader` is allowed.
-    /// The dashboard does not require a leader, so the combination launches into the dashboard in non-leader mode.
-    #[serial_test::serial(GROK_AGENT_DASHBOARD)]
-    #[test]
-    fn dashboard_subcommand_allows_no_leader() {
-        let mut args = PagerArgs::try_parse_from(["grok", "--no-leader", "dashboard"]).unwrap();
-        flag_dashboard_at_startup_if_requested(&mut args)
-            .expect("--no-leader + dashboard must be allowed");
-        assert!(args.no_leader, "--no-leader must be preserved");
-        assert!(!args.leader, "dashboard must not force leader mode");
-        assert!(
-            args.command.is_none(),
-            "soft subcommand must be consumed so the interactive path runs",
-        );
-        assert_eq!(
-            std::env::var("GROK_OPEN_DASHBOARD_AT_STARTUP").as_deref(),
-            Ok("1"),
-            "startup hook flag must be set",
-        );
-        unsafe { std::env::remove_var("GROK_OPEN_DASHBOARD_AT_STARTUP") };
-    }
     /// `GROK_AGENT_DASHBOARD=0` disables the feature; the subcommand must error visibly before the TUI starts.
     #[serial_test::serial(GROK_AGENT_DASHBOARD)]
     #[test]

@@ -61,8 +61,6 @@ mod event_loop_stall;
 mod exit_timeout;
 pub(crate) mod external_editor;
 mod foreign_sessions;
-#[cfg(all(test, unix))]
-mod leader_cluster;
 mod modals;
 pub(crate) mod mode_switch;
 mod mouse;
@@ -480,16 +478,6 @@ pub(crate) struct ExitSummary {
     /// `None` when the newest prompt is still unanswered.
     pub last_response: Option<String>,
 }
-/// Seed this process's UI caches from remote settings. `None` restores defaults.
-fn seed_remote_ui_caches(remote_settings: Option<&xai_grok_shell::util::config::RemoteSettings>) {
-    xai_grok_shell::util::config::cache_remote_auto_mode(
-        remote_settings.and_then(|s| s.auto_mode.clone()),
-    );
-    xai_grok_shell::util::config::cache_remote_prompt_suggestions(
-        remote_settings.and_then(|s| s.prompt_suggestions.clone()),
-    );
-    xai_grok_shell::util::config::set_remote_campaigns_from_settings(remote_settings);
-}
 /// Resolve leader mode, reporting both why it is off and what turned it off.
 ///
 /// Precedence, highest first: `--no-leader`, `--leader`, eligibility, local config `use_leader`, remote `leader_mode` (release-dist), default off.
@@ -566,9 +554,6 @@ pub fn resolve_use_leader(
     );
     (resolved.use_leader, resolved.policy_disable_reason)
 }
-/// How long the sandbox note stays uncovered before a fullscreen TUI opens over it.
-/// Paid only when the note was printed and the screen is about to hide it.
-const SANDBOX_NOTICE_LINGER: std::time::Duration = std::time::Duration::from_millis(1_200);
 /// Tell the user at startup that the sandbox turned leader mode off.
 /// Writes to the dup'd terminal stderr, which survives the TUI's fd-2 redirect (`redirect_native_stderr`).
 /// A fullscreen TUI still paints over it, leaving the line to be read on exit.
@@ -704,102 +689,23 @@ async fn bounded_connect(
 /// Main entry point: connect to agent, init terminal, run event loop, restore.
 /// If a session ID is provided via `--resume` / `--load` / `--continue`, the pager skips the welcome screen and immediately loads that session.
 /// The load replays the session's history; sessions not found locally are restored from remote storage.
-pub async fn run(
-    mut args: PagerArgs,
-    bg_update_rx: Option<
-        tokio::sync::oneshot::Receiver<Option<xai_grok_update::auto_update::UpdateAvailable>>,
-    >,
-) -> anyhow::Result<bool> {
+// oc-build: opencode backend; the opencode shim is the only agent (no xAI login, auth refresh,
+// remote settings, leader mode or update check).
+pub async fn run(args: PagerArgs) -> anyhow::Result<bool> {
+    crate::acp::opencode_shim::set_active();
     let screen_mode_override = screen_mode_relaunch::take_screen_mode_env_override();
     let cancel = CancellationToken::new();
-    // oc-build: opencode backend; skips xAI login, auth refresh, settings prefetch and leader mode.
-    let opencode = args.opencode_config();
-    if opencode.is_some() {
-        crate::acp::opencode_shim::set_active(); // oc-build: opencode backend
-    }
     let startup_start = std::time::Instant::now();
     let raw_config = xai_grok_shell::config::load_effective_config()
         .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
-    let (grok_com_config, proxy_base_url) =
-        match xai_grok_shell::agent::config::Config::new_from_toml_cfg(&raw_config) {
-            Ok(c) => (c.grok_com_config, c.endpoints.proxy_url()),
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to parse config for auth refresh, using defaults");
-                (
-                    xai_grok_login::GrokComConfig::default(),
-                    xai_grok_shell::agent::config::EndpointsConfig::default().proxy_url(),
-                )
-            }
-        };
-    if opencode.is_none()
-        && let xai_grok_login::PreTuiLoginOutcome::SignedIn(auth) =
-            xai_grok_login::maybe_run_pre_tui_external_login(
-                &grok_com_config,
-                proxy_base_url.clone(),
-                args.force_login,
-                io::stdin().is_terminal(),
-            )
-            .await?
-    {
-        xai_grok_shell::agent::init::apply_post_login_config(*auth).await?;
-        args.force_login = false;
-    }
+    let opencode = args.opencode_config(&raw_config);
     xai_tty_utils::redirect_native_stderr();
-    let refreshed_auth = if opencode.is_some() {
-        None
-    } else {
-        tokio::time::timeout(
-            xai_grok_shell::http::STARTUP_AUTH_REFRESH_TIMEOUT,
-            xai_grok_login::try_ensure_fresh_auth(&grok_com_config, proxy_base_url),
-        )
-        .await
-        .unwrap_or(None)
-    };
-    let settings_query = xai_grok_shell::agent::remote_config::settings_get::SettingsQuery::resolve(
-        refreshed_auth,
-        Some(grok_com_config.clone()),
-    );
-    let had_prefetch =
-        xai_grok_shell::agent::remote_config::settings_get::is_eligible(&settings_query);
-    if had_prefetch {
-        xai_grok_shell::agent::remote_config::settings_get::warm_startup_settings(
-            settings_query.clone(),
-        );
-    }
-    xai_grok_shell::agent::mvp_agent::warm_async_http_client();
+    // xAI remote settings are never fetched; the `None` plumbing goes away with the xAI code paths.
+    let remote_settings: Option<xai_grok_shell::util::config::RemoteSettings> = None;
     tokio::task::spawn_blocking(|| {});
     if let Ok(cwd) = std::env::current_dir() {
         crate::git_info::populate_from_cwd_async(cwd);
     }
-    let prefetch_wait_started = std::time::Instant::now();
-    let remote_settings = if had_prefetch {
-        let _wait_span = region!("startup.prefetch_join_wait", Parent::Inherit);
-        let warmed_auth = settings_query.auth().cloned();
-        let wait = {
-            let _settings = region!(
-                "startup.prefetch_join_wait.settings",
-                Parent::Explicit(_wait_span.span())
-            );
-            xai_grok_shell::agent::remote_config::settings_get::await_startup_settings(
-                settings_query,
-                EARLY_PREFETCH_WAIT,
-                &tokio_util::sync::CancellationToken::new(),
-            )
-            .await
-        };
-        let settings = xai_grok_shell::agent::remote_config::settings_get::consume_wait(
-            wait,
-            warmed_auth.as_ref(),
-            &grok_com_config,
-        );
-        xai_grok_telemetry::startup::record_prefetch_wait(prefetch_wait_started.elapsed());
-        settings
-    } else {
-        None
-    };
-    seed_remote_ui_caches(remote_settings.as_ref());
-    let raw_config = xai_grok_shell::config::load_effective_config()
-        .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
     xai_grok_shell::config::cache_standalone_memory_mode(
         xai_grok_shell::config::MemoryConfig::resolve(
             args.experimental_memory,
@@ -809,36 +715,6 @@ pub async fn run(
         )
         .mode,
     );
-    let prefetch_elapsed = startup_start.elapsed();
-    let requested_confinement = xai_grok_sandbox::requested_confinement_profile();
-    let LeaderMode {
-        use_leader,
-        policy_disable_reason,
-        disabled_by_confinement,
-    } = resolve_leader_mode(
-        args.leader,
-        args.no_leader,
-        &raw_config,
-        remote_settings.as_ref(),
-        true,
-        requested_confinement,
-    );
-    let use_leader = use_leader && opencode.is_none(); // oc-build: opencode backend
-    tracing::info!(
-        use_leader,
-        ?policy_disable_reason,
-        sandbox_profile = ?requested_confinement,
-        // The other fields cannot distinguish this from leader mode being off already while a sandbox is on
-        leader_disabled_by_sandbox = disabled_by_confinement.is_some(),
-        prefetch_ms = prefetch_elapsed.as_millis() as u64,
-        "pager TUI leader mode resolved"
-    );
-    if let Some(profile) = disabled_by_confinement {
-        warn_leader_disabled_by_sandbox(profile);
-    }
-    if session_startup::chat_mode_conflicts_with_leader(args.chat(), use_leader) {
-        anyhow::bail!("{}", session_startup::CHAT_MODE_LEADER_CONFLICT);
-    }
     if args.trust {
         use xai_grok_workspace::folder_trust::{grant_folder_trust, report_cli_trust_grant};
         match std::env::current_dir() {
@@ -848,9 +724,6 @@ pub async fn run(
                 eprintln!("error: --trust: failed to resolve cwd; folder not trusted: {e}");
             }
         }
-    }
-    if let Some(reason) = policy_disable_reason {
-        tokio::spawn(xai_grok_shell::leader::kill_stale_reachable_leaders(reason));
     }
     if let Some(err) =
         session_startup::chat_mode_flag_conflict(args.chat(), args.fork_session, args.restore_code)
@@ -1028,9 +901,6 @@ pub async fn run(
         multiplexer = ?term_ctx.multiplexer,
         "resolved fullscreen policy"
     );
-    if disabled_by_confinement.is_some() && screen_mode.is_fullscreen() {
-        tokio::time::sleep(SANDBOX_NOTICE_LINGER).await;
-    }
     crate::theme::cache::set_terminal_theme_enabled(resolve_terminal_theme_enabled(
         remote_settings
             .as_ref()
@@ -1077,12 +947,7 @@ pub async fn run(
             })),
         );
     }
-    let fallback_flags = use_leader.then(|| connect_flags.clone());
-    let primary_target = if use_leader {
-        crate::acp::AgentKind::Leader
-    } else {
-        crate::acp::AgentKind::Embedded
-    };
+    let connect_target = crate::acp::AgentKind::Embedded;
     xai_grok_telemetry::external::init(
         xai_grok_shell::agent::config::resolve_external_otel_config(
             xai_grok_telemetry::external::config::ExternalClientInfo {
@@ -1095,75 +960,28 @@ pub async fn run(
     let tracing_handle = crate::tracing::init_tracing();
     let pending_startup = xai_grok_telemetry::startup::PendingStartup::new();
     let timer = xai_grok_telemetry::startup::begin(crate::acp::Owner::Client);
-    let primary_started = std::time::Instant::now();
     let connect_result = bounded_connect(
         &cancel,
         connect_ui_timeout,
         connect_ui_timeout_env.as_deref(),
-        primary_target,
+        connect_target,
         startup_failure::ConnectAttempt::First,
         &timer,
-        async {
-            // oc-build: opencode backend
-            if let Some(oc) = opencode {
-                return crate::acp::opencode_shim::connect(&cancel, connect_flags, oc).await;
-            }
-            match primary_target {
-                crate::acp::AgentKind::Leader => {
-                    crate::acp::connect_via_leader(&cancel, connect_flags, &raw_config).await
-                }
-                crate::acp::AgentKind::Embedded => {
-                    crate::acp::connect(&cancel, connect_flags).await
-                }
-            }
-        },
+        crate::acp::opencode_shim::connect(&cancel, connect_flags, opencode),
     )
     .await;
-    let (connect_result, embedded_fallback, timer, connect_target) = match connect_result {
-        Err(f) if primary_target == crate::acp::AgentKind::Leader && !cancel.is_cancelled() => {
-            tracing::warn!(error = %f.error, "leader connect failed; falling back to embedded agent");
-            timer.emit_telemetry(primary_target, f.outcome, f.timeout_secs, false);
-            let flags = fallback_flags.expect("set on the use_leader path");
-            let timer = xai_grok_telemetry::startup::begin(crate::acp::Owner::Client);
-            let target = crate::acp::AgentKind::Embedded;
-            let fallback = bounded_connect(
-                &cancel,
-                connect_ui_timeout,
-                connect_ui_timeout_env.as_deref(),
-                target,
-                startup_failure::ConnectAttempt::AfterFallback(startup_failure::EarlierAttempt {
-                    target: primary_target,
-                    wait: primary_started.elapsed(),
-                    outcome: f.outcome,
-                    longest_step: f.longest_step,
-                }),
-                &timer,
-                async { crate::acp::connect(&cancel, flags).await },
-            )
-            .await;
-            (fallback, true, timer, target)
-        }
-        other => (other, false, timer, primary_target),
-    };
     let mut connection = match connect_result {
         Ok(conn) => {
             tracing::info!(
                 elapsed_ms = startup_start.elapsed().as_millis() as u64,
-                use_leader = use_leader && !embedded_fallback,
-                embedded_fallback,
                 phases = %timer.summary(),
                 "Connected"
             );
-            timer.emit_telemetry(
-                connect_target,
-                crate::acp::StartupOutcome::Ok,
-                None,
-                embedded_fallback,
-            );
+            timer.emit_telemetry(connect_target, crate::acp::StartupOutcome::Ok, None, false);
             conn
         }
         Err(f) => {
-            timer.emit_telemetry(connect_target, f.outcome, f.timeout_secs, embedded_fallback);
+            timer.emit_telemetry(connect_target, f.outcome, f.timeout_secs, false);
             if f.outcome == crate::acp::StartupOutcome::Cancelled {
                 pending_startup.abandon();
             } else {
@@ -1210,7 +1028,6 @@ pub async fn run(
         remote_settings,
         term_state,
         materialized,
-        bg_update_rx,
         writer_event_rx,
         &mut reader_thread,
     )
@@ -1955,23 +1772,6 @@ mod tests {
         PagerArgs::try_parse_from(args)
     }
     #[test]
-    fn cli_leader_and_no_leader_conflict() {
-        let result = try_parse_pager(&["grok-pager", "--leader", "--no-leader"]);
-        assert!(result.is_err());
-    }
-    #[test]
-    fn cli_leader_flag_parses() {
-        let args = try_parse_pager(&["grok-pager", "--leader"]).unwrap();
-        assert!(args.leader);
-        assert!(!args.no_leader);
-    }
-    #[test]
-    fn cli_no_leader_flag_parses() {
-        let args = try_parse_pager(&["grok-pager", "--no-leader"]).unwrap();
-        assert!(!args.leader);
-        assert!(args.no_leader);
-    }
-    #[test]
     fn cli_hidden_memory_compat_flags_parse_and_collapse() {
         let enabled = try_parse_pager(&["grok-pager", "--experimental-memory"]).unwrap();
         assert_eq!(enabled.memory_enabled_override(), Some(true));
@@ -1997,30 +1797,11 @@ mod tests {
         assert!(!try_parse_pager(&["grok-pager"]).unwrap().memory_flush);
     }
     #[test]
-    fn cli_neither_leader_flag_defaults_false() {
-        let args = try_parse_pager(&["grok-pager"]).unwrap();
-        assert!(!args.leader);
-        assert!(!args.no_leader);
-    }
-    #[test]
     fn no_leader_flag_overrides_config_for_tui_fallback() {
         let cfg = config_with_leader(true);
         let (use_leader, reason) = resolve_use_leader(false, true, &cfg, None, true, None);
         assert!(!use_leader);
         assert_eq!(reason, None);
-    }
-    /// clap accepts top-level --leader with agent subcommand, so main() must reject the combination at runtime.
-    #[test]
-    fn cli_top_level_leader_with_agent_subcommand_parses_flag() {
-        let args = try_parse_pager(&["grok-pager", "--leader", "agent"]).unwrap();
-        assert!(args.leader);
-        assert!(matches!(args.command, Some(Command::Agent(_))));
-    }
-    #[test]
-    fn cli_top_level_no_leader_with_agent_subcommand_parses_flag() {
-        let args = try_parse_pager(&["grok-pager", "--no-leader", "agent"]).unwrap();
-        assert!(args.no_leader);
-        assert!(matches!(args.command, Some(Command::Agent(_))));
     }
     #[test]
     fn remote_settings_none_falls_through_to_default() {

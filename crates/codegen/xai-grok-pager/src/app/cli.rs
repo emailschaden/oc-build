@@ -128,8 +128,6 @@ See ~/.grok/README.md for more information.
         #[arg(value_enum)]
         shell: Shell,
     },
-    /// Manage git worktrees
-    Worktree(crate::worktree_cmd::WorktreeArgs),
     /// Show what the grok home (~/.grok) uses on disk
     #[command(name = "du", visible_alias = "disk-usage")]
     DiskUsage(crate::disk_usage_cmd::DiskUsageArgs),
@@ -745,30 +743,17 @@ pub struct PagerArgs {
     /// Write sampling events to ~/.grok/logs/sampling.jsonl.
     #[arg(long = "log-sampling", env = "GROK_LOG_SAMPLING", hide = true)]
     pub log_sampling: bool,
-    /// Show the login screen even when credentials are already available.
-    #[arg(long = "force-login", hide = true)]
-    pub force_login: bool,
     /// Use OAuth when the welcome screen starts authentication.
     #[arg(long = "oauth")]
     pub oauth: bool,
-    /// Connect to a shared leader process.
-    #[arg(long, conflicts_with = "no_leader", hide = true)]
-    pub leader: bool,
-    /// Run standalone even when leader mode is configured.
-    #[arg(long, conflicts_with = "leader", hide = true)]
-    pub no_leader: bool,
     // oc-build: opencode backend
-    /// Run the TUI against an opencode v2 server (`opencode serve`) at URL instead of the built-in agent.
-    /// Setting env `OPENCODE_URL` alone (without this flag) also enables opencode mode.
+    /// URL of the opencode v2 server (`opencode serve`) the TUI talks to.
+    /// Precedence: this flag, env `OPENCODE_URL`, `[opencode] url` in ~/.grok/config.toml, then `http://127.0.0.1:4096`.
     /// The server password is read from `OPENCODE_PASSWORD`.
     #[arg(long = "opencode-url", value_name = "URL", env = "OPENCODE_URL")]
     pub opencode_url: Option<String>,
-    /// opencode model as `provider/id` (default `opencode/big-pickle`). Only used with `--opencode-url`.
-    #[arg(
-        long = "opencode-model",
-        value_name = "PROVIDER/ID",
-        requires = "opencode_url"
-    )]
+    /// opencode model as `provider/id` (default `opencode/big-pickle`).
+    #[arg(long = "opencode-model", value_name = "PROVIDER/ID")]
     pub opencode_model: Option<String>,
     /// Initial prompt for the interactive session, e.g. `grok "fix the bug"` or `grok --worktree=feat "create this feature"`.
     #[arg(
@@ -818,11 +803,20 @@ fn strip_cur_dir(path: PathBuf) -> PathBuf {
 }
 impl PagerArgs {
     // oc-build: opencode backend
-    /// `Some` when the TUI should talk to an opencode server instead of the built-in agent.
-    pub fn opencode_config(&self) -> Option<crate::acp::opencode_shim::OpencodeConfig> {
-        let url = self.opencode_url.as_ref().filter(|u| !u.is_empty())?;
-        Some(crate::acp::opencode_shim::OpencodeConfig {
-            url: url.clone(),
+    /// Where the opencode server is, resolved from the flags/env and `raw_config` (`[opencode] url`).
+    pub fn opencode_config(
+        &self,
+        raw_config: &toml::Value,
+    ) -> crate::acp::opencode_shim::OpencodeConfig {
+        let config_url = raw_config
+            .get("opencode")
+            .and_then(|oc| oc.get("url"))
+            .and_then(|v| v.as_str());
+        crate::acp::opencode_shim::OpencodeConfig {
+            url: crate::acp::opencode_shim::resolve_server_url(
+                self.opencode_url.as_deref(),
+                config_url,
+            ),
             password: std::env::var("OPENCODE_PASSWORD")
                 .ok()
                 .filter(|p| !p.is_empty()),
@@ -830,7 +824,7 @@ impl PagerArgs {
                 .opencode_model
                 .clone()
                 .unwrap_or_else(|| crate::acp::opencode_shim::DEFAULT_MODEL.to_owned()),
-        })
+        }
     }
     pub fn memory_enabled_override(&self) -> Option<bool> {
         if self.experimental_memory {

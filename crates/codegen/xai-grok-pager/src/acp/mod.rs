@@ -3,7 +3,6 @@
 //! This module spawns the agent process, initializes the protocol, authenticates, and provides the channel for communication.
 /// Shared plan-file size cap for the pager keep.
 pub(crate) const MAX_PLAN_FILE_BYTES: usize = 256 * 1024;
-pub mod leader_bridge;
 pub mod meta;
 pub mod model_state;
 // oc-build: opencode backend
@@ -64,14 +63,8 @@ pub(in crate::acp) struct AgentEndpoint {
     pub(in crate::acp) tx: AcpAgentTx,
     pub(in crate::acp) rx: AcpClientRx,
     pub(in crate::acp) cancel: CancellationToken,
-    pub(in crate::acp) location: AgentLocation,
-}
-/// Where an agent runs, and the one handle the pager keeps for it.
-pub(in crate::acp) enum AgentLocation {
-    /// On a thread in this process. Exit joins the thread so the agent can finish flushing.
-    Thread(std::thread::JoinHandle<Result<()>>),
-    /// In the leader process. The receiver reports socket reconnects to the event loop.
-    Leader(tokio::sync::watch::Receiver<leader_bridge::ConnectionStatus>),
+    /// The agent's thread in this process. Exit joins it so the agent can finish flushing.
+    pub(in crate::acp) thread: std::thread::JoinHandle<Result<()>>,
 }
 impl From<spawn::SpawnedAgent> for AgentEndpoint {
     fn from(spawned: spawn::SpawnedAgent) -> Self {
@@ -79,7 +72,7 @@ impl From<spawn::SpawnedAgent> for AgentEndpoint {
             tx: spawned.channel.tx,
             rx: spawned.channel.rx,
             cancel: spawned.cancel,
-            location: AgentLocation::Thread(spawned.thread_handle),
+            thread: spawned.thread_handle,
         }
     }
 }
@@ -97,8 +90,7 @@ pub struct AcpConnection {
     pub auth_methods: Vec<acp::AuthMethod>,
     /// Cancellation token to stop the agent.
     pub cancel: CancellationToken,
-    /// In-process agent worker thread (`connect` only). Join after cancel so session actors can flush SessionEnd hooks.
-    /// `None` in leader mode.
+    /// In-process agent worker thread. Join after cancel so the agent can flush.
     pub agent_thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
     /// ACP-advertised slash commands parsed from `InitializeResponse.meta.availableCommands`.
     /// Seeded into every new `AgentSession` so autocomplete has shell builtins and skills immediately, before any `AvailableCommandsUpdate` arrives.
@@ -113,8 +105,6 @@ pub struct AcpConnection {
     /// Auth response metadata from eager authentication (cached token or API key).
     /// Contains `team_name`, etc. `None` when interactive login is required.
     pub auth_meta: Option<serde_json::Value>,
-    /// Leader connection status. `Some` only when connected via leader.
-    pub leader_status_rx: Option<tokio::sync::watch::Receiver<leader_bridge::ConnectionStatus>>,
     /// Whether cancel-rewind is enabled (resolved by shell from config layers).
     pub cancel_rewind_enabled: bool,
     /// Whether the session-recap feature is rolled out for this connection. The client gates its automatic away-recap
@@ -123,8 +113,6 @@ pub struct AcpConnection {
     /// Shell-side feedback trace-offer eligibility (see `feedbackTraceOffer`).
     pub feedback_trace_offer: bool,
     /// `AuthManager` for pager-side authenticated channels (voice STT and TTS).
-    /// In-process mode shares the agent's instance (single token cache); leader mode builds a dedicated one off the same local `auth.json`.
-    /// Either way it resolves a fresh bearer per request via the refresh chain.
     pub auth_manager: std::sync::Arc<xai_grok_login::AuthManager>,
 }
 /// CLI flags that affect agent configuration, threaded from PagerArgs.
@@ -175,56 +163,6 @@ pub struct ConnectFlags {
     /// Ignored when `default_yolo_mode` is true.
     pub default_auto_mode: bool,
 }
-/// Connect to an agent: spawn, initialize, authenticate.
-pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<AcpConnection> {
-    startup::enter(StartupPhase::ConfigLoad);
-    let raw_config = {
-        let _t = xai_grok_telemetry::instrumentation::timer("startup.config_load.merge_layers");
-        xai_grok_shell::config::load_effective_config()
-            .map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?
-    };
-    let mut agent_config = {
-        let _t = xai_grok_telemetry::instrumentation::timer("startup.config_load.parse");
-        AgentConfig::new_from_toml_cfg(&raw_config)
-            .map_err(|e| anyhow::anyhow!("Failed to create agent config: {}", e))?
-    };
-    {
-        let _t = xai_grok_telemetry::instrumentation::timer("startup.config_load.resolve");
-        agent_config.resolve_runtime_fields(
-            &xai_grok_shell::agent::config::RuntimeResolutionContext {
-                raw_config: &raw_config,
-                remote_settings: flags.remote_settings.as_ref(),
-                is_headless: false,
-                cli_subagents: flags.no_subagents.then_some(false),
-                cli_web_search_model: None,
-                cli_session_summary_model: None,
-                memory_enabled_override: flags.memory_enabled_override,
-                disable_web_search: flags.disable_web_search,
-                todo_gate: flags.todo_gate,
-                laziness_debug_log: flags.laziness_debug_log.as_deref(),
-                storage_mode: flags.storage_mode.as_deref(),
-            },
-        );
-    }
-    agent_config.default_yolo_mode = flags.default_yolo_mode;
-    agent_config.default_auto_mode = flags.default_auto_mode && !flags.default_yolo_mode;
-    if let Some(effort) = flags.reasoning_effort_override {
-        agent_config.reasoning_effort_override = Some(effort);
-    }
-    if !flags.permission_rules.is_empty() {
-        agent_config.cli_agent_overrides.permission_rules = flags.permission_rules.clone();
-    }
-    apply_config_writes(&flags);
-    set_identity(ProcessIdentity {
-        entrypoint: Entrypoint::Embedded,
-        leader: LeaderMode::Standalone,
-        interactivity: Interactivity::Interactive,
-    });
-    let memory_config = agent_config.memory_config.clone();
-    let spawned = spawn::spawn_grok_shell(agent_config, cancel, memory_config).await?;
-    let auth_manager = spawned.auth_manager.clone();
-    initialize_connection(AgentEndpoint::from(spawned), &flags, auth_manager).await
-}
 /// Finishes connecting to an agent. Sends it `initialize`, works out whether the user must log in first, and returns the `AcpConnection`.
 /// Every agent target is connected through this function, so these steps are written once.
 pub(in crate::acp) async fn initialize_connection(
@@ -236,12 +174,8 @@ pub(in crate::acp) async fn initialize_connection(
         tx,
         rx,
         cancel,
-        location,
+        thread,
     } = endpoint;
-    let (agent_thread, leader_status_rx) = match location {
-        AgentLocation::Thread(thread) => (Some(thread), None),
-        AgentLocation::Leader(status_rx) => (None, Some(status_rx)),
-    };
     startup::enter(StartupPhase::AcpInitialize);
     let agent = initialize(&tx, flags).await?;
     let (needs_login, login_label, login_method_id, auth_start_mode) =
@@ -265,161 +199,20 @@ pub(in crate::acp) async fn initialize_connection(
         is_grok_shell: agent.is_grok_shell,
         auth_methods: agent.auth_methods,
         cancel,
-        agent_thread,
+        agent_thread: Some(thread),
         available_commands: agent.available_commands,
         needs_login,
         login_label,
         login_method_id,
         auth_start_mode,
         auth_meta,
-        leader_status_rx,
         cancel_rewind_enabled: agent.cancel_rewind_enabled,
         session_recap_available: agent.session_recap_available,
         feedback_trace_offer: agent.feedback_trace_offer,
         auth_manager,
     })
 }
-/// Connect to a leader process and return an `AcpConnection`. The leader provides the ACP transport via IPC (raw
-/// JSON strings over a Unix socket). This function bridges that transport into the same typed `(AcpAgentTx,
-/// AcpClientRx)` pair that `connect()` produces. It then runs the standard initialize and authenticate sequence.
-pub async fn connect_via_leader(
-    cancel: &CancellationToken,
-    flags: ConnectFlags,
-    raw_config: &toml::Value,
-) -> Result<AcpConnection> {
-    use xai_grok_shell::leader::{
-        ClientCapabilities, ClientMode, LeaderReconnector, ReconnectPolicy, connect_or_spawn,
-    };
-    warn_ignored_flags(
-        &unsupported_leader_flags(&flags),
-        "in leader mode (agent config is set at leader startup)",
-    );
-    apply_config_writes(&flags);
-    startup::enter(StartupPhase::ConfigLoad);
-    startup::set_auth_mode(xai_grok_cloud_config::managed_config::classify_auth_mode());
-    let mut agent_config = AgentConfig::new_from_toml_cfg(raw_config)
-        .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
-    agent_config.remote_settings = flags.remote_settings.clone();
-    let client_type = flags
-        .client_identifier
-        .as_deref()
-        .unwrap_or(HEADLESS_CLIENT_TYPE);
-    let env_urls = xai_grok_shell::leader::LeaderEnvUrls::from(&agent_config.grok_com_config);
-    let capabilities = ClientCapabilities {
-        yolo_mode: flags.default_yolo_mode,
-        auto_mode: flags.default_auto_mode && !flags.default_yolo_mode,
-        default_model: agent_config.models.default.clone(),
-        client_version: Some(PAGER_CLIENT_VERSION.to_string()),
-        code_nav_enabled: false,
-        terminal: flags.terminal,
-        fs_read: flags.fs_read,
-        fs_write: flags.fs_write,
-        status_line: flags.status_line,
-        user_message_echo: true,
-    };
-    startup::enter(StartupPhase::LeaderConnect);
-    let conn = {
-        let _t = xai_grok_telemetry::instrumentation::timer("startup.leader_connect.connect");
-        connect_or_spawn(
-            client_type,
-            ClientMode::Stdio,
-            &env_urls,
-            capabilities.clone(),
-        )
-        .await?
-    };
-    let (status_tx, status_rx) = LeaderReconnector::status_channel();
-    let reconnector = LeaderReconnector::new(
-        client_type,
-        ClientMode::Stdio,
-        env_urls,
-        capabilities,
-        status_tx,
-    );
-    let bridge = leader_bridge::bridge_leader_connection(
-        conn,
-        cancel.clone(),
-        Some(reconnector),
-        ReconnectPolicy::unbounded(),
-    )?;
-    let auth_manager = std::sync::Arc::new(xai_grok_login::AuthManager::new_with_proxy_base_url(
-        &xai_grok_shell::util::grok_home::grok_home(),
-        agent_config.grok_com_config.clone(),
-        agent_config.endpoints.proxy_url(),
-    ));
-    set_identity(ProcessIdentity {
-        entrypoint: Entrypoint::Pager,
-        leader: LeaderMode::Attached,
-        interactivity: Interactivity::Interactive,
-    });
-    xai_grok_shell::agent::init::update_telemetry_config(&agent_config, &auth_manager);
-    let endpoint = AgentEndpoint {
-        tx: bridge.channel.tx,
-        rx: bridge.channel.rx,
-        cancel: bridge.cancel,
-        location: AgentLocation::Leader(status_rx),
-    };
-    initialize_connection(endpoint, &flags, auth_manager).await
-}
-/// Prints one warning per flag the chosen backend ignores. `reason` finishes the sentence "has no effect ...".
-/// This runs before tracing is set up, and the pager has already redirected fd 2, so the saved terminal stderr is the sink.
-pub(in crate::acp) fn warn_ignored_flags(flags: &[&'static str], reason: &str) {
-    if flags.is_empty() {
-        return;
-    }
-    xai_grok_shell::util::with_locked_stderr(|stderr| {
-        for flag in flags {
-            let _ = writeln!(stderr, "warning: {flag} has no effect {reason}");
-        }
-    });
-}
-fn unsupported_leader_flags(flags: &ConnectFlags) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    if let Some(flag) = flags.memory_override_flag {
-        out.push(flag);
-    }
-    if flags.disable_web_search {
-        out.push("--disable-web-search");
-    }
-    if flags.storage_mode.is_some() {
-        out.push("--storage-mode");
-    }
-    if flags.no_subagents {
-        out.push("--no-subagents");
-    }
-    if !flags.permission_rules.is_empty() {
-        out.push("--allow/--deny permission rules");
-    }
-    out
-}
-/// Write config.toml fields based on CLI flags.
-pub(super) fn apply_config_writes(flags: &ConnectFlags) {
-    let config_path =
-        xai_grok_shell::util::grok_home::grok_home().join(xai_grok_config::USER_CONFIG_FILENAME);
-    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
-    let mut doc = content
-        .parse::<toml_edit::DocumentMut>()
-        .unwrap_or_default();
-    let mut changed = false;
-    if let Some(ref installer) = flags.installer {
-        let cli = doc
-            .entry("cli")
-            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-        if let Some(tbl) = cli.as_table_mut() {
-            tbl.insert("installer", toml_edit::value(installer.as_str()));
-            changed = true;
-        }
-    }
-    if changed {
-        if let Some(parent) = config_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Err(e) = std::fs::write(&config_path, doc.to_string()) {
-            tracing::warn!(error = %e, "failed to write config.toml");
-        }
-    }
-}
-/// Build the per-session `_meta` for `InitializeRequest` (TUI and leader).
+/// Build the per-session `_meta` for `InitializeRequest`.
 fn build_initialize_meta(flags: &ConnectFlags) -> serde_json::Value {
     let client_type = flags
         .client_identifier
@@ -473,7 +266,7 @@ pub fn parse_default_auth_method_id(meta: Option<&acp::Meta>) -> Option<acp::Aut
         .and_then(|v| v.as_str())
         .map(|s| acp::AuthMethodId::new(s.to_owned()))
 }
-/// The parsed `InitializeResponse`, shared by `connect` and `connect_via_leader`.
+/// The parsed `InitializeResponse`.
 pub(crate) struct InitializedAgent {
     pub(crate) models: ModelState,
     pub(crate) is_grok_shell: bool,
@@ -931,47 +724,6 @@ mod tests {
         let methods = vec![make_auth_method("grok.com", "grok.com", Some(meta))];
         let (_, _, _, mode) = startup_auth_metadata(&methods);
         assert_eq!(mode, AuthStartMode::Pending);
-    }
-    #[test]
-    fn unsupported_leader_flags_empty_when_none_set() {
-        let flags = ConnectFlags::default();
-        assert!(unsupported_leader_flags(&flags).is_empty());
-    }
-    #[test]
-    fn unsupported_leader_flags_detects_all() {
-        let flags = ConnectFlags {
-            memory_enabled_override: Some(true),
-            memory_override_flag: Some("--experimental-memory"),
-            disable_web_search: true,
-            storage_mode: Some("writeback".into()),
-            no_subagents: true,
-            ..Default::default()
-        };
-        let detected = unsupported_leader_flags(&flags);
-        assert_eq!(detected.len(), 4);
-        assert!(detected.contains(&"--experimental-memory"));
-        assert!(detected.contains(&"--disable-web-search"));
-        assert!(detected.contains(&"--storage-mode"));
-        assert!(detected.contains(&"--no-subagents"));
-    }
-    #[test]
-    fn unsupported_leader_flags_preserves_no_memory_spelling() {
-        let flags = ConnectFlags {
-            memory_enabled_override: Some(false),
-            memory_override_flag: Some("--no-memory"),
-            ..Default::default()
-        };
-        assert_eq!(unsupported_leader_flags(&flags), vec!["--no-memory"]);
-    }
-    #[test]
-    fn unsupported_leader_flags_ignores_supported() {
-        let flags = ConnectFlags {
-            terminal: true,
-            fs_read: true,
-            fs_write: true,
-            ..Default::default()
-        };
-        assert!(unsupported_leader_flags(&flags).is_empty());
     }
     #[test]
     fn build_initialize_meta_includes_rules_when_set() {
