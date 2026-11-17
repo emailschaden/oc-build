@@ -128,6 +128,10 @@ pub(crate) fn execute(
     progress_tx: &tokio::sync::mpsc::UnboundedSender<RestoreProgressMsg>,
 ) -> (bool, EffectMeta) {
     let mut meta = EffectMeta::default();
+    // oc-build: opencode backend; xAI-only effects would only fetch `method_not_found`.
+    if crate::acp::opencode_shim::is_active() && crate::acp::opencode_shim::skips_effect(&effect) {
+        return (false, meta);
+    }
     let effect_is_send_now = matches!(effect, Effect::SendPromptNow { .. });
     match effect {
         Effect::RegisterActiveSession { session_id, cwd } => {

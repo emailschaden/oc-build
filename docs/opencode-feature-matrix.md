@@ -35,6 +35,11 @@ in-process ACP shim (`src/acp/opencode_shim.rs`).
 - Stubs: `session/load` returns OK but replays nothing. `session/set_mode` and
   `session/set_model` return OK and are ignored.
 - Every `x.ai/*` method returns `method_not_found`, and every `x.ai/*` notification is dropped.
+- (feat/oc-hide-xai-only) `x.ai/plugins/list`, `x.ai/skills/list` and `x.ai/mcp/list` return
+  `method_not_found` with the message "not available in opencode mode yet". In opencode mode
+  (`opencode_shim::is_active()`) the pager hides the xAI-only commands
+  (`opencode_shim::UNAVAILABLE_COMMANDS`) and extensions tabs, and drops the xAI-only effects
+  (`opencode_shim::skips_effect`).
 - `initialize` sends `_meta.modelState` with exactly one model (`--opencode-model`, default
   `opencode/big-pickle`) and `cancelRewind:false`.
 - Prompt content blocks other than `Text` are dropped. A `ResourceLink` is sent as its URI text.
@@ -82,8 +87,8 @@ opencode endpoints are under `/api/*` in `/workspace/research/oc2-openapi.json`.
 | Served-model badge | `ServedModel`, `ModelChanged`, `ModelAutoSwitched` | `session.model.selected`, `session.step.started` (carries the model) | mappable |
 | Session title (auto) | `SessionSummaryGenerated`, `x.ai/session/info` | `session.renamed` event, `GET /api/session/{id}` `.title` | mappable |
 | Follow-up suggestions | `x.ai/follow_ups` notification | none (could use `POST /api/session/{id}/generate`) | no equivalent |
-| Prompt ghost suggestion | `x.ai/suggestPrompt` | none built in (`POST /api/session/{id}/generate` possible) | no equivalent |
-| Shell-command autocomplete | `x.ai/suggest` | none | no equivalent |
+| Prompt ghost suggestion | `x.ai/suggestPrompt` | none built in (`POST /api/session/{id}/generate` possible) | no equivalent; request skipped in opencode mode (feat/oc-hide-xai-only) |
+| Shell-command autocomplete | `x.ai/suggest` | none | no equivalent; request skipped in opencode mode (feat/oc-hide-xai-only) |
 
 ### Modes, agents, models
 
@@ -101,7 +106,7 @@ opencode endpoints are under `/api/*` in `/workspace/research/oc2-openapi.json`.
 | `/model <name>` set default | `Effect::PersistPreferredModel` (local `~/.grok/config.toml`) + `set_model` | local persist + `POST …/model` | partial |
 | `/effort <level>` (reasoning effort) | `session/set_model` with an effort meta (`acp/model_state.rs` effort levels) | `Model.Ref.variant` (`Model.Info.variants`) in `POST …/model` | mappable |
 | Fast mode / model variant | model id suffix / variant meta | `Model.Ref.variant` (e.g. a `fast` variant if the provider defines one) | mappable |
-| `/context-window <size>` | `session/set_model` with a context-window meta | none (the window is fixed per model) | no equivalent |
+| `/context-window <size>` | `session/set_model` with a context-window meta | none (the window is fixed per model) | hidden in opencode mode (feat/oc-hide-xai-only) |
 | Model notice banner / auto-switch | `ModelAutoSwitched`, `x.ai/models/update` | `model.updated`, `models-dev.refreshed` events | mappable (low value) |
 
 ### Slash commands, skills, workflows
@@ -112,7 +117,7 @@ opencode endpoints are under `/api/*` in `/workspace/research/oc2-openapi.json`.
 | Server commands as `/name` (opencode `init`, `review`, `goal`) | `AvailableCommandsUpdate`, `x.ai/commands/list` (`Effect::RefreshAvailableCommands`); unknown `/x` is `PassThrough`, i.e. sent as a prompt | `GET /api/command` → `AvailableCommandsUpdate`. The shim routes a prompt starting with `/name` to `POST /api/session/{id}/command {"name","text"}` | mappable |
 | Skills as `/skill` commands | `AvailableCommandsUpdate` entries with `_meta` skill scope/path; pager reads SKILL.md (`CommandResult::InjectSkill`) | `GET /api/skill`; activation through prompt `skills:[…]` attachment or `POST /api/experimental/session/{id}/skill` | mappable |
 | `/skills` view (list/toggle) | `x.ai/skills/list`, `x.ai/skills/config` toggle, `x.ai/skills/refresh-baseline` | `GET /api/skill`, `skill.updated` (no enable/disable endpoint) | mappable (read-only) |
-| `/workflows`, `/workflow`, workflow runs | `x.ai/workflows/list`, `WorkflowUpdated` | none | no equivalent |
+| `/workflows`, `/workflow`, workflow runs | `x.ai/workflows/list`, `WorkflowUpdated` | none | hidden in opencode mode (feat/oc-hide-xai-only) |
 | `/goal`, `/deep-research` (shell builtins) | shell `AvailableCommandsUpdate` | opencode `goal` command via `POST …/command`; no deep-research | partial |
 | `/loop [interval] <prompt>` (scheduler) | requires tool `scheduler_create`; `ScheduledTask*` updates, `x.ai/scheduler/delete` | `automation_*` tools; `POST/GET/DELETE /api/experimental/schedule`, `…/pause`, `…/resume` | mappable (experimental API) |
 | `/btw` side question | `x.ai/btw` | `POST /api/session/{id}/generate` (generate text from the session context without changing the transcript) | mappable |
@@ -157,7 +162,7 @@ opencode endpoints are under `/api/*` in `/workspace/research/oc2-openapi.json`.
 | Prompt queue while running (`Ctrl+;`, queue pane) | `x.ai/queue/{remove,reorder,clear,edit,hold_edit,release_edit,interject}`, `x.ai/queue/changed` | `POST …/prompt {"delivery":"queue"}`; `GET /api/session/{id}/inbox`, `PATCH/DELETE …/inbox/{inboxID}`; `session.inbox.*` events | mappable |
 | Send now / interject mid-turn (`Ctrl+Enter`) | `x.ai/interject`, `x.ai/queue/interject` | `POST …/prompt {"delivery":"steer"}` | mappable |
 | Draft stash (`Ctrl+S`), external editor (`Ctrl+G`, `/edit-prompt`), multiline (`/multiline`) | local | n/a | local |
-| `/remember`, `#` note mode | prompt / memory note (`Effect::SaveMemoryNote`) | `PUT /api/experimental/session/{id}/instructions/entries/{key}` (closest) | no equivalent (see Memory) |
+| `/remember`, `#` note mode | prompt / memory note (`Effect::SaveMemoryNote`) | `PUT /api/experimental/session/{id}/instructions/entries/{key}` (closest) | no equivalent; `/remember` hidden in opencode mode (feat/oc-hide-xai-only) |
 
 ### Questions, forms, elicitation
 
@@ -199,7 +204,7 @@ opencode endpoints are under `/api/*` in `/workspace/research/oc2-openapi.json`.
 
 | Feature | TUI backend call | opencode v2 equivalent | Status |
 |---|---|---|---|
-| Extensions modal (`Ctrl+L`, `/plugins`, `/hooks`, `/mcps`, `/skills`) | `src/views/extensions_modal*` fed by the list calls below | per-tab mapping below | partial |
+| Extensions modal (`Ctrl+L`, `/plugins`, `/hooks`, `/mcps`, `/skills`) | `src/views/extensions_modal*` fed by the list calls below | per-tab mapping below | partial; Hooks/Marketplace/Workflows tabs hidden in opencode mode (feat/oc-hide-xai-only); Plugins/Skills/MCP tabs say "not available in opencode mode yet" |
 | `/mcps` list + status | `x.ai/mcp/list`, `x.ai/mcp/server_status`, `x.ai/mcp/init_progress`, `x.ai/mcp_initialized` | `GET /api/mcp`, `mcp.status.changed` | mappable |
 | MCP add/remove | `x.ai/mcp/upsert`, `x.ai/mcp/delete` | `PUT/DELETE /api/experimental/mcp/{server}` | mappable |
 | MCP enable/disable | `x.ai/mcp/toggle` | `POST /api/experimental/mcp/{server}/connect`/`disconnect` | mappable |
@@ -208,8 +213,8 @@ opencode endpoints are under `/api/*` in `/workspace/research/oc2-openapi.json`.
 | MCP resources | n/a | `GET /api/mcp/resource` | n/a |
 | Plugins list | `x.ai/plugins/list`, `PluginsChanged` | `GET /api/plugin`, `plugin.updated` | mappable |
 | Plugin actions (enable/disable/reload/update) | `x.ai/plugins/action`, `x.ai/plugins/reload`, `x.ai/plugins/notify-updates` | `POST /api/plugin/check`, `POST /api/plugin/update`, `POST /api/location/reload`; no enable/disable | partial |
-| Marketplace (`/marketplace`, plugin CTA) | `x.ai/marketplace/list`, `x.ai/marketplace/action` | none | no equivalent |
-| Hooks (`/hooks`, hook annotations) | `x.ai/hooks/list`, `x.ai/hooks/action`, `HookExecution`/`HookAnnotation`/`HooksChanged` | none (opencode extends behaviour through plugins) | no equivalent |
+| Marketplace (`/marketplace`, plugin CTA) | `x.ai/marketplace/list`, `x.ai/marketplace/action` | none | hidden in opencode mode (feat/oc-hide-xai-only) |
+| Hooks (`/hooks`, hook annotations) | `x.ai/hooks/list`, `x.ai/hooks/action`, `HookExecution`/`HookAnnotation`/`HooksChanged` | none (opencode extends behaviour through plugins) | hidden in opencode mode (feat/oc-hide-xai-only) |
 | Project rules / AGENTS.md | shell-side discovery | opencode reads instructions itself; `GET /api/experimental/session/{id}/instructions/entries` | works (server-side) |
 
 ### Memory
@@ -224,17 +229,17 @@ opencode endpoints are under `/api/*` in `/workspace/research/oc2-openapi.json`.
 
 | Feature | TUI backend call | opencode v2 equivalent | Status |
 |---|---|---|---|
-| `/login`, `/logout`, account switch | `x.ai/auth/{get_url,submit_code,cancel,logout,info}`, `x.ai/getApiKey`/`setApiKey` | provider credentials: `GET/POST/PATCH/DELETE /api/credential`, `…/activate`; `POST /api/pair` | no equivalent (xAI account) |
-| Subscription / paywall / team capability | `x.ai/auth/check_subscription`, `x.ai/auth/hydrate_team_capability` | none | no equivalent |
-| `/usage` billing, credit bar, auto top-up | `x.ai/billing`, `x.ai/auto-topup-rule`, `x.ai/limit` | `GET /api/experimental/usage/limits` (provider limits, not billing) | no equivalent |
+| `/login`, `/logout`, account switch | `x.ai/auth/{get_url,submit_code,cancel,logout,info}`, `x.ai/getApiKey`/`setApiKey` | provider credentials: `GET/POST/PATCH/DELETE /api/credential`, `…/activate`; `POST /api/pair` | hidden in opencode mode (feat/oc-hide-xai-only) |
+| Subscription / paywall / team capability | `x.ai/auth/check_subscription`, `x.ai/auth/hydrate_team_capability` | none | no equivalent; checks skipped in opencode mode (feat/oc-hide-xai-only) |
+| `/usage` billing, credit bar, auto top-up | `x.ai/billing`, `x.ai/auto-topup-rule`, `x.ai/limit` | `GET /api/experimental/usage/limits` (provider limits, not billing) | hidden in opencode mode (feat/oc-hide-xai-only); background billing fetches skipped |
 | Token / cost usage of this session | `x.ai/session/usage`, `UsageUpdate` | `session.usage.updated` | mappable (see context bar) |
-| `/privacy` data retention | `x.ai/privacy/setCodingDataRetention` | none | no equivalent |
-| Consent / folder trust | `x.ai/consent/record`, `x.ai/folderTrust` | none | no equivalent |
-| `/feedback` + drafts + trace upload | `x.ai/feedback`, `x.ai/feedback/drafts/*`, `x.ai/feedback/upload-trace`, `x.ai/feedback/dismiss` | none | no equivalent |
+| `/privacy` data retention | `x.ai/privacy/setCodingDataRetention` | none | hidden in opencode mode (feat/oc-hide-xai-only) |
+| Consent / folder trust | `x.ai/consent/record`, `x.ai/folderTrust` | none | no equivalent; consent upload skipped in opencode mode (feat/oc-hide-xai-only) |
+| `/feedback` + drafts + trace upload | `x.ai/feedback`, `x.ai/feedback/drafts/*`, `x.ai/feedback/upload-trace`, `x.ai/feedback/dismiss` | none | hidden in opencode mode (feat/oc-hide-xai-only) |
 | Rollout survey | `x.ai/rollout/survey` | none | no equivalent |
 | Announcements, release notes | `x.ai/announcements/update`; release notes are local/bundled | none | no equivalent / local |
 | Remote settings / feature gates | `x.ai/settings/update`, remote config fetch (skipped in opencode mode, `app/mod.rs:715`) | `GET /api/config`, `PATCH /api/experimental/config`, `config.updated` | no equivalent (gates use local defaults) |
-| Bundle sync (personas, roles) | `x.ai/bundle/status`, `x.ai/bundle/sync` | `GET /api/agent` covers agents | no equivalent |
+| Bundle sync (personas, roles) | `x.ai/bundle/status`, `x.ai/bundle/sync` | `GET /api/agent` covers agents | no equivalent; `x.ai/bundle/status` skipped in opencode mode (feat/oc-hide-xai-only) |
 | Cloud environments / remote workspaces | `x.ai/cloud/env/*`, `x.ai/cloud_server_id`, `x.ai/cloud_existing_workspace` | none | no equivalent |
 | Leader mode (multi-client daemon) | `x.ai/leader*` | the opencode server already supports multiple clients | no equivalent (disabled in opencode mode) |
 
@@ -251,7 +256,7 @@ opencode endpoints are under `/api/*` in `/workspace/research/oc2-openapi.json`.
 | Status line (custom command) | local `RunStatusLineCommand` | n/a | local |
 | `/doctor` | local diagnostics (`src/doctor_cmd`) | n/a | local (xAI checks irrelevant) |
 | `/quit`, `Ctrl+Q` | local | n/a | local |
-| Voice input (`/voice`, voice key) | xAI voice service (`src/voice`), gated, hidden | `GET /api/experimental/voice/models`, `POST /api/experimental/voice/session` (webrtc) | no equivalent (needs a new client; keep hidden) |
+| Voice input (`/voice`, voice key) | xAI voice service (`src/voice`), gated, hidden | `GET /api/experimental/voice/models`, `POST /api/experimental/voice/session` (webrtc) | hidden in opencode mode (feat/oc-hide-xai-only) (needs a new client) |
 | Terminal notifications / bell | local | n/a | local |
 
 ## No equivalent
@@ -262,21 +267,21 @@ call an `x.ai/*` method and get `method_not_found`.
 
 | Feature | Current behaviour in opencode mode (from code) | Recommendation |
 |---|---|---|
-| `/login`, `/logout` | Visible. Calls `x.ai/auth/*` → `method_not_found` error toast. Eager auth already succeeds through the fake `opencode` auth method | Hide both commands in opencode mode. Provider keys live in opencode (`/api/credential`) |
-| `/usage` billing, credit bar, paywall, auto top-up | `x.ai/billing` fails → error / empty modal | Hide `/usage`. Later, show token/cost from `session.usage.updated` in the context bar instead |
-| Subscription / team capability checks | `x.ai/auth/check_subscription` fails, logged only | Skip the effect when the backend is opencode |
-| `/privacy`, consent, folder trust | `x.ai/privacy/…`, `x.ai/consent/record` fail | Hide `/privacy`; skip consent effects |
-| `/feedback` (+ drafts, trace upload) | Modal opens. Send fails with `method_not_found` | Hide, or show "not available in opencode mode" |
+| `/login`, `/logout` | Hidden (feat/oc-hide-xai-only): not in the menu/palette; typed → toast "/login is not available in opencode mode". Eager auth succeeds through the fake `opencode` auth method | Hide both commands in opencode mode. Provider keys live in opencode (`/api/credential`) |
+| `/usage` billing, credit bar, paywall, auto top-up | `/usage` (`/cost`) hidden (feat/oc-hide-xai-only); background `x.ai/billing` refreshes (`FetchBilling` silent, `FetchAppBilling` nonce 0) skipped | Hide `/usage`. Later, show token/cost from `session.usage.updated` in the context bar instead |
+| Subscription / team capability checks | Skipped (feat/oc-hide-xai-only): `CheckSubscription`, `HydrateTeamCapability`, `CreditLimitRecheck` effects dropped | Skip the effect when the backend is opencode |
+| `/privacy`, consent, folder trust | `/privacy` hidden, `RecordConsentUpstream` skipped (feat/oc-hide-xai-only); folder trust untouched | Hide `/privacy`; skip consent effects |
+| `/feedback` (+ drafts, trace upload) | Hidden (feat/oc-hide-xai-only) | Hide, or show "not available in opencode mode" |
 | `/share` | Already returns "Session sharing is temporarily disabled" | Leave as is |
-| `/marketplace`, plugin install CTA | `x.ai/marketplace/list` fails → error state in the modal | Hide the Marketplace tab and the CTA |
-| `/hooks` | `x.ai/hooks/list` fails → error in the Hooks tab | Hide the tab ("opencode uses plugins") |
-| `/workflows`, `/workflow` | `x.ai/workflows/list` fails; `/workflow` shows nothing launchable | Hide |
-| `/memory`, `/flush`, `/dream`, `/remember` | `/memory`/`/flush`/`/dream` hidden (`SHELL_GATED_COMMANDS`, no catalog). `/remember` visible but has no effect server-side | Hide `/remember` too |
+| `/marketplace`, plugin install CTA | Hidden (feat/oc-hide-xai-only): command, Marketplace tab and palette entry removed; marketplace list / CTA catalog / update-check effects skipped | Hide the Marketplace tab and the CTA |
+| `/hooks` | Hidden (feat/oc-hide-xai-only): command, Hooks tab and palette entry removed; `FetchHooksList` skipped | Hide the tab ("opencode uses plugins") |
+| `/workflows`, `/workflow` | Hidden (feat/oc-hide-xai-only): commands, Workflows tab and palette entry removed; `FetchWorkflowsList` skipped | Hide |
+| `/memory`, `/flush`, `/dream`, `/remember` | `/memory`/`/flush`/`/dream` hidden (`SHELL_GATED_COMMANDS`, no catalog). `/remember` hidden (feat/oc-hide-xai-only) | Hide `/remember` too |
 | `/auto` (classifier auto-review) | Hidden (`set_auto_mode_available` never true) | Keep hidden |
-| `/context-window` | Sends `set_model` with meta → ignored, so it silently does nothing | Hide, or message "fixed per model in opencode" |
+| `/context-window` | Hidden (feat/oc-hide-xai-only) | Hide, or message "fixed per model in opencode" |
 | `/imagine-video` | Hidden (tool `image_to_video` not advertised) | Keep hidden |
-| `/voice` | Hidden (voice gate) | Keep hidden. Optional later work on `/api/experimental/voice/*` |
-| Prompt suggestions, `/btw`-free follow-ups, shell autocomplete (`x.ai/suggest*`, `x.ai/follow_ups`) | Requests fail silently; no ghost text | Skip the effects in opencode mode (saves round-trips). Optional later work on `POST …/generate` |
+| `/voice` | Visible once the voice gate resolves (seen live); now hidden (feat/oc-hide-xai-only) | Keep hidden. Optional later work on `/api/experimental/voice/*` |
+| Prompt suggestions, `/btw`-free follow-ups, shell autocomplete (`x.ai/suggest*`, `x.ai/follow_ups`) | `FetchPromptSuggestion` / `FetchShellSuggestions` skipped (feat/oc-hide-xai-only); follow-ups untouched | Skip the effects in opencode mode (saves round-trips). Optional later work on `POST …/generate` |
 | Code navigation (`x.ai/code/*`), PR status, review comments | Fail silently | Hide the affordances |
 | Worktree salvage / gc / db / clean-artifacts (`grok worktree …`) | CLI subcommands talk to the local shell, not opencode | Leave the CLI as is; don't expose these in opencode mode |
 | MCP per-tool toggle | `x.ai/mcp/toggle_tool` fails | Hide the toggle in the MCP tab |
