@@ -57,6 +57,9 @@ use super::{AcpConnection, AgentEndpoint, ConnectFlags, initialize_connection};
 
 /// Default model when `--opencode-model` is not given.
 pub const DEFAULT_MODEL: &str = "opencode/big-pickle";
+/// Server URL when neither `--opencode-url`, `OPENCODE_URL` nor `[opencode] url` is set
+/// (`opencode serve`'s default port).
+pub const DEFAULT_URL: &str = "http://127.0.0.1:4096";
 /// Auth method advertised so the pager's eager-auth step succeeds without a login screen
 /// (an empty list is treated as "needs login").
 const AUTH_METHOD_ID: &str = "opencode";
@@ -96,13 +99,15 @@ const NOT_YET_MESSAGE: &str = "not available in opencode mode yet";
 
 static ACTIVE: OnceLock<()> = OnceLock::new();
 
-/// Mark the process as running against opencode. Called once at startup when
-/// `--opencode-url` is set; read through [`is_active`].
+/// Mark the process as running against opencode. Called first thing by every entry point
+/// that starts the shim (TUI and headless), so it is always set in a real run.
 pub fn set_active() {
     let _ = ACTIVE.set(());
 }
 
-/// True when the TUI talks to an opencode server instead of the built-in agent.
+/// True once the TUI or headless run has started; opencode is the only backend.
+/// TODO(oc-build PR b): drop this flag together with the xAI-only features it hides. It
+/// stays a runtime flag (not `true`) only so their unit tests, deleted in (b), keep running.
 pub fn is_active() -> bool {
     ACTIVE.get().is_some()
 }
@@ -158,6 +163,18 @@ pub struct OpencodeConfig {
     pub model: String,
 }
 
+/// The server URL: `cli` (`--opencode-url` or `OPENCODE_URL`, as clap merges them), then
+/// `config` (`[opencode] url`), then [`DEFAULT_URL`]. Blank values are skipped.
+pub fn resolve_server_url(cli: Option<&str>, config: Option<&str>) -> String {
+    [cli, config]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|u| !u.is_empty())
+        .unwrap_or(DEFAULT_URL)
+        .to_owned()
+}
+
 /// Spawn the shim and run the standard initialize/authenticate sequence against it.
 pub async fn connect(
     cancel: &CancellationToken,
@@ -169,13 +186,24 @@ pub async fn connect(
     initialize_connection(AgentEndpoint::from(spawned), &flags, auth_manager).await
 }
 
-async fn spawn_opencode_shim(
+/// Start the shim on its own runtime thread and return the raw ACP channel pair
+/// (`headless` drives it directly).
+pub(crate) async fn spawn_opencode_shim(
     cancel: &CancellationToken,
     config: OpencodeConfig,
 ) -> Result<SpawnedAgent> {
     let model = parse_model_id(&config.model).context("--opencode-model must be provider/id")?;
     let client = Client::new(config.url.clone(), config.password.clone())
         .context("failed to build the opencode client")?;
+    // Fail at startup, not at the first session, when the server is down or the password is wrong.
+    client.list_agents().await.map_err(|err| {
+        anyhow::anyhow!(
+            "can't reach the opencode server at {}: {err}\n\
+             Start it with `opencode serve`, or point --opencode-url / OPENCODE_URL / \
+             [opencode] url at a running server (password from OPENCODE_PASSWORD).",
+            config.url
+        )
+    })?;
     let directory = std::env::current_dir().context("failed to resolve cwd")?;
     // Inert: constructed only because `SpawnedAgent` carries one. No refresher or
     // refresh loop is started, so it never talks to xAI.

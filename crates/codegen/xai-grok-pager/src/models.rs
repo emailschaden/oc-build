@@ -1,41 +1,29 @@
 //! `grok models` subcommand.
+// oc-build: opencode backend; lists the opencode server's models (`GET /api/model`).
 
-use anyhow::Result;
-use tokio_util::sync::CancellationToken;
-use xai_grok_shell::agent::config::Config as AgentConfig;
-use xai_grok_shell::cli_models::{AuthStatus, list_models};
+use anyhow::{Context, Result};
 
-use crate::client_identity::{PAGER_CLIENT_TYPE, PAGER_CLIENT_VERSION};
+use crate::acp::opencode_shim::OpencodeConfig;
 
-pub async fn list_available_models(agent_config: &AgentConfig) -> Result<()> {
-    match AuthStatus::resolve(agent_config) {
-        AuthStatus::ApiKey => println!("You are using XAI_API_KEY."),
-        AuthStatus::LoggedIn(host) => println!("You are logged in with {}.", host),
-        AuthStatus::ModelCredentials(model) => {
-            println!("Model '{model}' is using its own API key.");
-        }
-        AuthStatus::DeploymentKey => println!("You are authenticated via deployment key."),
-        AuthStatus::NotAuthenticated => println!("You are not authenticated."),
-    }
-    println!();
+pub async fn list_available_models(config: &OpencodeConfig) -> Result<()> {
+    let client = oc_opencode_client::Client::new(config.url.clone(), config.password.clone())
+        .context("failed to build the opencode client")?;
+    let models = client.list_models().await.with_context(|| {
+        format!(
+            "couldn't list models from the opencode server at {}",
+            config.url
+        )
+    })?;
 
-    let cancel = CancellationToken::new();
-    xai_grok_telemetry::startup::mark_utility_process();
-    let spawned = crate::acp::spawn::spawn_grok_shell(agent_config.clone(), &cancel, None).await?;
-    // Cancel and join on every return path, including the `?` below
-    let _agent_guard =
-        crate::acp::spawn::AgentShutdownGuard::new(cancel.clone(), Some(spawned.thread_handle));
-
-    let state = list_models(&spawned.channel.tx, PAGER_CLIENT_TYPE, PAGER_CLIENT_VERSION).await?;
-
-    println!("Default model: {}", state.current_model_id.0);
+    println!("Default model: {}", config.model);
     println!();
     println!("Available models:");
-    for m in state.available_models {
-        if m.model_id == state.current_model_id {
-            println!("  * {} (default)", m.model_id.0);
+    for m in models {
+        let id = format!("{}/{}", m.provider_id, m.id);
+        if id == config.model {
+            println!("  * {id} (default)");
         } else {
-            println!("  - {}", m.model_id.0);
+            println!("  - {id}");
         }
     }
 

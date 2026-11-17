@@ -98,7 +98,7 @@ mod tests {
         );
         // Subcommand dispatch blocks (already on $line[1]) must survive.
         assert!(
-            fixed.contains("grok-worktree-command-$line[1]"),
+            fixed.contains("grok-mcp-command-$line[1]"),
             "nested subcommand dispatch must be untouched"
         );
         // The subcommand list itself must still be offered at the root.

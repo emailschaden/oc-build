@@ -1,28 +1,17 @@
-//! Agent spawning: creates the agent process and ACP channels.
-//!
-//! Simplified to only support GrokShell (in-process) mode.
-//! Subprocess and remote modes can be added later if needed.
+//! Agent thread plumbing: the runtime thread the in-process agent (the opencode shim) runs on,
+//! and its shutdown guard.
+// oc-build: opencode backend; the in-process GrokShell spawn path is gone.
 
 use std::io::{IsTerminal, Write};
-use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::AbortOnDropHandle;
-use xai_grok_telemetry::startup::{self, StartupPhase};
 
-use xai_acp_lib::{
-    AcpAgentChannel, AcpClientChannel, AcpClientTx, AcpGatewayReceiver, AcpGatewaySender,
-    acp_channels,
-};
+use xai_acp_lib::AcpClientChannel;
 use xai_grok_login::AuthManager;
-use xai_grok_shell::{
-    agent::{MvpAgent, activity::SESSION_FLUSH_GRACE, config::Config as AgentConfig},
-    config::watcher::{DiscoveryChange, SkillsFileWatcher},
-    util::grok_home::grok_home,
-};
+use xai_grok_shell::agent::activity::SESSION_FLUSH_GRACE;
 
 /// Extra slack when joining the agent OS thread after cancel so the flush
 /// can finish and the thread can unwind.
@@ -34,51 +23,6 @@ const UPLOAD_DRAIN_AT_CANCEL: Duration = Duration::from_secs(1);
 /// drop waits out every in-flight `spawn_blocking` task (non-abortable), so a
 /// long detached archive build would otherwise hold `/quit` for its duration.
 const WORKER_RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
-
-/// Cancels `token` unless disarmed. Held across the bootstrap join so a
-/// connect-timeout drop (which does not abort `spawn_blocking`) stops the worker.
-struct BootstrapCancelGuard {
-    token: Option<CancellationToken>,
-}
-
-impl BootstrapCancelGuard {
-    fn arm(token: CancellationToken) -> Self {
-        Self { token: Some(token) }
-    }
-
-    fn disarm(&mut self) {
-        self.token.take();
-    }
-}
-
-impl Drop for BootstrapCancelGuard {
-    fn drop(&mut self) {
-        if let Some(token) = self.token.take() {
-            token.cancel();
-        }
-    }
-}
-
-/// Run `work` on the blocking pool. Dropping the future cancels `cancel` so
-/// the worker can stop at its next check; the OS thread is not abortable.
-async fn run_cancellable_blocking<T, F>(cancel: CancellationToken, work: F) -> Result<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    let join = tokio::task::spawn_blocking(work);
-    let mut guard = BootstrapCancelGuard::arm(cancel.clone());
-    tokio::pin!(join);
-    let result = tokio::select! {
-        biased;
-        () = cancel.cancelled() => Err(anyhow::anyhow!("bootstrap cancelled")),
-        result = join.as_mut() => result.context("bootstrap worker join"),
-    };
-    if result.is_ok() {
-        guard.disarm();
-    }
-    result
-}
 
 /// Bounded worker-runtime teardown; see [`WORKER_RUNTIME_SHUTDOWN_GRACE`].
 /// A timed-out blocking task is abandoned, not cancelled, safe only because
@@ -126,8 +70,7 @@ pub struct AgentShutdownGuard {
 }
 
 impl AgentShutdownGuard {
-    /// Guard an in-process agent worker. A `None` thread makes the guard a
-    /// no-op cancel (leader mode has no in-process worker to join).
+    /// Guard an in-process agent worker. A `None` thread makes the guard a no-op cancel.
     pub fn new(cancel: CancellationToken, thread: Option<thread::JoinHandle<Result<()>>>) -> Self {
         Self { cancel, thread }
     }
@@ -245,163 +188,6 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// Auth manager for the embedded shell: construction and refresher wiring
-/// only. The proactive refresh loop starts in [`spawn_grok_shell`]'s body on
-/// `agent_cancel`, so a failed spawn cannot leak it.
-pub(crate) fn boot_auth_manager(
-    home: &std::path::Path,
-    agent_config: &AgentConfig,
-) -> std::sync::Arc<AuthManager> {
-    let auth_manager = std::sync::Arc::new(AuthManager::new_with_proxy_base_url(
-        home,
-        agent_config.grok_com_config.clone(),
-        agent_config.endpoints.proxy_url(),
-    ));
-    auth_manager.configure_refresher(
-        agent_config.grok_com_config.auth_provider_command.clone(),
-        None,
-    );
-    auth_manager
-}
-
-/// Spawn a GrokShell agent in a background thread.
-pub async fn spawn_grok_shell(
-    agent_config: AgentConfig,
-    cancel: &CancellationToken,
-    memory_config: Option<xai_grok_shell::config::MemoryConfig>,
-) -> Result<SpawnedAgent> {
-    let auth_manager = boot_auth_manager(&grok_home(), &agent_config);
-    // Pause token refreshes across system sleep so an OIDC refresh can't
-    // straddle a suspend (which can revoke the refresh token and force
-    // re-login). No-op where the OS listener is unavailable.
-    auth_manager.start_system_power_listener();
-
-    let agent_cancel = cancel.child_token();
-
-    // With no leader, this process owns token refresh; a turn parked on the uncharged 401 path never drives refreshes
-    // itself and relies on this loop. On `agent_cancel` so the loop dies with the agent instead of surviving a failed
-    // spawn.
-    auth_manager.start_proactive_refresh(agent_cancel.child_token());
-    auth_manager.prewarm_auth_refresh(agent_cancel.child_token());
-    // Dropping a token does not cancel it: a `?` exit below creates no SpawnedAgent and no AgentShutdownGuard, so this
-    // guard cancels the prewarm and the refresh loop instead.
-    let cancel_auth_tasks_unless_spawned = agent_cancel.clone().drop_guard();
-
-    xai_grok_shell::agent::app::apply_otel_config(&auth_manager, &agent_config.grok_com_config);
-
-    // Policy repair must finish before any authenticated settings load.
-    xai_grok_cloud_config::managed_config::ensure_managed_policy_present(&auth_manager).await;
-    // This worker is a current-thread runtime. Resolve settings here so the
-    // sync bootstrap below observes a finished wait instead of falling open.
-    let mut agent_config = agent_config;
-    let boot = xai_grok_shell::agent::init::resolve_boot_startup_settings(
-        &mut agent_config,
-        cancel,
-        true,
-        auth_manager.current(),
-    )
-    .await?;
-
-    // On a blocking thread so the connect `select!` can preempt `bootstrap`'s synchronous I/O. A child of the connect
-    // token so a user cancel stops the worker, but a timeout drop does not cancel the parent (the embedded fallback
-    // reuses it).
-    let bootstrap_cancel = cancel.child_token();
-    let worker_cancel = bootstrap_cancel.clone();
-    let bootstrap_auth = auth_manager.clone();
-    let (agent_config, models_manager) = run_cancellable_blocking(bootstrap_cancel, move || {
-        xai_grok_shell::agent::init::bootstrap_with_cancel(
-            &agent_config,
-            &bootstrap_auth,
-            None,
-            &worker_cancel,
-            Some(boot),
-        )
-    })
-    .await?
-    .map_err(anyhow::Error::new)?;
-    models_manager.spawn_background_refresh();
-
-    let (acp_client, acp_agent) = acp_channels();
-
-    // Clone before `auth_manager` is moved into the agent closure below, so the
-    // pager (voice channel) can share the same refreshing bearer.
-    let auth_manager_for_pager = auth_manager.clone();
-
-    let skills_paths = agent_config.skills.paths.clone();
-
-    let spawn_fn: Box<dyn FnOnce(AcpClientTx) -> Result<Rc<MvpAgent>> + Send + 'static> = {
-        Box::new(move |client_tx| {
-            let gateway = AcpGatewaySender::new(client_tx);
-
-            let _t = xai_grok_telemetry::instrumentation::timer("startup.worker_spawn.agent_build");
-            let mut agent =
-                MvpAgent::with_models(gateway, &agent_config, auth_manager, models_manager);
-            drop(_t);
-            if let Some(mc) = memory_config {
-                agent.set_memory_config(mc);
-            }
-            Ok(Rc::new(agent))
-        })
-    };
-
-    // Spawn the agent thread with direct dispatch
-    startup::enter(StartupPhase::WorkerSpawn);
-    let handle =
-        spawn_agent_thread_direct(spawn_fn, acp_agent, agent_cancel.clone(), skills_paths).await?;
-
-    // The spawn succeeded: the caller's AgentShutdownGuard owns cancellation now.
-    let agent_cancel = cancel_auth_tasks_unless_spawned.disarm();
-    Ok(SpawnedAgent {
-        thread_handle: handle,
-        channel: acp_client,
-        cancel: agent_cancel,
-        auth_manager: auth_manager_for_pager,
-    })
-}
-
-/// Spawn an agent in a dedicated thread with direct RPC dispatch.
-/// The agent runs on a single-threaded tokio LocalSet runtime.
-/// RPC requests go directly to the agent via Rc, bypassing simplex pipes.
-async fn spawn_agent_thread_direct(
-    spawn_agent: Box<dyn FnOnce(AcpClientTx) -> Result<Rc<MvpAgent>> + Send + 'static>,
-    channel: AcpAgentChannel,
-    cancel: CancellationToken,
-    skills_paths: Vec<String>,
-) -> Result<thread::JoinHandle<Result<()>>> {
-    spawn_runtime_thread("acp-agent-worker", move |rt| {
-        // Declared before the `LocalSet` so an unwind also drops it last: tokio drops tasks in spawn order, so the gateway task would free the agent before its `LocalRef` tasks are dropped.
-        let mut keepalive: Option<Rc<MvpAgent>> = None;
-        let local = tokio::task::LocalSet::new();
-        let result = local.block_on(&rt, async {
-            let client_tx = channel.tx.clone();
-            let agent_rc = spawn_agent(client_tx)?;
-            keepalive = Some(agent_rc.clone());
-
-            let gw_rx = AcpGatewayReceiver::new(channel.rx, agent_rc.clone()).with_tracing(true);
-            tokio::task::spawn_local(gw_rx.run());
-            let _skills_watcher = AbortOnDropHandle::new(spawn_skills_file_watcher(
-                agent_rc.clone(),
-                skills_paths,
-                cancel.child_token(),
-            ));
-
-            cancel.cancelled().await;
-            agent_rc.flush_all_sessions(SESSION_FLUSH_GRACE).await;
-            tokio::join!(
-                xai_grok_shell::upload::drain_pending_uploads(UPLOAD_DRAIN_AT_CANCEL),
-                xai_grok_telemetry::session_ctx::drain_at_process_exit(),
-            );
-            anyhow::Result::Ok(())
-        });
-        // LocalSet before runtime, as an implicit scope-end drop would do; the agent last.
-        drop(local);
-        drop(keepalive);
-        shutdown_worker_runtime(rt);
-        result
-    })
-    .await
-}
-
 /// Starts a new OS thread, builds a single-threaded Tokio runtime on it, and calls `body` with that runtime.
 /// `name` is the thread name shown in logs and debuggers. `body` is the agent's main function; it runs until the agent stops.
 /// Building the runtime on the new thread means a build failure is returned from this call, and a `Runtime` is never dropped inside Tokio.
@@ -448,69 +234,6 @@ pub(super) async fn spawn_runtime_thread(
     let _ = start_tx.send(());
 
     Ok(handle)
-}
-
-fn spawn_skills_file_watcher(
-    agent: Rc<MvpAgent>,
-    skills_paths: Vec<String>,
-    cancel: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    // Resolve the workspace at call time; the blocking pool may run this after cwd changes.
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let workspace_user_dir = xai_grok_agent::prompt::workspace_user::optional_workspace_user_dir();
-    tokio::task::spawn_local(async move {
-        // Blocking pool with a shutdown cancel, so a slow filesystem cannot wedge teardown.
-        let start_result = run_cancellable_blocking(cancel.clone(), move || {
-            // Plain span, not instrumentation::timer, which would misattribute this off-path walk to startup latency.
-            let _span = tracing::info_span!("skills_watcher").entered();
-            SkillsFileWatcher::start(
-                Some(cwd.as_path()),
-                workspace_user_dir.as_deref(),
-                &skills_paths,
-            )
-        })
-        .await;
-
-        let (mut watcher, mut skills_rx) = match start_result {
-            Ok(Some(started)) => started,
-            Ok(None) => return,
-            Err(e) => {
-                tracing::debug!(error = %e, "skills watcher not started; live reload off");
-                return;
-            }
-        };
-
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                maybe = skills_rx.recv() => match maybe {
-                    Some(change) => {
-                        let created_discovery_dir = watcher.refresh_new_discovery_dirs();
-                        apply_discovery_change(&agent, change, created_discovery_dir);
-                    }
-                    None => break,
-                },
-            }
-        }
-    })
-}
-
-fn apply_discovery_change(agent: &MvpAgent, change: DiscoveryChange, created_discovery_dir: bool) {
-    match change {
-        DiscoveryChange::Skills => {
-            tracing::info!("skill directory changed on disk; reloading skills for all sessions");
-            agent.reload_skills_all_sessions();
-            if created_discovery_dir {
-                agent.advertise_commands_all_sessions();
-            }
-        }
-        DiscoveryChange::Workflows => {
-            tracing::info!(
-                "workflow directory changed on disk; re-advertising commands for all sessions"
-            );
-            agent.advertise_commands_all_sessions();
-        }
-    }
 }
 
 #[cfg(test)]
@@ -568,52 +291,6 @@ mod tests {
         );
     }
 
-    /// The embedded-shell path has no leader process to own token refresh: a parked 401 turn can only self-heal
-    /// in-process through this loop. It starts in `spawn_grok_shell`'s body on `agent_cancel`, so a `?` exit before the
-    /// spawn succeeds (drop-guard fires) must cancel it instead of leaking a refresh loop until process teardown.
-    #[tokio::test]
-    async fn spawn_drop_guard_cancels_proactive_refresh_loop() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let am = boot_auth_manager(dir.path(), &AgentConfig::default());
-        assert!(
-            !am.proactive_refresh_started(),
-            "construction alone must not start the loop — only the guarded spawn body may"
-        );
-
-        // Baseline includes the configured refresher's back-reference; the
-        // loop task's own Arc is the +1 on top of it.
-        let baseline = std::sync::Arc::strong_count(&am);
-
-        // Mirror spawn_grok_shell's wiring: loop on agent_cancel, guarded until
-        // ownership transfers to SpawnedAgent.
-        let cancel = CancellationToken::new();
-        let agent_cancel = cancel.child_token();
-        am.start_proactive_refresh(agent_cancel.child_token());
-        let guard = agent_cancel.clone().drop_guard();
-        assert!(
-            am.proactive_refresh_started(),
-            "the embedded shell must run the proactive refresh loop"
-        );
-        assert_eq!(
-            std::sync::Arc::strong_count(&am),
-            baseline + 1,
-            "the running loop task must hold its own AuthManager Arc"
-        );
-
-        // A `?` exit drops the guard with no SpawnedAgent; the cancelled loop
-        // must release its own AuthManager Arc instead of refreshing forever.
-        drop(guard);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while std::sync::Arc::strong_count(&am) > baseline && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(
-            std::sync::Arc::strong_count(&am),
-            baseline,
-            "dropping the spawn guard must cancel the refresh loop"
-        );
-    }
-
     #[test]
     fn join_reports_clean_worker_exit() {
         let handle = thread::spawn(|| Ok(()));
@@ -649,42 +326,6 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "join must return at its budget, not wait out the worker"
-        );
-    }
-
-    /// `bounded_connect` owns the connect future inside `select!`. The losing
-    /// branch is dropped; that drop must cancel the bootstrap worker.
-    #[tokio::test]
-    async fn dropping_the_blocking_join_cancels_the_worker_token() {
-        let token = CancellationToken::new();
-        let started = std::sync::Arc::new(tokio::sync::Notify::new());
-        let started_worker = started.clone();
-        let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let seen_worker = seen.clone();
-        let worker_token = token.clone();
-        tokio::select! {
-            _ = run_cancellable_blocking(token, move || {
-                started_worker.notify_one();
-                let start = Instant::now();
-                while !worker_token.is_cancelled() && start.elapsed() < Duration::from_secs(5) {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                seen_worker.store(
-                    worker_token.is_cancelled(),
-                    std::sync::atomic::Ordering::SeqCst,
-                );
-            }) => panic!("worker finished before the connect future was dropped"),
-            () = started.notified() => {}
-        }
-        let start = Instant::now();
-        while !seen.load(std::sync::atomic::Ordering::SeqCst)
-            && start.elapsed() < Duration::from_secs(2)
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            seen.load(std::sync::atomic::Ordering::SeqCst),
-            "dropping the join future must cancel the worker token"
         );
     }
 

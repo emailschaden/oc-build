@@ -719,3 +719,18 @@ fn yolo_change_reads_the_pager_notification() {
     let other = serde_json::json!({ "sessionId": SID, "auto_mode": true });
     assert_eq!(yolo_change(&other), None);
 }
+
+#[test]
+fn server_url_prefers_flag_or_env_then_config_then_default() {
+    let cli = Some("http://127.0.0.1:4098");
+    let config = Some("http://10.0.0.2:4096");
+    assert_eq!(resolve_server_url(cli, config), "http://127.0.0.1:4098");
+    assert_eq!(resolve_server_url(None, config), "http://10.0.0.2:4096");
+    assert_eq!(resolve_server_url(None, None), DEFAULT_URL);
+    // Blank values (e.g. `OPENCODE_URL=`) fall through.
+    assert_eq!(
+        resolve_server_url(Some("  "), config),
+        "http://10.0.0.2:4096"
+    );
+    assert_eq!(resolve_server_url(Some(""), Some("")), DEFAULT_URL);
+}

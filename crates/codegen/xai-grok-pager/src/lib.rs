@@ -73,4 +73,3 @@ pub mod tracing;
 pub mod unified_log;
 pub mod views;
 pub mod voice;
-pub mod worktree_cmd;

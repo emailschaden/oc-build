@@ -1,6 +1,6 @@
 //! `grok plugin` CLI subcommand: manage plugins and marketplace sources.
 //!
-//! Follows the `memory_cmd.rs`, `sessions_cmd.rs`, and `worktree_cmd` pattern: clap args and handler logic co-located in a dedicated module.
+//! Follows the `memory_cmd.rs`, and `sessions_cmd.rs` pattern: clap args and handler logic co-located in a dedicated module.
 //! The pager's `main.rs` dispatches here with a one-liner.
 //!
 //! Business logic lives in `xai_grok_shell::plugin` and lower crates (`xai-grok-agent`, `xai-grok-plugin-marketplace`).
