@@ -10,7 +10,10 @@
 //! interrupts it, and `permission.asked` becomes `session/request_permission`.
 //!
 //! The model list comes from `GET /api/model` and `session/set_model` switches the
-//! opencode session's model. A rejected permission is replied with a message (the
+//! opencode session's model. Session modes are opencode's primary agents (`GET /api/agent`):
+//! `build` is the pager's `default` mode and `plan` its `plan` mode; `session/set_mode`
+//! switches the session agent. Always-approve (`_meta.yoloMode` on `session/new`,
+//! `x.ai/yolo_mode_changed`) makes the shim answer `permission.asked` with `once` itself. A rejected permission is replied with a message (the
 //! user's feedback or [`DEFAULT_REJECT_MESSAGE`]) so the model continues the turn.
 //!
 //! `x.ai/*` extension calls are answered with stubs. Each call and turn step is
@@ -19,7 +22,7 @@
 //! uses can be audited.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -30,10 +33,12 @@ use agent_client_protocol::{self as acp, Client as _};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use oc_opencode_client::{
-    Client, CreateSession, Decision, Effect, Event, Location, Model, PermissionRule, tool_text,
+    AgentInfo, Client, CreateSession, Decision, Effect, Event, Location, Model, PermissionRule,
+    tool_text,
 };
 use tokio_util::sync::CancellationToken;
 use xai_acp_lib::{AcpGatewayReceiver, AcpGatewaySender, acp_channels};
+use xai_grok_tools::types::SessionMode;
 use xai_grok_tools::types::output::{BashOutput, ToolOutput};
 
 use super::spawn::{SpawnedAgent, spawn_runtime_thread};
@@ -50,6 +55,10 @@ const DEFAULT_REJECT_MESSAGE: &str =
     "The user rejected this tool call. Do not retry it; ask the user how to proceed.";
 /// Shown in the rejected tool block.
 const REJECTED_LABEL: &str = "Rejected by user";
+/// opencode's default primary agent; the pager calls it the `default` mode.
+const BUILD_AGENT: &str = "build";
+/// Turns the plan from a post-turn approve (`_meta.executePlan`) into a build prompt.
+const EXECUTE_PLAN_PROMPT: &str = "The user approved the plan. Implement it now.";
 /// How long a cancelled turn waits for `session.execution.interrupted` before giving up.
 const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
 
@@ -178,6 +187,9 @@ async fn spawn_opencode_shim(
                 directory,
                 catalog: RefCell::new(None),
                 session_models: RefCell::new(HashMap::new()),
+                modes: RefCell::new(None),
+                session_modes: RefCell::new(HashMap::new()),
+                yolo: RefCell::new(HashSet::new()),
                 active: RefCell::new(HashMap::new()),
                 started: Instant::now(),
             }));
@@ -209,6 +221,12 @@ struct OpencodeShim {
     catalog: RefCell<Option<Vec<acp::ModelInfo>>>,
     /// Model id (`provider/id`) chosen via `session/set_model`, keyed by session id.
     session_models: RefCell<HashMap<String, String>>,
+    /// Session modes from `GET /api/agent`, fetched once.
+    modes: RefCell<Option<Vec<acp::SessionMode>>>,
+    /// Current mode id per session (absent means `default`).
+    session_modes: RefCell<HashMap<String, String>>,
+    /// Sessions in always-approve: `permission.asked` is answered `once` without the TUI.
+    yolo: RefCell<HashSet<String>>,
     /// Cancel token of the running turn, keyed by session id.
     active: RefCell<HashMap<String, CancellationToken>>,
     started: Instant,
@@ -239,6 +257,83 @@ impl OpencodeShim {
         self.log(&format!("models: {} listed", models.len()));
         *self.catalog.borrow_mut() = Some(models.clone());
         models
+    }
+
+    /// The mode picker state for `session_id` (or a new session when `None`). `None` when
+    /// the server lists no usable agents, so the pager keeps its built-in Normal/Plan.
+    async fn mode_state(&self, session_id: Option<&str>) -> Option<acp::SessionModeState> {
+        let available = self.available_modes().await;
+        if available.is_empty() {
+            return None;
+        }
+        let current = session_id
+            .and_then(|sid| self.session_modes.borrow().get(sid).cloned())
+            .unwrap_or_else(|| SessionMode::Default.as_id().to_owned());
+        Some(acp::SessionModeState::new(current, available))
+    }
+
+    async fn available_modes(&self) -> Vec<acp::SessionMode> {
+        if let Some(modes) = self.modes.borrow().as_ref() {
+            return modes.clone();
+        }
+        let agents = match self.client.list_agents().await {
+            Ok(agents) => agents,
+            Err(err) => {
+                // Not cached, so a later session retries.
+                tracing::warn!(error = %err, "opencode list_agents failed");
+                return Vec::new();
+            }
+        };
+        let modes = session_modes(&agents);
+        self.log(&format!(
+            "modes: {} of {} agents",
+            modes.len(),
+            agents.len()
+        ));
+        *self.modes.borrow_mut() = Some(modes.clone());
+        modes
+    }
+
+    /// Switch the session's opencode agent to the one behind `mode_id` and confirm the
+    /// mode to the TUI.
+    async fn switch_mode(&self, session_id: &acp::SessionId, mode_id: &str) -> acp::Result<()> {
+        let sid = session_id.0.to_string();
+        let agent = agent_for_mode(mode_id);
+        self.client
+            .switch_agent(&sid, agent)
+            .await
+            .map_err(oc_error)?;
+        self.log(&format!(
+            "session/set_mode {sid} {mode_id} -> agent {agent}"
+        ));
+        self.session_modes
+            .borrow_mut()
+            .insert(sid, mode_id.to_owned());
+        self.notify(
+            session_id,
+            &None,
+            acp::SessionUpdate::CurrentModeUpdate(acp::CurrentModeUpdate::new(mode_id.to_owned())),
+        );
+        Ok(())
+    }
+
+    fn current_mode(&self, sid: &str) -> String {
+        self.session_modes
+            .borrow()
+            .get(sid)
+            .cloned()
+            .unwrap_or_else(|| SessionMode::Default.as_id().to_owned())
+    }
+
+    fn set_yolo(&self, sid: &str, on: bool) {
+        let changed = if on {
+            self.yolo.borrow_mut().insert(sid.to_owned())
+        } else {
+            self.yolo.borrow_mut().remove(sid)
+        };
+        if changed {
+            self.log(&format!("always-approve {sid} -> {on}"));
+        }
     }
 
     fn log(&self, line: &str) {
@@ -301,7 +396,25 @@ impl OpencodeShim {
             };
             match turn.on_event(event) {
                 TurnStep::Ignore => {}
-                TurnStep::Update(update) => self.notify(session_id, &meta, update),
+                TurnStep::Update(update) => {
+                    if let acp::SessionUpdate::CurrentModeUpdate(mode) = &update {
+                        self.session_modes
+                            .borrow_mut()
+                            .insert(sid.clone(), mode.current_mode_id.0.to_string());
+                    }
+                    self.notify(session_id, &meta, update);
+                }
+                TurnStep::Permission { request_id, .. } if self.yolo.borrow().contains(&sid) => {
+                    // Always-approve: the TUI would answer allow-once anyway; skip the round trip.
+                    self.log(&format!("permission {request_id} -> Once (always-approve)"));
+                    if let Err(err) = self
+                        .client
+                        .reply_permission(&sid, &request_id, Decision::Once, None)
+                        .await
+                    {
+                        tracing::warn!(error = %err, "opencode reply_permission failed");
+                    }
+                }
                 TurnStep::Permission {
                     request_id,
                     tool_call,
@@ -448,6 +561,12 @@ impl TurnState {
                     .unwrap_or_else(|| "unknown error".to_owned()),
             ),
             Event::Idle { .. } if self.started => TurnStep::Stop(self.end_reason()),
+            // Another client (or opencode itself) switched the agent mid-turn.
+            Event::AgentSelected { agent, .. } => {
+                TurnStep::Update(acp::SessionUpdate::CurrentModeUpdate(
+                    acp::CurrentModeUpdate::new(mode_for_agent(&agent)),
+                ))
+            }
             // After a cancel, stop painting new output.
             _ if self.cancelling => TurnStep::Ignore,
             Event::TextDelta { delta, .. } => TurnStep::Update(
@@ -638,6 +757,70 @@ fn parse_model_id(model_id: &str) -> Option<Model> {
     })
 }
 
+/// The pager's mode id for an opencode agent: `build` is `default`, others keep their id
+/// (`plan` is already the pager's plan mode).
+fn mode_for_agent(agent: &str) -> String {
+    if agent == BUILD_AGENT {
+        SessionMode::Default.as_id().to_owned()
+    } else {
+        agent.to_owned()
+    }
+}
+
+/// The opencode agent behind a pager mode id; inverse of [`mode_for_agent`].
+fn agent_for_mode(mode_id: &str) -> &str {
+    if mode_id == SessionMode::Default.as_id() {
+        BUILD_AGENT
+    } else {
+        mode_id
+    }
+}
+
+/// Session modes for the pager: opencode's selectable (primary, not hidden) agents, `build`
+/// first so it is the cycle's start. Subagents and the internal compaction/title/summary
+/// agents are left out.
+fn session_modes(agents: &[AgentInfo]) -> Vec<acp::SessionMode> {
+    let mut modes: Vec<acp::SessionMode> = agents
+        .iter()
+        .filter(|a| !a.hidden && matches!(a.mode.as_str(), "primary" | "all"))
+        .map(|a| {
+            let name = if a.name.is_empty() {
+                a.id.clone()
+            } else {
+                a.name.clone()
+            };
+            acp::SessionMode::new(mode_for_agent(&a.id), name).description(a.description.clone())
+        })
+        .collect();
+    let default = SessionMode::Default.as_id();
+    modes.sort_by_key(|m| m.id.0.as_ref() != default);
+    modes
+}
+
+/// The build prompt for a post-turn plan approve: the pager sends empty text with the
+/// plan in `_meta.executePlan.planFileContent`. `None` for any other prompt.
+fn execute_plan_prompt(meta: Option<&acp::Meta>) -> Option<String> {
+    let plan = meta?.get("executePlan")?;
+    let content = plan
+        .get("planFileContent")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or_default();
+    Some(if content.is_empty() {
+        EXECUTE_PLAN_PROMPT.to_owned()
+    } else {
+        format!("{EXECUTE_PLAN_PROMPT}\n\n{content}")
+    })
+}
+
+/// `(session id, always-approve on)` from an `x.ai/yolo_mode_changed` notification.
+/// `None` when the sender left `yolo_mode` out (it only speaks for another setting).
+fn yolo_change(params: &serde_json::Value) -> Option<(String, bool)> {
+    let sid = params.get("sessionId")?.as_str()?;
+    let on = params.get("yolo_mode")?.as_bool()?;
+    Some((sid.to_owned(), on))
+}
+
 /// The picker entries for opencode's model list, ids `provider/id`. `configured`
 /// is kept (first) when the server does not list it, so `current` always resolves.
 fn model_infos(listed: &[oc_opencode_client::ModelInfo], configured: &str) -> Vec<acp::ModelInfo> {
@@ -727,12 +910,21 @@ impl acp::Agent for ShimAgent {
             })
             .await
             .map_err(oc_error)?;
+        let yolo = args
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("yoloMode"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        self.set_yolo(&session.id, yolo);
         self.log(&format!(
             "session/new -> {} in {}",
             session.id,
             directory.display()
         ));
-        Ok(acp::NewSessionResponse::new(session.id).models(self.model_state(None).await))
+        Ok(acp::NewSessionResponse::new(session.id)
+            .models(self.model_state(None).await)
+            .modes(self.mode_state(None).await))
     }
 
     async fn load_session(
@@ -742,14 +934,15 @@ impl acp::Agent for ShimAgent {
         // No history replay yet: the TUI continues on the opencode session id.
         self.log(&format!("session/load {} (no replay)", args.session_id.0));
         let models = self.model_state(Some(&args.session_id.0)).await;
-        Ok(acp::LoadSessionResponse::new().models(models))
+        let modes = self.mode_state(Some(&args.session_id.0)).await;
+        Ok(acp::LoadSessionResponse::new().models(models).modes(modes))
     }
 
     async fn set_session_mode(
         &self,
         args: acp::SetSessionModeRequest,
     ) -> acp::Result<acp::SetSessionModeResponse> {
-        self.log(&format!("session/set_mode {} (ignored)", args.mode_id.0));
+        self.switch_mode(&args.session_id, &args.mode_id.0).await?;
         Ok(acp::SetSessionModeResponse::new())
     }
 
@@ -772,7 +965,16 @@ impl acp::Agent for ShimAgent {
     }
 
     async fn prompt(&self, args: acp::PromptRequest) -> acp::Result<acp::PromptResponse> {
-        let text = prompt_text(&args.prompt);
+        let mut text = prompt_text(&args.prompt);
+        // Plan approve: opencode's plan agent has no exit tool, so leave it here and
+        // prompt the build agent with the approved plan.
+        if let Some(build) = execute_plan_prompt(args.meta.as_ref()) {
+            let default = SessionMode::Default.as_id();
+            if self.current_mode(&args.session_id.0) != default {
+                self.switch_mode(&args.session_id, default).await?;
+            }
+            text = build;
+        }
         let prompt_id = args.meta.as_ref().and_then(|m| m.get("promptId")).cloned();
         // Echo the prompt id so the TUI attributes chunks to this turn.
         let meta = prompt_id.map(|id| {
@@ -818,10 +1020,34 @@ impl acp::Agent for ShimAgent {
     }
 
     async fn ext_notification(&self, args: acp::ExtNotification) -> acp::Result<()> {
+        let params: serde_json::Value = serde_json::from_str(args.params.get()).unwrap_or_default();
+        let handled = match args.method.as_ref() {
+            "x.ai/yolo_mode_changed" => yolo_change(&params)
+                .map(|(sid, on)| self.set_yolo(&sid, on))
+                .is_some(),
+            "x.ai/toggle_plan_mode" => match params.get("sessionId").and_then(|v| v.as_str()) {
+                Some(sid) => {
+                    let plan = SessionMode::Plan.as_id();
+                    let next = if self.current_mode(sid) == plan {
+                        SessionMode::Default.as_id()
+                    } else {
+                        plan
+                    };
+                    let session_id = acp::SessionId::new(sid.to_owned());
+                    if let Err(err) = self.switch_mode(&session_id, next).await {
+                        tracing::warn!(error = %err, "opencode toggle_plan_mode failed");
+                    }
+                    true
+                }
+                None => false,
+            },
+            _ => false,
+        };
         self.log(&format!(
-            "ext_notification {} params={} -> ignored",
+            "ext_notification {} params={} -> {}",
             args.method,
-            truncate(args.params.get(), 200)
+            truncate(args.params.get(), 200),
+            if handled { "handled" } else { "ignored" }
         ));
         Ok(())
     }

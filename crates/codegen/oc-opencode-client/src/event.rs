@@ -56,6 +56,15 @@ pub enum Event {
         status: Value,
     },
 
+    #[serde(rename = "session.agent.selected")]
+    AgentSelected {
+        #[serde(rename = "sessionID")]
+        session_id: String,
+        agent: String,
+        #[serde(default)]
+        previous: Option<String>,
+    },
+
     #[serde(rename = "session.step.started")]
     StepStarted {
         #[serde(rename = "sessionID")]
@@ -302,6 +311,7 @@ impl Event {
             Event::ExecutionInterrupted { .. } => "session.execution.interrupted",
             Event::Idle { .. } => "session.idle",
             Event::Status { .. } => "session.status",
+            Event::AgentSelected { .. } => "session.agent.selected",
             Event::StepStarted { .. } => "session.step.started",
             Event::StepEnded { .. } => "session.step.ended",
             Event::StepFailed { .. } => "session.step.failed",
@@ -333,6 +343,7 @@ impl Event {
             | Event::ExecutionInterrupted { session_id, .. }
             | Event::Idle { session_id }
             | Event::Status { session_id, .. }
+            | Event::AgentSelected { session_id, .. }
             | Event::StepStarted { session_id, .. }
             | Event::StepEnded { session_id, .. }
             | Event::StepFailed { session_id, .. }

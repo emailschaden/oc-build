@@ -1467,7 +1467,9 @@ impl AppView {
             cli_effort_token: None,
             default_yolo: false,
             permission_mode_from_soft_default: true,
-            auto_mode_gate: xai_grok_shell::util::config::auto_permission_mode_enabled_from_disk(),
+            // oc-build: opencode backend; no auto-review classifier, so Auto stays out of the cycle.
+            auto_mode_gate: !crate::acp::opencode_shim::is_active()
+                && xai_grok_shell::util::config::auto_permission_mode_enabled_from_disk(),
             yolo_policy_block: None,
             yolo_launch_block_notice: None,
             screen_mode_switch_hint: None,

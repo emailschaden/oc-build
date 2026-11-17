@@ -96,6 +96,8 @@ fn route(req: &Request) -> (&'static str, &'static str, String) {
         ("POST", "/api/session/ses_1/permission/per_1/reply") => ("204 No Content", JSON, String::new()),
         ("POST", "/api/session/ses_1/model") => ("204 No Content", JSON, String::new()),
         ("GET", "/api/model") => ("200 OK", JSON, r#"{"location":{"directory":"/tmp/x"},"data":[{"id":"big-pickle","providerID":"opencode","name":"Big Pickle","type":"chat","limit":{"context":200000,"output":32000}},{"id":"glm-5.3-flash-free","providerID":"opencode","name":"GLM-5.3-Flash Free"}]}"#.into()),
+        ("GET", "/api/agent") => ("200 OK", JSON, r#"{"location":{"directory":"/tmp/x"},"data":[{"id":"build","name":"Build","description":"The default agent.","mode":"primary","hidden":false,"permissions":[]},{"id":"explore","name":"Explore","mode":"subagent","hidden":false},{"id":"title","name":"Title","mode":"primary","hidden":true}]}"#.into()),
+        ("POST", "/api/session/ses_1/agent") => ("204 No Content", JSON, String::new()),
         ("POST", "/api/session/ses_1/interrupt") => ("200 OK", JSON, r#"{"interrupted":true}"#.into()),
         ("GET", "/api/event") => (
             "200 OK",
@@ -255,5 +257,47 @@ async fn lists_and_switches_models() {
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&reqs[1].body).unwrap(),
         serde_json::json!({"model": {"id": "glm-5.3-flash-free", "providerID": "opencode"}})
+    );
+}
+
+#[tokio::test]
+async fn lists_and_switches_agents() {
+    let (url, log) = mock_server().await;
+    let client = Client::new(url, Some("secret".into())).unwrap();
+
+    let agents = client.list_agents().await.unwrap();
+    let summary: Vec<_> = agents
+        .iter()
+        .map(|a| (a.id.as_str(), a.mode.as_str(), a.hidden))
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("build", "primary", false),
+            ("explore", "subagent", false),
+            ("title", "primary", true)
+        ]
+    );
+    assert_eq!(agents[0].name, "Build");
+    assert_eq!(agents[0].description.as_deref(), Some("The default agent."));
+
+    client.switch_agent("ses_1", "plan").await.unwrap();
+    assert!(matches!(
+        client.switch_agent("ses_missing", "plan").await,
+        Err(Error::Api { status: 400, .. })
+    ));
+
+    let reqs = log.lock().unwrap().clone();
+    assert_eq!(
+        (reqs[0].method.as_str(), reqs[0].path.as_str()),
+        ("GET", "/api/agent")
+    );
+    assert_eq!(
+        (reqs[1].method.as_str(), reqs[1].path.as_str()),
+        ("POST", "/api/session/ses_1/agent")
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&reqs[1].body).unwrap(),
+        serde_json::json!({"agent": "plan"})
     );
 }

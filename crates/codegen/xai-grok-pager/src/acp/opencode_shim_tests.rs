@@ -468,3 +468,101 @@ fn xai_only_effects_are_skipped() {
     assert!(!skips_effect(&Effect::Quit));
     assert!(!skips_effect(&Effect::ResetMouseReporting));
 }
+
+fn agent(id: &str, mode: &str, hidden: bool) -> AgentInfo {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "name": format!("{}{}", id[..1].to_uppercase(), &id[1..]),
+        "mode": mode,
+        "hidden": hidden,
+    }))
+    .expect("agent info")
+}
+
+#[test]
+fn modes_are_the_visible_primary_agents_with_build_as_default() {
+    // Server order from opencode 2.3.0: build, subagents, hidden primaries, then plan.
+    let agents = [
+        agent("general", "subagent", false),
+        agent("build", "primary", false),
+        agent("explore", "subagent", false),
+        agent("compaction", "primary", true),
+        agent("title", "primary", true),
+        agent("summary", "primary", true),
+        agent("plan", "primary", false),
+    ];
+    let modes = session_modes(&agents);
+    let ids: Vec<_> = modes
+        .iter()
+        .map(|m| (m.id.0.as_ref(), m.name.as_str()))
+        .collect();
+    assert_eq!(ids, [("default", "Build"), ("plan", "Plan")]);
+    // The pager parses these ids as its own Normal/Plan modes.
+    assert_eq!(SessionMode::from_id(&modes[0].id.0), SessionMode::Default);
+    assert!(SessionMode::from_id(&modes[1].id.0).is_plan());
+}
+
+#[test]
+fn mode_ids_map_to_agents_and_back() {
+    assert_eq!(agent_for_mode("default"), "build");
+    assert_eq!(agent_for_mode("plan"), "plan");
+    assert_eq!(mode_for_agent("build"), "default");
+    assert_eq!(mode_for_agent("plan"), "plan");
+    // A custom primary agent keeps its id both ways.
+    assert_eq!(agent_for_mode(&mode_for_agent("review")), "review");
+}
+
+#[test]
+fn agent_selected_mid_turn_updates_the_mode() {
+    let mut t = turn();
+    let step = t.on_event(event(
+        "session.agent.selected",
+        serde_json::json!({ "sessionID": SID, "agent": "build", "previous": "plan" }),
+    ));
+    match update(step) {
+        acp::SessionUpdate::CurrentModeUpdate(m) => {
+            assert_eq!(m.current_mode_id.0.as_ref(), "default")
+        }
+        other => panic!("expected CurrentModeUpdate, got {other:?}"),
+    }
+    let other_session = t.on_event(event(
+        "session.agent.selected",
+        serde_json::json!({ "sessionID": "ses_other", "agent": "plan" }),
+    ));
+    assert!(matches!(other_session, TurnStep::Ignore));
+}
+
+#[test]
+fn execute_plan_meta_becomes_a_build_prompt() {
+    let meta = |v: serde_json::Value| v.as_object().cloned().expect("object");
+    let with_plan = meta(serde_json::json!({
+        "promptId": "p1",
+        "executePlan": { "planFileContent": "# Plan\n1. write x\n" },
+    }));
+    let prompt = execute_plan_prompt(Some(&with_plan)).expect("execute plan");
+    assert!(prompt.starts_with(EXECUTE_PLAN_PROMPT));
+    assert!(prompt.ends_with("# Plan\n1. write x"));
+
+    let empty = meta(serde_json::json!({ "executePlan": { "planFileContent": "  " } }));
+    assert_eq!(
+        execute_plan_prompt(Some(&empty)).as_deref(),
+        Some(EXECUTE_PLAN_PROMPT)
+    );
+
+    let normal = meta(serde_json::json!({ "promptId": "p2" }));
+    assert_eq!(execute_plan_prompt(Some(&normal)), None);
+    assert_eq!(execute_plan_prompt(None), None);
+}
+
+#[test]
+fn yolo_change_reads_the_pager_notification() {
+    let on = serde_json::json!({
+        "sessionId": SID, "yolo_mode": true, "auto_mode": false, "permission_mode": "always-approve",
+    });
+    assert_eq!(yolo_change(&on), Some((SID.to_owned(), true)));
+    let off = serde_json::json!({ "sessionId": SID, "yolo_mode": false, "permission_mode": "ask" });
+    assert_eq!(yolo_change(&off), Some((SID.to_owned(), false)));
+    // The settings-sync sender omits `yolo_mode` on purpose: leave the state alone.
+    let other = serde_json::json!({ "sessionId": SID, "auto_mode": true });
+    assert_eq!(yolo_change(&other), None);
+}
