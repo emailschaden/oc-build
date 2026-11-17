@@ -53,6 +53,75 @@ const REJECTED_LABEL: &str = "Rejected by user";
 /// How long a cancelled turn waits for `session.execution.interrupted` before giving up.
 const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
 
+/// Builtin slash commands with no opencode equivalent (canonical names). In opencode mode
+/// they are left out of the completion menu, and a typed one shows
+/// [`unavailable_message`] instead of running.
+pub const UNAVAILABLE_COMMANDS: &[&str] = &[
+    "login",
+    "logout",
+    "usage",
+    "privacy",
+    "feedback",
+    "marketplace",
+    "hooks",
+    "workflows",
+    "workflow",
+    "remember",
+    "context-window",
+    // Dictation goes to the xAI voice service.
+    "voice",
+];
+/// Error message for the `x.ai/*` list calls of features opencode can back later.
+const NOT_YET_MESSAGE: &str = "not available in opencode mode yet";
+
+static ACTIVE: OnceLock<()> = OnceLock::new();
+
+/// Mark the process as running against opencode. Called once at startup when
+/// `--opencode-url` is set; read through [`is_active`].
+pub fn set_active() {
+    let _ = ACTIVE.set(());
+}
+
+/// True when the TUI talks to an opencode server instead of the built-in agent.
+pub fn is_active() -> bool {
+    ACTIVE.get().is_some()
+}
+
+/// True for a builtin command (canonical name) that has no opencode equivalent.
+pub fn is_unavailable_command(name: &str) -> bool {
+    UNAVAILABLE_COMMANDS.contains(&name)
+}
+
+/// Shown when the user types a command from [`UNAVAILABLE_COMMANDS`] in full.
+pub fn unavailable_message(name: &str) -> String {
+    format!("/{name} is not available in opencode mode")
+}
+
+/// True for a pager effect that only calls an xAI-only `x.ai/*` method (account, billing,
+/// consent, suggestions, bundle sync, marketplace, hooks, workflows). In opencode mode the
+/// effect runner drops these, so they never reach the shim.
+pub(crate) fn skips_effect(effect: &crate::app::actions::Effect) -> bool {
+    use crate::app::actions::Effect;
+    matches!(
+        effect,
+        Effect::CheckSubscription { .. }
+            | Effect::HydrateTeamCapability { .. }
+            | Effect::CreditLimitRecheck { .. }
+            // Background refreshes only; a usage modal waiting on a nonce still gets its error.
+            | Effect::FetchBilling { silent: true, nonce: 0, .. }
+            | Effect::FetchAppBilling { nonce: 0 }
+            | Effect::RecordConsentUpstream { .. }
+            | Effect::FetchShellSuggestions { .. }
+            | Effect::FetchPromptSuggestion { .. }
+            | Effect::FetchBundleStatus
+            | Effect::FetchMarketplaceList { .. }
+            | Effect::FetchPluginCtaCatalog { .. }
+            | Effect::CheckMarketplaceUpdates { .. }
+            | Effect::FetchHooksList { .. }
+            | Effect::FetchWorkflowsList { .. }
+    )
+}
+
 /// Where and how to reach the opencode server.
 #[derive(Debug, Clone)]
 pub struct OpencodeConfig {
@@ -759,9 +828,19 @@ impl acp::Agent for ShimAgent {
 }
 
 /// Stub for `x.ai/*` methods: method-not-found everywhere, which the TUI already
-/// treats as "agent does not support this".
-fn stub_ext_method(_method: &str) -> (acp::Result<acp::ExtResponse>, &'static str) {
-    (Err(acp::Error::method_not_found()), "method_not_found")
+/// treats as "agent does not support this". The extensions-modal tabs opencode can
+/// back later (plugins, skills, MCP) get a message saying so instead of "Method not found".
+fn stub_ext_method(method: &str) -> (acp::Result<acp::ExtResponse>, &'static str) {
+    match method {
+        "x.ai/plugins/list" | "x.ai/skills/list" | "x.ai/mcp/list" => (
+            Err(acp::Error::new(
+                acp::ErrorCode::MethodNotFound.into(),
+                NOT_YET_MESSAGE.to_owned(),
+            )),
+            "not_yet",
+        ),
+        _ => (Err(acp::Error::method_not_found()), "method_not_found"),
+    }
 }
 
 fn permission_options() -> Vec<acp::PermissionOption> {

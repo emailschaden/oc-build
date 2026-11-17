@@ -737,7 +737,8 @@ impl AgentView {
         // This keeps the default (L/R expand/collapse on the selected item) unless the user explicitly moved focus to the tabs with arrows
         {
             let state = self.extensions_modal.as_mut().unwrap();
-            let labels: Vec<&str> = crate::views::extensions_modal::ExtensionsTab::ALL
+            // oc-build: opencode backend
+            let labels: Vec<&str> = crate::views::extensions_modal::ExtensionsTab::shown()
                 .iter()
                 .map(|t| t.label())
                 .collect();
@@ -895,11 +896,13 @@ impl AgentView {
         };
 
         // Build the same config as the renderer.
-        let labels: Vec<&str> = crate::views::extensions_modal::ExtensionsTab::ALL
+        // oc-build: opencode backend
+        let labels: Vec<&str> = crate::views::extensions_modal::ExtensionsTab::shown()
             .iter()
             .map(|t| t.label())
             .collect();
-        let active_idx = crate::views::extensions_modal::ExtensionsTab::ALL
+        // oc-build: opencode backend
+        let active_idx = crate::views::extensions_modal::ExtensionsTab::shown()
             .iter()
             .position(|t| *t == state.active_tab)
             .unwrap_or(0);
@@ -970,7 +973,8 @@ impl AgentView {
             }
             crate::views::picker::PickerOutcome::TabChanged(idx) => {
                 if let Some(ref mut state) = self.extensions_modal
-                    && let Some(&tab) = crate::views::extensions_modal::ExtensionsTab::ALL.get(idx)
+                    // oc-build: opencode backend
+                    && let Some(&tab) = crate::views::extensions_modal::ExtensionsTab::shown().get(idx)
                 {
                     // switch_tab also clears the Add form, error overlay, and pending [processing] badge
                     // The new tab thus opens in a clean browse view
@@ -1175,7 +1179,9 @@ impl AgentView {
                     return InputOutcome::Changed;
                 }
                 crate::views::modal_window::ModalWindowOutcome::TabChanged(idx) => {
-                    if let Some(&tab) = crate::views::extensions_modal::ExtensionsTab::ALL.get(idx)
+                    // oc-build: opencode backend
+                    if let Some(&tab) =
+                        crate::views::extensions_modal::ExtensionsTab::shown().get(idx)
                     {
                         // Clears Add form, error overlay, and pending badge in addition to resetting picker state
                         state.switch_tab_focus_list(tab);
@@ -1193,7 +1199,8 @@ impl AgentView {
                     // Resolve the char here; dispatch after the borrow is released so execute_modal_button_action can take &mut self
                     if id == 98 {
                         // The "Tab/Shift+Tab tabs" hint: cycle to the next tab, mirroring the Tab keypress flow
-                        let all = crate::views::extensions_modal::ExtensionsTab::ALL;
+                        // oc-build: opencode backend
+                        let all = crate::views::extensions_modal::ExtensionsTab::shown();
                         let cur = all.iter().position(|&t| t == state.active_tab).unwrap_or(0);
                         let next = (cur + 1) % all.len();
                         if let Some(&tab) = all.get(next) {
@@ -1279,11 +1286,13 @@ impl AgentView {
         }
 
         // Build the same config as the renderer/key handler.
-        let labels: Vec<&str> = crate::views::extensions_modal::ExtensionsTab::ALL
+        // oc-build: opencode backend
+        let labels: Vec<&str> = crate::views::extensions_modal::ExtensionsTab::shown()
             .iter()
             .map(|t| t.label())
             .collect();
-        let active_idx = crate::views::extensions_modal::ExtensionsTab::ALL
+        // oc-build: opencode backend
+        let active_idx = crate::views::extensions_modal::ExtensionsTab::shown()
             .iter()
             .position(|t| *t == state.active_tab)
             .unwrap_or(0);
@@ -1373,7 +1382,8 @@ impl AgentView {
             }
             crate::views::picker::PickerOutcome::TabChanged(idx) => {
                 if let Some(ref mut state) = self.extensions_modal
-                    && let Some(&tab) = crate::views::extensions_modal::ExtensionsTab::ALL.get(idx)
+                    // oc-build: opencode backend
+                    && let Some(&tab) = crate::views::extensions_modal::ExtensionsTab::shown().get(idx)
                 {
                     // Clears Add form, error overlay, and pending badge in addition to resetting picker state
                     state.switch_tab_focus_list(tab);

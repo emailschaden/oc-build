@@ -384,3 +384,87 @@ fn model_id_parses_provider_and_id() {
     assert!(parse_model_id("big-pickle").is_none());
     assert!(parse_model_id("/x").is_none());
 }
+
+/// Builtins with the runtime voice gate open, as in a live session.
+fn builtin_registry() -> crate::slash::registry::CommandRegistry {
+    let mut reg =
+        crate::slash::registry::CommandRegistry::new(crate::slash::commands::builtin_commands());
+    reg.set_voice_visible(true);
+    reg
+}
+
+fn opencode_registry() -> crate::slash::registry::CommandRegistry {
+    let mut reg = builtin_registry();
+    reg.hide_unavailable_in_opencode();
+    reg
+}
+
+#[test]
+fn unavailable_commands_are_real_builtins() {
+    let reg = builtin_registry();
+    for name in UNAVAILABLE_COMMANDS {
+        let cmd = reg.get_for_dispatch(name);
+        assert_eq!(
+            cmd.map(|c| c.name()),
+            Some(*name),
+            "/{name} is not a builtin"
+        );
+    }
+}
+
+#[test]
+fn unavailable_commands_leave_the_menu_but_still_resolve() {
+    let reg = opencode_registry();
+    let offered: Vec<&str> = reg
+        .triggers()
+        .iter()
+        .map(|t| t.canonical.as_str())
+        .collect();
+    for name in UNAVAILABLE_COMMANDS {
+        assert!(!offered.contains(name), "/{name} is still offered");
+        assert!(reg.get(name).is_none(), "/{name} still completes");
+        // A typed one still resolves, so the prompt can say it is unavailable.
+        assert!(reg.get_for_dispatch(name).is_some());
+    }
+    // The `/cost` alias of `/usage` resolves to the hidden command too.
+    let cost = reg.get_for_dispatch("cost").expect("alias resolves");
+    assert!(is_unavailable_command(cost.name()));
+    for kept in ["help", "model", "plugins", "skills", "mcps", "new"] {
+        assert!(offered.contains(&kept), "/{kept} should stay offered");
+    }
+}
+
+#[test]
+fn unavailable_command_message_names_the_command() {
+    assert!(is_unavailable_command("usage"));
+    assert!(!is_unavailable_command("model"));
+    assert_eq!(
+        unavailable_message("usage"),
+        "/usage is not available in opencode mode"
+    );
+}
+
+#[test]
+fn later_mappable_list_calls_say_not_yet() {
+    for method in ["x.ai/plugins/list", "x.ai/skills/list", "x.ai/mcp/list"] {
+        let (result, _) = stub_ext_method(method);
+        let err = result.expect_err("stubbed");
+        assert_eq!(err.code, acp::ErrorCode::MethodNotFound);
+        assert_eq!(err.to_string(), NOT_YET_MESSAGE);
+    }
+    let (result, label) = stub_ext_method("x.ai/billing");
+    assert_eq!(result.expect_err("stubbed"), acp::Error::method_not_found());
+    assert_eq!(label, "method_not_found");
+}
+
+#[test]
+fn xai_only_effects_are_skipped() {
+    use crate::app::actions::Effect;
+    assert!(skips_effect(&Effect::FetchBundleStatus));
+    assert!(skips_effect(&Effect::CheckSubscription { verify: None }));
+    assert!(skips_effect(&Effect::FetchAppBilling { nonce: 0 }));
+    // A usage-modal fetch (non-zero nonce) still runs so the modal settles.
+    assert!(!skips_effect(&Effect::FetchAppBilling { nonce: 7 }));
+    assert!(!skips_effect(&Effect::Quit));
+    assert!(!skips_effect(&Effect::ResetMouseReporting));
+}

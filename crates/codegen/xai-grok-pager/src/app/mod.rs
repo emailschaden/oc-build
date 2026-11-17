@@ -714,6 +714,9 @@ pub async fn run(
     let cancel = CancellationToken::new();
     // oc-build: opencode backend; skips xAI login, auth refresh, settings prefetch and leader mode.
     let opencode = args.opencode_config();
+    if opencode.is_some() {
+        crate::acp::opencode_shim::set_active(); // oc-build: opencode backend
+    }
     let startup_start = std::time::Instant::now();
     let raw_config = xai_grok_shell::config::load_effective_config()
         .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;

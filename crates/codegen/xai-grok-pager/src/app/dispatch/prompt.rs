@@ -805,6 +805,26 @@ pub(super) fn dispatch_send_prompt_submission(
     let mut effects = prelude;
     let mut tip_send_now_after_queue = false;
 
+    // oc-build: opencode backend; a typed command with no opencode equivalent says so instead of running.
+    if !literal
+        && crate::acp::opencode_shim::is_active()
+        && trimmed.starts_with('/')
+        && let Some(invocation) = crate::slash::parse_invocation(trimmed)
+        && let Some(cmd) = agent
+            .prompt
+            .slash_controller
+            .registry()
+            .get_for_dispatch(invocation.token)
+        && crate::acp::opencode_shim::is_unavailable_command(cmd.name())
+    {
+        let message = crate::acp::opencode_shim::unavailable_message(cmd.name());
+        if consume_input {
+            agent.prompt.set_text("");
+        }
+        agent.show_toast(&message);
+        return effects;
+    }
+
     // Tier restricted command upsell
     // A typed invocation would otherwise fall through the unknown-command path below and leak to the model as a raw prompt
     // Upsell instead; genuinely unknown commands still pass through (shell/ACP commands depend on that)

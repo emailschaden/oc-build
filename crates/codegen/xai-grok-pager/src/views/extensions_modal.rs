@@ -498,6 +498,22 @@ impl ExtensionsTab {
         Self::McpServers,
     ];
 
+    // oc-build: opencode backend
+    /// Tabs offered in this process: [`Self::ALL`], or in opencode mode only those opencode can
+    /// back (no Hooks, Marketplace or Workflows).
+    pub fn shown() -> &'static [Self] {
+        const OPENCODE: &[ExtensionsTab] = &[
+            ExtensionsTab::Plugins,
+            ExtensionsTab::Skills,
+            ExtensionsTab::McpServers,
+        ];
+        if crate::acp::opencode_shim::is_active() {
+            OPENCODE
+        } else {
+            Self::ALL
+        }
+    }
+
     /// Display label for the tab bar.
     pub fn label(self) -> &'static str {
         match self {
@@ -1948,8 +1964,15 @@ impl Default for ExtensionsModalState {
 
 impl ExtensionsModalState {
     pub fn new(tab: ExtensionsTab) -> Self {
+        // oc-build: opencode backend; a hidden tab opens the first shown one.
+        let shown = ExtensionsTab::shown();
+        let tab = if shown.contains(&tab) {
+            tab
+        } else {
+            shown.first().copied().unwrap_or(tab)
+        };
         Self {
-            window: ModalWindowState::with_tabs(ExtensionsTab::ALL.len()),
+            window: ModalWindowState::with_tabs(shown.len()),
             active_tab: tab,
             session_team_id: None,
             managed_connectors_wait: None,
@@ -2794,8 +2817,9 @@ pub fn render_extensions_modal(
     }
 
     // Tab labels and active index.
-    let labels: Vec<&str> = ExtensionsTab::ALL.iter().map(|t| t.label()).collect();
-    let active_idx = ExtensionsTab::ALL
+    // oc-build: opencode backend
+    let labels: Vec<&str> = ExtensionsTab::shown().iter().map(|t| t.label()).collect();
+    let active_idx = ExtensionsTab::shown()
         .iter()
         .position(|t| *t == state.active_tab)
         .unwrap_or(0);

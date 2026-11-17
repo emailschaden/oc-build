@@ -591,6 +591,19 @@ pub(crate) fn default_palette_entries(
         {
             return false;
         }
+        // oc-build: opencode backend; drop tabs and commands opencode has no equivalent for.
+        if let PaletteCommand::OpenExtensionsTab(tab) = &entry.command
+            && !crate::views::extensions_modal::ExtensionsTab::shown().contains(tab)
+        {
+            return false;
+        }
+        if crate::acp::opencode_shim::is_active()
+            && let PaletteCommand::SlashCommand(text) = &entry.command
+            && let Some(invocation) = crate::slash::parse_invocation(text.trim())
+            && crate::acp::opencode_shim::is_unavailable_command(invocation.token)
+        {
+            return false;
+        }
         true
     });
     if !screen_mode.is_minimal()

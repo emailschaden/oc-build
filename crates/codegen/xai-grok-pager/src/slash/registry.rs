@@ -168,8 +168,24 @@ impl CommandRegistry {
             saved_workflows: Vec::new(),
             skipped_acp_names: Vec::new(),
         };
+        // oc-build: opencode backend
+        if crate::acp::opencode_shim::is_active() {
+            reg.hide_unavailable_in_opencode();
+        }
         reg.rebuild_triggers();
         reg
+    }
+
+    // oc-build: opencode backend
+    /// Drop the commands opencode has no equivalent for from the completion menu. They stay
+    /// resolvable through [`Self::get_for_dispatch`] so a typed one can say it is unavailable.
+    pub(crate) fn hide_unavailable_in_opencode(&mut self) {
+        self.menu_hidden.extend(
+            crate::acp::opencode_shim::UNAVAILABLE_COMMANDS
+                .iter()
+                .map(|name| name.to_string()),
+        );
+        self.rebuild_triggers();
     }
 
     fn set_command_visible(&mut self, name: &str, visible: bool) {
