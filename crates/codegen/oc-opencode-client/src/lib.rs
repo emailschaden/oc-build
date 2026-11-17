@@ -104,6 +104,19 @@ pub struct ModelInfo {
     pub name: String,
     #[serde(default)]
     pub limit: Option<ModelLimit>,
+    /// Selectable variants (e.g. reasoning effort `low`/`high`); empty when the model has none.
+    #[serde(default)]
+    pub variants: Vec<ModelVariant>,
+}
+
+/// One entry of `Model.Info.variants`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelVariant {
+    /// e.g. `low`, `high`, `max`.
+    pub id: String,
+    /// Provider settings the variant applies, e.g. `{"reasoningEffort":"high"}`.
+    #[serde(default)]
+    pub settings: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -207,8 +220,18 @@ impl Client {
         json_data(resp).await
     }
 
-    /// Switch the model used by the session's subsequent provider turns.
-    pub async fn switch_model(&self, session_id: &str, model: &Model) -> Result<()> {
+    /// Switch the model used by the session's subsequent provider turns. `variant` is one of
+    /// the model's `variants` ids; `None` selects the model's default.
+    pub async fn switch_model(
+        &self,
+        session_id: &str,
+        model: &Model,
+        variant: Option<&str>,
+    ) -> Result<()> {
+        let mut model = serde_json::to_value(model)?;
+        if let (Some(variant), Some(fields)) = (variant, model.as_object_mut()) {
+            fields.insert("variant".into(), variant.into());
+        }
         let resp = self
             .post(&format!("/api/session/{session_id}/model"))
             .json(&serde_json::json!({ "model": model }))

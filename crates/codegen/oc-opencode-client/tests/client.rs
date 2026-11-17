@@ -95,7 +95,7 @@ fn route(req: &Request) -> (&'static str, &'static str, String) {
         ("POST", "/api/session/ses_1/prompt") => ("200 OK", JSON, r#"{"data":{"id":"msg_1","type":"user"}}"#.into()),
         ("POST", "/api/session/ses_1/permission/per_1/reply") => ("204 No Content", JSON, String::new()),
         ("POST", "/api/session/ses_1/model") => ("204 No Content", JSON, String::new()),
-        ("GET", "/api/model") => ("200 OK", JSON, r#"{"location":{"directory":"/tmp/x"},"data":[{"id":"big-pickle","providerID":"opencode","name":"Big Pickle","type":"chat","limit":{"context":200000,"output":32000}},{"id":"glm-5.3-flash-free","providerID":"opencode","name":"GLM-5.3-Flash Free"}]}"#.into()),
+        ("GET", "/api/model") => ("200 OK", JSON, r#"{"location":{"directory":"/tmp/x"},"data":[{"id":"big-pickle","providerID":"opencode","name":"Big Pickle","type":"chat","limit":{"context":200000,"output":32000}},{"id":"glm-5.3-flash-free","providerID":"opencode","name":"GLM-5.3-Flash Free","variants":[{"id":"low","settings":{"reasoningEffort":"low"}},{"id":"high"}]}]}"#.into()),
         ("GET", "/api/agent") => ("200 OK", JSON, r#"{"location":{"directory":"/tmp/x"},"data":[{"id":"build","name":"Build","description":"The default agent.","mode":"primary","hidden":false,"permissions":[]},{"id":"explore","name":"Explore","mode":"subagent","hidden":false},{"id":"title","name":"Title","mode":"primary","hidden":true}]}"#.into()),
         ("POST", "/api/session/ses_1/agent") => ("204 No Content", JSON, String::new()),
         ("POST", "/api/session/ses_1/interrupt") => ("200 OK", JSON, r#"{"interrupted":true}"#.into()),
@@ -224,6 +224,10 @@ async fn lists_and_switches_models() {
         Some(200_000)
     );
     assert!(models[1].limit.is_none());
+    assert!(models[0].variants.is_empty());
+    let variants: Vec<_> = models[1].variants.iter().map(|v| v.id.as_str()).collect();
+    assert_eq!(variants, ["low", "high"]);
+    assert_eq!(models[1].variants[0].settings["reasoningEffort"], "low");
 
     client
         .switch_model(
@@ -232,6 +236,18 @@ async fn lists_and_switches_models() {
                 id: "glm-5.3-flash-free".into(),
                 provider_id: "opencode".into(),
             },
+            None,
+        )
+        .await
+        .unwrap();
+    client
+        .switch_model(
+            "ses_1",
+            &Model {
+                id: "glm-5.3-flash-free".into(),
+                provider_id: "opencode".into(),
+            },
+            Some("high"),
         )
         .await
         .unwrap();
@@ -242,7 +258,8 @@ async fn lists_and_switches_models() {
                 &Model {
                     id: "x".into(),
                     provider_id: "y".into()
-                }
+                },
+                None,
             )
             .await,
         Err(Error::Api { status: 400, .. })
@@ -257,6 +274,10 @@ async fn lists_and_switches_models() {
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&reqs[1].body).unwrap(),
         serde_json::json!({"model": {"id": "glm-5.3-flash-free", "providerID": "opencode"}})
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&reqs[2].body).unwrap(),
+        serde_json::json!({"model": {"id": "glm-5.3-flash-free", "providerID": "opencode", "variant": "high"}})
     );
 }
 
