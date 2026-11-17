@@ -65,6 +65,15 @@ pub enum Event {
         previous: Option<String>,
     },
 
+    #[serde(rename = "session.model.selected")]
+    ModelSelected {
+        #[serde(rename = "sessionID")]
+        session_id: String,
+        model: ModelRef,
+        #[serde(default)]
+        previous: Option<ModelRef>,
+    },
+
     #[serde(rename = "session.step.started")]
     StepStarted {
         #[serde(rename = "sessionID")]
@@ -244,6 +253,9 @@ pub struct ModelRef {
     pub id: String,
     #[serde(rename = "providerID")]
     pub provider_id: String,
+    /// Selected variant id; absent or `default` for the model's default.
+    #[serde(default)]
+    pub variant: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -312,6 +324,7 @@ impl Event {
             Event::Idle { .. } => "session.idle",
             Event::Status { .. } => "session.status",
             Event::AgentSelected { .. } => "session.agent.selected",
+            Event::ModelSelected { .. } => "session.model.selected",
             Event::StepStarted { .. } => "session.step.started",
             Event::StepEnded { .. } => "session.step.ended",
             Event::StepFailed { .. } => "session.step.failed",
@@ -344,6 +357,7 @@ impl Event {
             | Event::Idle { session_id }
             | Event::Status { session_id, .. }
             | Event::AgentSelected { session_id, .. }
+            | Event::ModelSelected { session_id, .. }
             | Event::StepStarted { session_id, .. }
             | Event::StepEnded { session_id, .. }
             | Event::StepFailed { session_id, .. }

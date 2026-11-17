@@ -42,7 +42,10 @@ in-process ACP shim (`src/acp/opencode_shim.rs`).
   (`opencode_shim::UNAVAILABLE_COMMANDS`) and extensions tabs, and drops the xAI-only effects
   (`opencode_shim::skips_effect`).
 - `initialize` sends `_meta.modelState` with exactly one model (`--opencode-model`, default
-  `opencode/big-pickle`) and `cancelRewind:false`.
+  `opencode/big-pickle`) and `cancelRewind:false`. (#4: the full `GET /api/model` list.
+  feat/oc-model-variants: models with effort-named `variants` advertise them as their effort
+  menu; the effort on `session/set_model` picks the variant. In opencode mode the pager does not
+  save the chosen model/effort to `~/.grok/config.toml`.)
 - Prompt content blocks other than `Text` are dropped. A `ResourceLink` is sent as its URI text.
 - No `AvailableCommandsUpdate`, no modes (until feat/oc-modes-agents), and no tool list are ever sent. Gated commands
   (`/loop`, `/imagine*`, `/memory`, `/flush`, `/dream`, `/auto`, `/dashboard`, `/recap`, `/voice`)
@@ -85,7 +88,7 @@ opencode endpoints are under `/api/*` in `/workspace/research/oc2-openapi.json`.
 | Turn completed / idle state | `PromptResponse` + `TurnCompleted`, `x.ai/session/prompt_complete` | `session.execution.succeeded`/`failed`/`interrupted`, `session.idle` | works |
 | Error / retry banner | `RetryState`, prompt error | `session.retry.scheduled`, `session.step.failed`, `session.execution.failed` | partial (failures shown, retries not) |
 | Session status line (busy/idle) | `SessionStatus` | `session.status` | mappable |
-| Served-model badge | `ServedModel`, `ModelChanged`, `ModelAutoSwitched` | `session.model.selected`, `session.step.started` (carries the model) | mappable |
+| Served-model badge | `ServedModel`, `ModelChanged`, `ModelAutoSwitched` | `session.model.selected`, `session.step.started` (carries the model) | mapped (feat/oc-model-variants): `session.model.selected` during a turn becomes an `x.ai/session/update` `ModelChanged` (effort from the variant). Not proven live: the shim only reads events while a turn runs, and the pager's own switches don't need it |
 | Session title (auto) | `SessionSummaryGenerated`, `x.ai/session/info` | `session.renamed` event, `GET /api/session/{id}` `.title` | mappable |
 | Follow-up suggestions | `x.ai/follow_ups` notification | none (could use `POST /api/session/{id}/generate`) | no equivalent |
 | Prompt ghost suggestion | `x.ai/suggestPrompt` | none built in (`POST /api/session/{id}/generate` possible) | no equivalent; request skipped in opencode mode (feat/oc-hide-xai-only) |
@@ -103,10 +106,10 @@ opencode endpoints are under `/api/*` in `/workspace/research/oc2-openapi.json`.
 | Auto-review mode (`/auto`, classifier) | `permission_mode = "auto"`, shell-side classifier | none (no classifier). Keep hidden | hidden in opencode mode (feat/oc-modes-agents): `auto_mode_gate` is off, so Auto is not in the Shift+Tab cycle |
 | Mode cycle (`Shift+Tab`: Normal → Plan → Auto → Always) | local cycle + `session/set_mode` | `build`/`plan` agents + permission ruleset | verified live (feat/oc-modes-agents): Build → Plan → Always-Approve → Build |
 | Agent / persona picker (`/config-agents`, `/personas`) | bundle `x.ai/bundle/status`, roster `x.ai/sessions/list` | `GET /api/agent` (primary and subagent, `Agent.Info`), `POST /api/session/{id}/agent` | mappable |
-| Model picker (`Ctrl+M`, `/model`) | list from `initialize._meta.modelState` + `x.ai/models/update`; switch with `session/set_model` | `GET /api/model` (+ `GET /api/provider`) for the list, `POST /api/session/{id}/model {"model":{id,providerID}}` to switch | mapped in #4 (list from `GET /api/model`, switch via `POST …/model`) |
-| `/model <name>` set default | `Effect::PersistPreferredModel` (local `~/.grok/config.toml`) + `set_model` | local persist + `POST …/model` | partial |
-| `/effort <level>` (reasoning effort) | `session/set_model` with an effort meta (`acp/model_state.rs` effort levels) | `Model.Ref.variant` (`Model.Info.variants`) in `POST …/model` | mappable |
-| Fast mode / model variant | model id suffix / variant meta | `Model.Ref.variant` (e.g. a `fast` variant if the provider defines one) | mappable |
+| Model picker (`Ctrl+M`, `/model`) | list from `initialize._meta.modelState` + `x.ai/models/update`; switch with `session/set_model` | `GET /api/model` (+ `GET /api/provider`) for the list, `POST /api/session/{id}/model {"model":{id,providerID}}` to switch | verified live (feat/oc-model-variants): list from `GET /api/model`, switch via `POST …/model`; footer shows the opencode model |
+| `/model <name>` set default | `Effect::PersistPreferredModel` (local `~/.grok/config.toml`) + `set_model` | local persist + `POST …/model` | verified live (feat/oc-model-variants): switches via `POST …/model`; in opencode mode `PersistPreferredModel` and `PersistSetting` for `default_model`/`fork_secondary_model` are skipped (`skips_effect`), so no opencode id reaches `~/.grok/config.toml` (`--opencode-model` picks the startup model) |
+| `/effort <level>` (reasoning effort) | `session/set_model` with an effort meta (`acp/model_state.rs` effort levels) | `Model.Ref.variant` (`Model.Info.variants`) in `POST …/model` | verified live (feat/oc-model-variants): variants named after an effort level (or with `settings.reasoningEffort`) become `_meta.supportsReasoningEffort` + `reasoningEfforts`; `/effort high` and the picker's effort phase send `POST …/model {"model":{…,"variant":"high"}}`. Models without such variants (e.g. `big-pickle`) get no effort menu and `/effort` says "current model does not support reasoning effort" |
+| Fast mode / model variant | model id suffix / variant meta | `Model.Ref.variant` (e.g. a `fast` variant if the provider defines one) | no pager feature (feat/oc-model-variants): this pager has no fast mode (no command, keybinding or setting; `/fast` is sent as a prompt, as with the native agent), so nothing to map or hide. The fast choice is `/effort low`/`none`/`minimal` on models that offer it |
 | `/context-window <size>` | `session/set_model` with a context-window meta | none (the window is fixed per model) | hidden in opencode mode (feat/oc-hide-xai-only) |
 | Model notice banner / auto-switch | `ModelAutoSwitched`, `x.ai/models/update` | `model.updated`, `models-dev.refreshed` events | mappable (low value) |
 
@@ -324,6 +327,8 @@ LOC, M 200–600, L > 600.
    - Shim: fill `modelState` from the real list (`provider/id` ids). Implement
      `set_session_model`, map `/effort` and fast to `Model.Ref.variant`, and emit `ModelChanged`
      on `session.model.selected`.
+   - Done in feat/oc-model-variants, except fast (the pager has none). Model/effort saves to
+     `~/.grok/config.toml` are skipped in opencode mode.
 4. **Slash commands & skills (M).**
    - Client: `list_commands`, `run_command`, `list_skills`.
    - Shim: send `AvailableCommandsUpdate` after `session/new`/`load` and on

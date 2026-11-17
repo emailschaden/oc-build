@@ -374,6 +374,136 @@ fn configured_model_is_listed_even_if_server_omits_it() {
     assert_eq!(model_infos(&[], "a/b").len(), 1);
 }
 
+fn with_variants(
+    mut model: oc_opencode_client::ModelInfo,
+    variants: serde_json::Value,
+) -> oc_opencode_client::ModelInfo {
+    model.variants = serde_json::from_value(variants).expect("variants");
+    model
+}
+
+/// The pager's model state over the shim's picker list, as the TUI builds it.
+fn pager_models(listed: &[oc_opencode_client::ModelInfo]) -> crate::acp::model_state::ModelState {
+    let mut state = crate::acp::model_state::ModelState::default();
+    for info in model_infos(listed, "opencode/big-pickle") {
+        state.available.insert(info.model_id.clone(), info);
+    }
+    state
+}
+
+#[test]
+fn effort_variants_become_the_pager_effort_menu() {
+    let glm = with_variants(
+        listed("opencode", "glm-5.3-flash-free", "GLM", None),
+        serde_json::json!([
+            { "id": "low", "settings": { "reasoningEffort": "low" } },
+            { "id": "high", "settings": { "reasoningEffort": "high" } },
+            { "id": "max", "settings": { "reasoningEffort": "max" } },
+        ]),
+    );
+    // `default` and an unknown name without a known reasoningEffort are left out; a custom
+    // name with one is kept under its own id.
+    let custom = with_variants(
+        listed("local", "custom", "Custom", None),
+        serde_json::json!([
+            { "id": "default" },
+            { "id": "turbo", "settings": { "speed": 2 } },
+            { "id": "deep", "settings": { "reasoningEffort": "xhigh" } },
+            { "id": "xhigh" },
+        ]),
+    );
+    let pickle = listed("opencode", "big-pickle", "Big Pickle", None);
+    let state = pager_models(&[pickle, glm, custom]);
+    let id = |s: &str| acp::ModelId::new(s.to_owned());
+
+    let menu = state.reasoning_effort_options_for(&id("opencode/glm-5.3-flash-free"));
+    let rows: Vec<(&str, ReasoningEffort, &str)> = menu
+        .iter()
+        .map(|o| (o.id.as_str(), o.value, o.label.as_str()))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("low", ReasoningEffort::Low, "Low"),
+            ("high", ReasoningEffort::High, "High"),
+            ("max", ReasoningEffort::Max, "Max"),
+        ]
+    );
+    let custom_menu = state.reasoning_effort_options_for(&id("local/custom"));
+    let custom_rows: Vec<(&str, ReasoningEffort)> = custom_menu
+        .iter()
+        .map(|o| (o.id.as_str(), o.value))
+        .collect();
+    assert_eq!(custom_rows, [("deep", ReasoningEffort::Xhigh)]);
+
+    // `/effort high` resolves on glm; a level it has no variant for is rejected.
+    assert_eq!(
+        state
+            .resolve_effort_for_model(&id("opencode/glm-5.3-flash-free"), "high")
+            .ok(),
+        Some(ReasoningEffort::High)
+    );
+    assert!(
+        state
+            .resolve_effort_for_model(&id("opencode/glm-5.3-flash-free"), "medium")
+            .is_err()
+    );
+    // A model without variants has no effort menu and `/effort` says it is unsupported.
+    let pickle = id("opencode/big-pickle");
+    assert!(state.reasoning_effort_options_for(&pickle).is_empty());
+    assert!(matches!(
+        state.resolve_effort_for_model(&pickle, "high"),
+        Err(crate::acp::model_state::EffortTokenError::Unsupported)
+    ));
+}
+
+#[test]
+fn effort_maps_to_variant_and_back() {
+    let models = model_infos(
+        &[with_variants(
+            listed("local", "custom", "Custom", Some(1000)),
+            serde_json::json!([{ "id": "deep", "settings": { "reasoningEffort": "high" } }, { "id": "low" }]),
+        )],
+        "local/custom",
+    );
+    let info = &models[0];
+    assert_eq!(
+        info.meta.as_ref().and_then(|m| m.get("totalContextTokens")),
+        Some(&serde_json::json!(1000))
+    );
+    assert_eq!(
+        variant_for_effort(info, ReasoningEffort::High).as_deref(),
+        Some("deep")
+    );
+    assert_eq!(
+        variant_for_effort(info, ReasoningEffort::Low).as_deref(),
+        Some("low")
+    );
+    assert_eq!(variant_for_effort(info, ReasoningEffort::Max), None);
+    assert_eq!(
+        effort_for_variant(info, "deep"),
+        Some(ReasoningEffort::High)
+    );
+    assert_eq!(effort_for_variant(info, "default"), None);
+}
+
+#[test]
+fn model_selected_mid_turn_reports_model_and_variant() {
+    let mut turn = turn();
+    let step = turn.on_event(event(
+        "session.model.selected",
+        serde_json::json!({
+            "sessionID": SID,
+            "model": { "id": "glm-5.3-flash-free", "providerID": "opencode", "variant": "high" },
+        }),
+    ));
+    assert!(matches!(
+        step,
+        TurnStep::ModelSelected { ref model_id, ref variant }
+            if model_id == "opencode/glm-5.3-flash-free" && variant.as_deref() == Some("high")
+    ));
+}
+
 #[test]
 fn model_id_parses_provider_and_id() {
     let model = parse_model_id("opencode/glm-5.3-flash-free").expect("valid");
@@ -467,6 +597,29 @@ fn xai_only_effects_are_skipped() {
     assert!(!skips_effect(&Effect::FetchAppBilling { nonce: 7 }));
     assert!(!skips_effect(&Effect::Quit));
     assert!(!skips_effect(&Effect::ResetMouseReporting));
+}
+
+#[test]
+fn model_preferences_are_not_saved_to_the_grok_config() {
+    use crate::app::actions::Effect;
+    use crate::settings::SettingValue;
+    let setting = |key| Effect::PersistSetting {
+        key,
+        value: SettingValue::String("opencode/glm-5.3-flash-free".into()),
+        rollback_value: SettingValue::String(String::new()),
+    };
+    assert!(skips_effect(&Effect::PersistPreferredModel {
+        model_id: acp::ModelId::new("opencode/glm-5.3-flash-free"),
+        reasoning_effort: Some(ReasoningEffort::High),
+    }));
+    assert!(skips_effect(&setting("default_model")));
+    assert!(skips_effect(&setting("fork_secondary_model")));
+    // UI preferences are still saved.
+    assert!(!skips_effect(&Effect::PersistSetting {
+        key: "vim_mode",
+        value: SettingValue::Bool(true),
+        rollback_value: SettingValue::Bool(false),
+    }));
 }
 
 fn agent(id: &str, mode: &str, hidden: bool) -> AgentInfo {

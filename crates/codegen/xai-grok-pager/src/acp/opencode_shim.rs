@@ -10,9 +10,12 @@
 //! interrupts it, and `permission.asked` becomes `session/request_permission`.
 //!
 //! The model list comes from `GET /api/model` and `session/set_model` switches the
-//! opencode session's model. Session modes are opencode's primary agents (`GET /api/agent`):
-//! `build` is the pager's `default` mode and `plan` its `plan` mode; `session/set_mode`
-//! switches the session agent. Always-approve (`_meta.yoloMode` on `session/new`,
+//! opencode session's model. A model's `variants` named after reasoning-effort levels are
+//! offered as its effort menu (`_meta.reasoningEfforts`), and the effort sent with
+//! `session/set_model` selects the matching variant. `session.model.selected` during a turn
+//! becomes an `x.ai/session/update` `ModelChanged`. Session modes are opencode's primary
+//! agents (`GET /api/agent`): `build` is the pager's `default` mode and `plan` its `plan`
+//! mode; `session/set_mode` switches the session agent. Always-approve (`_meta.yoloMode` on `session/new`,
 //! `x.ai/yolo_mode_changed`) makes the shim answer `permission.asked` with `once` itself. A rejected permission is replied with a message (the
 //! user's feedback or [`DEFAULT_REJECT_MESSAGE`]) so the model continues the turn.
 //!
@@ -33,11 +36,19 @@ use agent_client_protocol::{self as acp, Client as _};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use oc_opencode_client::{
-    AgentInfo, Client, CreateSession, Decision, Effect, Event, Location, Model, PermissionRule,
-    tool_text,
+    AgentInfo, Client, CreateSession, Decision, Effect, Event, Location, Model, ModelVariant,
+    PermissionRule, tool_text,
 };
 use tokio_util::sync::CancellationToken;
 use xai_acp_lib::{AcpGatewayReceiver, AcpGatewaySender, acp_channels};
+use xai_grok_shell::extensions::notification::{
+    SessionNotification as XaiSessionNotification, SessionUpdate as XaiSessionUpdate,
+};
+use xai_grok_shell::sampling::types::{
+    REASONING_EFFORT_META_KEY, REASONING_EFFORTS_META_KEY, ReasoningEffort,
+    SUPPORTS_REASONING_EFFORT_META_KEY, effort_label, parse_reasoning_effort_meta,
+    parse_reasoning_efforts_meta,
+};
 use xai_grok_tools::types::SessionMode;
 use xai_grok_tools::types::output::{BashOutput, ToolOutput};
 
@@ -107,8 +118,10 @@ pub fn unavailable_message(name: &str) -> String {
 }
 
 /// True for a pager effect that only calls an xAI-only `x.ai/*` method (account, billing,
-/// consent, suggestions, bundle sync, marketplace, hooks, workflows). In opencode mode the
-/// effect runner drops these, so they never reach the shim.
+/// consent, suggestions, bundle sync, marketplace, hooks, workflows), or that would save an
+/// opencode model id or effort into `~/.grok/config.toml`, which the built-in agent shares
+/// (preferred model, `default_model`, `fork_secondary_model`). In opencode mode the effect
+/// runner drops these, so they never reach the shim or the config file.
 pub(crate) fn skips_effect(effect: &crate::app::actions::Effect) -> bool {
     use crate::app::actions::Effect;
     matches!(
@@ -128,6 +141,11 @@ pub(crate) fn skips_effect(effect: &crate::app::actions::Effect) -> bool {
             | Effect::CheckMarketplaceUpdates { .. }
             | Effect::FetchHooksList { .. }
             | Effect::FetchWorkflowsList { .. }
+            | Effect::PersistPreferredModel { .. }
+            | Effect::PersistSetting {
+                key: "default_model" | "fork_secondary_model",
+                ..
+            }
     )
 }
 
@@ -317,6 +335,46 @@ impl OpencodeShim {
         Ok(())
     }
 
+    /// opencode switched the session's model (another client, or opencode itself): record it
+    /// and tell the TUI with a `ModelChanged`, effort from the selected variant.
+    async fn on_model_selected(
+        &self,
+        session_id: &acp::SessionId,
+        model_id: String,
+        variant: Option<&str>,
+    ) {
+        let models = self.available_models().await;
+        let effort = models
+            .iter()
+            .find(|m| m.model_id.0.as_ref() == model_id)
+            .and_then(|info| effort_for_variant(info, variant?));
+        self.log(&format!(
+            "model selected {model_id} variant={variant:?} -> effort {effort:?}"
+        ));
+        self.session_models
+            .borrow_mut()
+            .insert(session_id.0.to_string(), model_id.clone());
+        let payload = XaiSessionNotification {
+            session_id: session_id.clone(),
+            update: XaiSessionUpdate::model_changed(
+                model_id,
+                effort.map(|e| e.as_ref().to_owned()),
+                None,
+            ),
+            meta: None,
+        };
+        match serde_json::value::to_raw_value(&payload) {
+            Ok(params) => {
+                self.gateway
+                    .forward_fire_and_forget(acp::ExtNotification::new(
+                        "x.ai/session/update",
+                        params.into(),
+                    ));
+            }
+            Err(err) => tracing::warn!(error = %err, "ModelChanged serialize failed"),
+        }
+    }
+
     fn current_mode(&self, sid: &str) -> String {
         self.session_modes
             .borrow()
@@ -404,6 +462,10 @@ impl OpencodeShim {
                     }
                     self.notify(session_id, &meta, update);
                 }
+                TurnStep::ModelSelected { model_id, variant } => {
+                    self.on_model_selected(session_id, model_id, variant.as_deref())
+                        .await;
+                }
                 TurnStep::Permission { request_id, .. } if self.yolo.borrow().contains(&sid) => {
                     // Always-approve: the TUI would answer allow-once anyway; skip the round trip.
                     self.log(&format!("permission {request_id} -> Once (always-approve)"));
@@ -490,6 +552,11 @@ enum TurnStep {
         request_id: String,
         tool_call: acp::ToolCallUpdate,
     },
+    /// opencode selected another model for the session (`provider/id`, variant id).
+    ModelSelected {
+        model_id: String,
+        variant: Option<String>,
+    },
     Stop(acp::StopReason),
     /// The execution failed; the turn ends with an error carrying this message.
     Fail(String),
@@ -567,6 +634,10 @@ impl TurnState {
                     acp::CurrentModeUpdate::new(mode_for_agent(&agent)),
                 ))
             }
+            Event::ModelSelected { model, .. } => TurnStep::ModelSelected {
+                model_id: format!("{}/{}", model.provider_id, model.id),
+                variant: model.variant,
+            },
             // After a cancel, stop painting new output.
             _ if self.cancelling => TurnStep::Ignore,
             Event::TextDelta { delta, .. } => TurnStep::Update(
@@ -833,11 +904,16 @@ fn model_infos(listed: &[oc_opencode_client::ModelInfo], configured: &str) -> Ve
             } else {
                 m.name.clone()
             };
-            let meta = m.limit.as_ref().and_then(|l| l.context).and_then(|tokens| {
-                serde_json::json!({ "totalContextTokens": tokens })
-                    .as_object()
-                    .cloned()
-            });
+            let mut meta = acp::Meta::new();
+            if let Some(tokens) = m.limit.as_ref().and_then(|l| l.context) {
+                meta.insert("totalContextTokens".into(), tokens.into());
+            }
+            let efforts = effort_options(&m.variants);
+            if !efforts.is_empty() {
+                meta.insert(SUPPORTS_REASONING_EFFORT_META_KEY.into(), true.into());
+                meta.insert(REASONING_EFFORTS_META_KEY.into(), efforts.into());
+            }
+            let meta = (!meta.is_empty()).then_some(meta);
             acp::ModelInfo::new(id.clone(), name)
                 .description(id)
                 .meta(meta)
@@ -850,6 +926,55 @@ fn model_infos(listed: &[oc_opencode_client::ModelInfo], configured: &str) -> Ve
         );
     }
     models
+}
+
+/// The pager's effort menu for a model's opencode variants (`_meta.reasoningEfforts` entries):
+/// variants named after a reasoning-effort level (`low`, `high`, `max`, …), or whose
+/// `settings.reasoningEffort` is one, in server order. The first variant per level wins;
+/// the rest (e.g. `default`) are left out.
+fn effort_options(variants: &[ModelVariant]) -> Vec<serde_json::Value> {
+    let mut seen = Vec::new();
+    variants
+        .iter()
+        .filter_map(|v| {
+            let effort = v.id.parse::<ReasoningEffort>().ok().or_else(|| {
+                v.settings
+                    .get(REASONING_EFFORT_META_KEY)?
+                    .as_str()?
+                    .parse()
+                    .ok()
+            })?;
+            (!seen.contains(&effort)).then(|| {
+                seen.push(effort);
+                let description = crate::slash::commands::effort_levels::effort_description(effort);
+                let mut option = serde_json::Map::new();
+                option.insert("id".into(), v.id.clone().into());
+                option.insert("value".into(), effort.as_ref().into());
+                option.insert("description".into(), description.into());
+                if v.id == effort.as_ref() {
+                    option.insert("label".into(), effort_label(effort).into());
+                }
+                serde_json::Value::Object(option)
+            })
+        })
+        .collect()
+}
+
+/// The opencode variant behind `effort` on a picker model, if it offers that level.
+fn variant_for_effort(info: &acp::ModelInfo, effort: ReasoningEffort) -> Option<String> {
+    parse_reasoning_efforts_meta(info.meta.as_ref())?
+        .into_iter()
+        .find(|opt| opt.value == effort)
+        .map(|opt| opt.id)
+}
+
+/// The effort level of opencode variant `variant` on a picker model; inverse of
+/// [`variant_for_effort`]. `None` for `default` and other unmapped variants.
+fn effort_for_variant(info: &acp::ModelInfo, variant: &str) -> Option<ReasoningEffort> {
+    parse_reasoning_efforts_meta(info.meta.as_ref())?
+        .into_iter()
+        .find(|opt| opt.id == variant)
+        .map(|opt| opt.value)
 }
 
 #[async_trait::async_trait(?Send)]
@@ -955,11 +1080,22 @@ impl acp::Agent for ShimAgent {
         let model = parse_model_id(&label).ok_or_else(|| {
             acp::Error::invalid_params().data(format!("model id {label:?} is not provider/id"))
         })?;
+        let effort = parse_reasoning_effort_meta(args.meta.as_ref());
+        let variant = match effort {
+            Some(effort) => {
+                let models = self.available_models().await;
+                let info = models.iter().find(|m| m.model_id.0.as_ref() == label);
+                info.and_then(|info| variant_for_effort(info, effort))
+            }
+            None => None,
+        };
         self.client
-            .switch_model(&sid, &model)
+            .switch_model(&sid, &model, variant.as_deref())
             .await
             .map_err(oc_error)?;
-        self.log(&format!("session/set_model {sid} -> {label}"));
+        self.log(&format!(
+            "session/set_model {sid} -> {label} effort={effort:?} variant={variant:?}"
+        ));
         self.session_models.borrow_mut().insert(sid, label);
         Ok(acp::SetSessionModelResponse::new())
     }

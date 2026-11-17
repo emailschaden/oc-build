@@ -251,4 +251,19 @@ fn spec_only_events() {
             previous: Some("build".into())
         }
     );
+    let model = r#"{"id":"e","created":1,"type":"session.model.selected","data":{"sessionID":"ses_1","model":{"id":"glm-5.3-flash-free","providerID":"opencode","variant":"high"},"previous":{"id":"big-pickle","providerID":"opencode"}}}"#;
+    let event = Event::parse(model).unwrap();
+    assert_eq!(event.type_name(), "session.model.selected");
+    assert_eq!(event.session_id(), Some("ses_1"));
+    let Event::ModelSelected {
+        model, previous, ..
+    } = event
+    else {
+        panic!("expected ModelSelected");
+    };
+    assert_eq!(
+        (model.id.as_str(), model.variant.as_deref()),
+        ("glm-5.3-flash-free", Some("high"))
+    );
+    assert_eq!(previous.and_then(|p| p.variant), None);
 }
