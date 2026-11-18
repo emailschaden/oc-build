@@ -495,9 +495,9 @@ impl WelcomeLayout {
 
 /// Controls what the version badge renders.
 pub(super) enum VersionBadgeMode<'a> {
-    /// Full badge: team | tier | api_key | **Grok Build** VERSION+channel (right-aligned).
+    /// Full badge: team | tier | api_key | **Grok Build** VERSION (right-aligned).
     Full { subscription_tier: Option<&'a str> },
-    /// Hero footer: team | api_key | channel (right-aligned, gray).
+    /// Hero footer: team | api_key (right-aligned, gray).
     HeroFooter,
     /// Hero inline: **Grok Build**  VERSION (left-aligned).
     HeroInline,
@@ -552,7 +552,7 @@ pub(super) fn render_version_badge(
         spans.push(sep);
     }
 
-    let channel = xai_grok_update::channel_label();
+    // oc-build: opencode backend; plain version string (no update channel).
     match &mode {
         VersionBadgeMode::Full { .. } => {
             spans.push(Span::styled(
@@ -562,18 +562,11 @@ pub(super) fn render_version_badge(
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled(
-                format!("{}{}", xai_grok_version::VERSION, channel),
+                xai_grok_version::VERSION,
                 Style::default().fg(theme.gray),
             ));
         }
-        VersionBadgeMode::HeroFooter => {
-            if !channel.is_empty() {
-                spans.push(Span::styled(
-                    channel.trim(),
-                    Style::default().fg(theme.gray),
-                ));
-            }
-        }
+        VersionBadgeMode::HeroFooter => {}
         VersionBadgeMode::HeroInline => {
             spans.push(Span::styled(
                 "Grok Build  ",
@@ -588,7 +581,7 @@ pub(super) fn render_version_badge(
         }
     }
 
-    // Only alpha and beta builds print a channel, so on stable the spans can end on a separator.
+    // The spans can end on a separator.
     if spans.last().is_some_and(|s| s.content == SEP) {
         spans.pop();
     }
@@ -729,9 +722,6 @@ pub struct WelcomeRenderParams<'a> {
     /// Live working directory (tracks `Effect::SetWorkingDir`), used to pin the current repo's session group to the top of the picker.
     pub cwd: &'a std::path::Path,
     /// App-level credit balance for showing the usage warning on the welcome screen.
-    pub credit_balance: Option<&'a crate::views::credit_bar::CreditBalance>,
-    /// Auto top-up rule paired with `credit_balance` for the welcome warning.
-    pub auto_topup: Option<&'a crate::views::credit_bar::AutoTopupInfo>,
     /// Whether the consumer billing UI applies (false for team / API-key, which get no credit warning).
     pub usage_visible: bool,
     /// Cached changelog bullets for the welcome screen (up to 3).
@@ -801,8 +791,6 @@ pub fn render_welcome(
                 model_name: params.model_name,
                 flags: params.flags,
                 multiline: false,
-                usage_warning: None,
-                usage_warning_critical: false,
             };
             let (menu_rects, post_flush_escapes) = render_welcome_blocked(
                 content_area,
@@ -2243,19 +2231,10 @@ fn render_welcome_done(
                 .render(tip_inset, buf);
         }
 
-        let warning = p.credit_balance.and_then(|bal| {
-            crate::views::credit_bar::usage_warning(bal, p.auto_topup, p.usage_visible)
-        });
-        let (usage_warning_text, usage_warning_critical) = match warning {
-            Some((text, critical)) => (Some(text), critical),
-            None => (None, false),
-        };
         let usage_info = PromptInfo {
             model_name: p.model_name,
             flags: p.flags,
             multiline: false,
-            usage_warning: usage_warning_text.as_deref(),
-            usage_warning_critical,
         };
 
         if let Some(notice) = p.model_notice {
@@ -2725,8 +2704,8 @@ mod tests {
             .to_string()
     }
 
-    /// The badge carries the product name, the version, and the channel, and never a release label.
-    /// The hero footer prints a channel only on alpha and beta builds, so on stable it must not end on a separator.
+    /// The badge carries the product name and the version, and never a release label.
+    /// The hero footer must not end on a separator.
     #[test]
     fn version_badge_carries_no_release_label() {
         let full = badge_text(
@@ -2922,8 +2901,6 @@ mod tests {
             session_picker_pending_delete: false,
             chat_mode: false,
             cwd: std::path::Path::new("/repo"),
-            credit_balance: None,
-            auto_topup: None,
             usage_visible: true,
             changelog_bullets: &[],
             changelog_has_full_notes: false,

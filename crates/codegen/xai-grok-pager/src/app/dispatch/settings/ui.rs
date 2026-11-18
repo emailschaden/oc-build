@@ -2,7 +2,7 @@
 
 use super::setters::{
     pr13_effective_default, set_ask_user_question_timeout_enabled_inner, set_auto_dark_theme_inner,
-    set_auto_light_theme_inner, set_auto_update_inner, set_collapsed_edit_blocks_inner,
+    set_auto_light_theme_inner, set_collapsed_edit_blocks_inner,
     set_combine_queued_prompts_inner, set_compact_mode, set_compact_mode_inner,
     set_confirm_before_rewind_inner, set_contextual_hint_inner, set_default_model_inner,
     set_default_selected_permission_inner, set_display_refresh_auto_cadence_inner,
@@ -50,7 +50,6 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
     let coding_data_sharing_opt_out_from_app = app.coding_data_retention_opt_out;
     let coding_data_sharing_lock_from_app = app.coding_data_sharing_lock();
     let show_tips_from_app = app.show_tips;
-    let auto_update_from_app = app.auto_update;
     let respect_manual_folds_from_app = app.appearance.scrollback.scroll.respect_manual_folds;
     let auto_mode_gate_from_app = app.auto_mode_gate;
     let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
@@ -86,7 +85,6 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                 // Prefer optimistic pending over confirmed active.
                 plan_mode_active: agent.plan_mode_pending.unwrap_or(agent.plan_mode_active),
                 show_tips: show_tips_from_app,
-                auto_update: auto_update_from_app,
                 vim_mode: crate::appearance::cache::load_vim_mode(),
                 scroll_speed: crate::appearance::cache::load_scroll_speed(),
                 respect_manual_folds: respect_manual_folds_from_app,
@@ -126,10 +124,7 @@ pub(in crate::app::dispatch) fn dispatch_open_command_palette(app: &mut AppView)
         return vec![];
     }
     agent.active_modal = Some(ActiveModal::CommandPalette {
-        entries: crate::views::modal::default_palette_entries(
-            agent.sharing_enabled,
-            &agent.prompt.slash_controller,
-        ),
+        entries: crate::views::modal::default_palette_entries(&agent.prompt.slash_controller),
         // Type-to-find: open in input mode (matches Ctrl+P).
         state: crate::views::picker::PickerState::input_active(),
         window: crate::views::modal_window::ModalWindowState::new(),
@@ -192,7 +187,6 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
     let coding_data_sharing_opt_out_from_app = app.coding_data_retention_opt_out;
     let coding_data_sharing_lock_from_app = app.coding_data_sharing_lock();
     let show_tips_from_app = app.show_tips;
-    let auto_update_from_app = app.auto_update;
     let respect_manual_folds_from_app = app.appearance.scrollback.scroll.respect_manual_folds;
     let auto_mode_gate_from_app = app.auto_mode_gate;
     let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
@@ -241,7 +235,6 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
         // Prefer optimistic pending over confirmed active.
         plan_mode_active: agent.plan_mode_pending.unwrap_or(agent.plan_mode_active),
         show_tips: show_tips_from_app,
-        auto_update: auto_update_from_app,
         vim_mode: crate::appearance::cache::load_vim_mode(),
         scroll_speed: crate::appearance::cache::load_scroll_speed(),
         respect_manual_folds: respect_manual_folds_from_app,
@@ -630,7 +623,6 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         coding_data_sharing_lock: app.coding_data_sharing_lock(),
         plan_mode_active: agent_plan_mode(app),
         show_tips: app.show_tips,
-        auto_update: app.auto_update,
         vim_mode: crate::appearance::cache::load_vim_mode(),
         scroll_speed: crate::appearance::cache::load_scroll_speed(),
         respect_manual_folds: app.appearance.scrollback.scroll.respect_manual_folds,
@@ -774,9 +766,8 @@ pub(in crate::app::dispatch) fn action_for_reset(
         ("plan_mode", SettingValue::Enum("on")) => {
             Some(Action::SetPlanMode(crate::app::actions::PlanModeKind::On))
         }
-        // show_tips / auto_update / display_refresh_auto_cadence: direct bool.
+        // show_tips / display_refresh_auto_cadence: direct bool.
         ("show_tips", SettingValue::Bool(b)) => Some(Action::SetShowTips(*b)),
-        ("auto_update", SettingValue::Bool(b)) => Some(Action::SetAutoUpdate(*b)),
         ("display_refresh_auto_cadence", SettingValue::Bool(b)) => {
             Some(Action::SetDisplayRefreshAutoCadence(*b))
         }
@@ -1077,19 +1068,12 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
                 crate::settings::canonical_voice_stt_language(Some(s)),
             );
         }
-        // show_tips / auto_update: if the rollback equals the effective default, restore to None (keeps the mirror in sync with disk)
+        // show_tips: if the rollback equals the effective default, restore to None (keeps the mirror in sync with disk)
         ("show_tips", SettingValue::Bool(b)) => {
             if Some(*b) == pr13_effective_default("show_tips") {
                 app.show_tips = None;
             } else {
                 set_show_tips_inner(app, *b);
-            }
-        }
-        ("auto_update", SettingValue::Bool(b)) => {
-            if Some(*b) == pr13_effective_default("auto_update") {
-                app.auto_update = None;
-            } else {
-                set_auto_update_inner(app, *b);
             }
         }
         // fork_secondary_model: empty rollback restores baseline default.

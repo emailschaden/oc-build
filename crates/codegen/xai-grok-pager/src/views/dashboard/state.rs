@@ -1248,11 +1248,6 @@ impl DashboardState {
         self.peek_reply.set_auto_mode_available(available);
     }
 
-    /// Replace the restricted slash-command deny list on both dashboard prompt registries (dispatch and peek reply).
-    pub(crate) fn set_restricted_commands(&mut self, names: &[String]) {
-        self.dispatch.set_restricted_commands(names);
-        self.peek_reply.set_restricted_commands(names);
-    }
 
     /// Prefix error text that has no glyph of its own. Messages that already
     /// carry a glyph should not go through this helper.

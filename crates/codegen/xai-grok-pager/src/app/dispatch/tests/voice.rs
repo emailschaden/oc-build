@@ -2,45 +2,6 @@
 
 use super::*;
 
-/// Plan mode must not gate voice.
-/// Typing `/voice` and Enter through the real input path (prompt keys, then the slash registry, then dispatch) starts recording.
-/// With `plan_mode_active` set it behaves exactly like normal mode.
-#[test]
-fn voice_slash_submit_starts_recording_in_plan_mode() {
-    use crate::app::app_view::InputOutcome;
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-    if !xai_grok_voice::AUDIO_SUPPORTED {
-        return;
-    }
-    let mut app = test_app_with_agent();
-    let (tx, _rx) = tokio::sync::mpsc::channel(8);
-    app.voice_cmd_tx = Some(tx);
-    // The production reveal path flips the flag AND the `/voice` visibility in each slash registry together
-    app.apply_voice_mode_enabled(true);
-    let agent = app.agents.get_mut(&AgentId(0)).unwrap();
-    agent.plan_mode_active = true;
-    agent.set_active_pane(crate::views::agent::ActivePane::Prompt, false);
-
-    for ch in "/voice".chars() {
-        app.handle_input(&Event::Key(KeyEvent::new(
-            KeyCode::Char(ch),
-            KeyModifiers::NONE,
-        )));
-    }
-    let out = app.handle_input(&Event::Key(KeyEvent::new(
-        KeyCode::Enter,
-        KeyModifiers::NONE,
-    )));
-    let InputOutcome::Action(action) = out else {
-        panic!("Enter on /voice must produce a submit action, got {out:?}");
-    };
-    dispatch(action, &mut app);
-    assert!(
-        app.voice_listening(),
-        "typed /voice + Enter must start recording in plan mode"
-    );
-}
-
 #[test]
 fn voice_on_welcome_noop_when_startup_gated() {
     // Auth or folder trust unresolved: voice must not create a session (that would bypass the startup gate)
@@ -377,55 +338,6 @@ fn voice_ctrl_space_release_leaves_toggle_recording_running() {
     assert!(
         rx.try_recv().is_err(),
         "no PttRelease for a non-hold session"
-    );
-}
-
-/// A free-tier user hitting the voice keybinding gets the SuperGrok upsell instead of a doomed voice session.
-/// The keybinding bypasses the slash registry, so this dispatcher is the enforcement point.
-#[test]
-fn voice_keybinding_on_restricted_tier_opens_upsell() {
-    if !xai_grok_voice::AUDIO_SUPPORTED {
-        return; // The tier check runs after the AUDIO_SUPPORTED gate.
-    }
-    let mut app = test_app_with_agent();
-    app.voice_mode_enabled = true;
-    // A personal login without a subscription tier is free tier, so voice is restricted
-    app.apply_auth_meta(&xai_grok_login::AuthMeta::default());
-    assert!(app.is_voice_tier_restricted());
-
-    dispatch(Action::EnableVoiceMode, &mut app);
-
-    assert!(
-        app.agents.get(&AgentId(0)).unwrap().question_view.is_some(),
-        "restricted-tier voice keybinding must open the SuperGrok upsell"
-    );
-    assert!(
-        !app.voice_listening(),
-        "voice must not start on a restricted tier"
-    );
-}
-
-/// A paid-tier user's voice keybinding is not intercepted by the tier gate.
-#[test]
-fn voice_keybinding_on_paid_tier_not_gated() {
-    if !xai_grok_voice::AUDIO_SUPPORTED {
-        return;
-    }
-    let mut app = test_app_with_agent();
-    app.voice_mode_enabled = true;
-    let meta = xai_grok_login::AuthMeta {
-        subscription_tier: Some("SuperGrok".into()),
-        ..Default::default()
-    };
-    app.apply_auth_meta(&meta);
-    assert!(!app.is_voice_tier_restricted());
-
-    dispatch(Action::EnableVoiceMode, &mut app);
-
-    // No upsell modal; the paid user proceeds down the normal voice path
-    assert!(
-        app.agents.get(&AgentId(0)).unwrap().question_view.is_none(),
-        "paid-tier voice must not be intercepted by the tier gate"
     );
 }
 

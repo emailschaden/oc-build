@@ -354,9 +354,7 @@ pub struct SlashController {
     /// Offer `/announcements` when session announcements (critical or promo) exist.
     has_session_announcements: bool,
     /// Consumer billing surface; gates `/usage` subcommands. Default `true`.
-    billing_surface_visible: bool,
     /// Whether `/usage` is offered. Default `true`; cleared for external auth.
-    usage_command_visible: bool,
     workflows_available: bool,
     /// Session run handles for `/workflow` manage-verb autocomplete.
     workflow_runs: Vec<crate::slash::command::WorkflowRunChoice>,
@@ -398,8 +396,6 @@ impl SlashController {
             cwd,
             hide_session_scoped: false,
             has_session_announcements: false,
-            billing_surface_visible: true,
-            usage_command_visible: true,
             workflows_available: false,
             workflow_runs: Vec::new(),
             screen_mode: crate::app::ScreenMode::Fullscreen,
@@ -433,22 +429,6 @@ impl SlashController {
 
     pub fn has_session_announcements(&self) -> bool {
         self.has_session_announcements
-    }
-
-    pub fn set_billing_surface_visible(&mut self, visible: bool) {
-        self.billing_surface_visible = visible;
-    }
-
-    pub fn billing_surface_visible(&self) -> bool {
-        self.billing_surface_visible
-    }
-
-    pub fn set_usage_command_visible(&mut self, visible: bool) {
-        self.usage_command_visible = visible;
-    }
-
-    pub fn usage_command_visible(&self) -> bool {
-        self.usage_command_visible
     }
 
     pub fn set_workflows_available(&mut self, available: bool) {
@@ -493,8 +473,6 @@ impl SlashController {
             models,
             cwd: &self.cwd,
             has_session_announcements: self.has_session_announcements,
-            billing_surface_visible: self.billing_surface_visible,
-            usage_command_visible: self.usage_command_visible,
             workflows_available: self.workflows_available,
             saved_workflows: self.registry.saved_workflows(),
             workflow_runs: &self.workflow_runs,
@@ -1782,16 +1760,6 @@ mod tests {
     }
 
     #[test]
-    fn is_complete_builtin_invocation_rejects_restricted_builtin() {
-        let mut reg = test_registry();
-        reg.set_restricted_commands(&["usage".to_string()]);
-        assert!(
-            !is_complete_builtin_invocation("/usage", &reg),
-            "a tier-gated command must stay saved as text, not run from a queue row"
-        );
-    }
-
-    #[test]
     fn controller_surfaces_commands_without_query() {
         let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
         let state = SlashState::default();
@@ -1882,8 +1850,8 @@ mod tests {
         let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
         let meta = serde_json::json!({
             "scope": "plugin",
-            "path": "/plugins/acme/skills/login/SKILL.md",
-            "bareName": "login",
+            "path": "/plugins/acme/skills/help/SKILL.md",
+            "bareName": "help",
             "pluginName": "acme",
         })
         .as_object()
@@ -1891,26 +1859,26 @@ mod tests {
         .unwrap();
         ctrl.registry_mut()
             .set_acp_commands(&[agent_client_protocol::AvailableCommand::new(
-                "acme:login".to_string(),
+                "acme:help".to_string(),
                 "Acme account login".to_string(),
             )
             .meta(meta)]);
 
         let state = SlashState::default();
         let models = ModelState::default();
-        ctrl.refresh(&state, "/login", 6, &models);
+        ctrl.refresh(&state, "/help", 5, &models);
         let snapshot = state.snapshot();
-        let login = snapshot
+        let help = snapshot
             .matches
             .iter()
-            .find(|row| row.display == "/login")
-            .expect("builtin /login");
-        assert_eq!(login.provenance, Some(CommandProvenance::Builtin));
-        assert!(!login.description.contains("built-in"));
+            .find(|row| row.display == "/help")
+            .expect("builtin /help");
+        assert_eq!(help.provenance, Some(CommandProvenance::Builtin));
+        assert!(!help.description.contains("built-in"));
         let skill = snapshot
             .matches
             .iter()
-            .find(|row| row.display == "/acme:login")
+            .find(|row| row.display == "/acme:help")
             .expect("qualified skill");
         assert_eq!(
             skill.provenance,
@@ -1919,18 +1887,18 @@ mod tests {
             })
         );
         assert_eq!(skill.description, "Acme account login");
-        assert!(ctrl.registry().get("login").is_some_and(|c| !c.is_skill()));
+        assert!(ctrl.registry().get("help").is_some_and(|c| !c.is_skill()));
         assert!(
             ctrl.registry()
-                .get("acme:login")
+                .get("acme:help")
                 .is_some_and(|c| c.is_skill())
         );
 
-        ctrl.refresh(&state, "/acme:login", 11, &models);
+        ctrl.refresh(&state, "/acme:help", 10, &models);
         let snapshot = state.snapshot();
         assert_eq!(
             snapshot.selection().map(|row| row.display.as_str()),
-            Some("/acme:login"),
+            Some("/acme:help"),
             "exact qualified query should select the skill"
         );
     }
@@ -2587,29 +2555,6 @@ mod tests {
             .as_ref()
             .expect("ghost tracks selected row");
         assert_eq!(ghost.full_name, "privacy");
-    }
-
-    /// Tier-restricted commands stay in the dropdown (discoverability) even though `get()` blocks execution.
-    /// Invoking one shows the SuperGrok upsell (covered by the dispatch-level tests).
-    #[test]
-    fn restricted_commands_stay_visible_in_dropdown() {
-        let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
-        ctrl.registry_mut()
-            .set_restricted_commands(&["usage".to_string()]);
-        assert!(
-            ctrl.registry().get("usage").is_none(),
-            "execution stays blocked"
-        );
-
-        let state = SlashState::default();
-        let models = ModelState::default();
-        ctrl.refresh(&state, "/usa", 4, &models);
-        let snapshot = state.snapshot();
-        let top = snapshot.selection().expect("dropdown open").display.clone();
-        assert_eq!(
-            top, "/usage",
-            "restricted command stays discoverable in the dropdown"
-        );
     }
 
     /// With the gate open, both `/always-approve` and `/auto` are offered and dispatchable.

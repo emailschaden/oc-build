@@ -645,7 +645,7 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             &SettingCategory::Privacy,
             &SettingCategory::Models,
             // The Session category has no registered settings, so its header is not emitted
-            // Advanced category (first entries: `show_tips`, `auto_update`)
+            // Advanced category (first entries: `show_tips`, `contextual_hints`)
             &SettingCategory::Advanced,
         ]
     );
@@ -733,7 +733,6 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             // Per-tip contextual-hints GROUP row, placed right after `show_tips`
             // Its 3 child toggles (`contextual_hints.{undo,plan_mode,image_input}`) are hidden from the top-level list and reached via the sub-sheet
             "contextual_hints",
-            "auto_update",
             // SHELL-owned hunk_tracker_mode (Advanced; `off` disables it).
             "hunk_tracker_mode",
         ]

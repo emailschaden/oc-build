@@ -429,7 +429,6 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
     configure_agent_composer(app, agent_id);
     {
         let agent = app.agents.get_mut(&agent_id).unwrap();
-        agent.apply_credit_balance(app.credit_balance.clone(), app.auto_topup.clone());
         agent.active_pane = ActivePane::Prompt;
     }
     if stay_on_welcome {
@@ -470,7 +469,6 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
             agent.workspace_mode = mode;
             agent.workspace_mode_cli_locked = locked;
         }
-        agent.apply_credit_balance(app.credit_balance.clone(), app.auto_topup.clone());
         agent.session_starting_since = Some(Instant::now());
         agent.session.prompt_history_loading = true;
     }
@@ -640,18 +638,6 @@ pub(in crate::app::dispatch) fn dispatch_delete_current_session_answered(
 }
 use xai_grok_workspace::folder_trust::GrantResolution;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::app::dispatch) enum AgentLocation {
-    Embedded,
-    Leader,
-}
-pub(in crate::app::dispatch) fn agent_location(app: &AppView) -> AgentLocation {
-    if app.leader_mode {
-        AgentLocation::Leader
-    } else {
-        AgentLocation::Embedded
-    }
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::app::dispatch) enum TrustGateOutcome {
     Finish,
     FinishSessionLocal,
@@ -659,14 +645,10 @@ pub(in crate::app::dispatch) enum TrustGateOutcome {
 }
 pub(in crate::app::dispatch) fn trust_gate_outcome(
     resolution: GrantResolution,
-    agent: AgentLocation,
 ) -> TrustGateOutcome {
     match resolution {
         GrantResolution::Trusted => TrustGateOutcome::Finish,
-        GrantResolution::SessionLocal => match agent {
-            AgentLocation::Embedded => TrustGateOutcome::FinishSessionLocal,
-            AgentLocation::Leader => TrustGateOutcome::Quit,
-        },
+        GrantResolution::SessionLocal => TrustGateOutcome::FinishSessionLocal,
         GrantResolution::Unrecorded => TrustGateOutcome::Quit,
     }
 }
@@ -676,7 +658,7 @@ pub(in crate::app::dispatch) fn dispatch_trust_folder(app: &mut AppView) -> Vec<
     };
     let shown = workspace.clone();
     let outcome = xai_grok_workspace::folder_trust::grant_folder_trust_key(&shown);
-    match trust_gate_outcome(outcome.resolution(), agent_location(app)) {
+    match trust_gate_outcome(outcome.resolution()) {
         TrustGateOutcome::Finish => finish_trust(app),
         TrustGateOutcome::FinishSessionLocal => {
             app.show_toast(
@@ -725,7 +707,6 @@ pub(in crate::app::dispatch) fn dispatch_accept_consent(app: &mut AppView) -> Ve
             acked: false,
         });
     }
-    effects.push(Effect::RecordConsentUpstream { notice_id, version });
     effects.extend(finish_consent(app));
     effects
 }
@@ -788,12 +769,9 @@ fn configure_agent_composer(app: &mut AppView, agent_id: AgentId) {
     let recap = app.session_recap_available;
     let voice = app.voice_mode_enabled;
     let sharing_enabled = app.sharing_enabled;
-    let usage_visible = app.usage_visible;
-    let usage_command_visible = !app.has_external_auth_provider;
     let chat_mode = app.chat_mode;
     let screen_mode = app.screen_mode;
     let announcements = app.active_announcements.clone();
-    let restricted = app.tier_restricted_commands.clone();
     let plugins_visible = !app.appearance.disable_plugins;
     let Some(agent) = app.agents.get_mut(&agent_id) else {
         return;
@@ -804,15 +782,7 @@ fn configure_agent_composer(app: &mut AppView, agent_id: AgentId) {
     agent.prompt.set_contextual_hints(undo, plan_mode);
     agent.set_session_recap_available(recap);
     agent.set_voice_mode_available(voice);
-    agent.apply_app_scoped_gates(
-        sharing_enabled,
-        usage_visible,
-        usage_command_visible,
-        chat_mode,
-        screen_mode,
-        &announcements,
-        &restricted,
-    );
+    agent.apply_app_scoped_gates(sharing_enabled, chat_mode, screen_mode, &announcements);
     agent
         .prompt
         .slash_controller
@@ -1271,12 +1241,9 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
         agent.set_voice_mode_available(app.voice_mode_enabled);
         agent.apply_app_scoped_gates(
             app.sharing_enabled,
-            app.usage_visible,
-            !app.has_external_auth_provider,
             app.chat_mode,
             app.screen_mode,
             &app.active_announcements,
-            &app.tier_restricted_commands,
         );
         agent.chat_kind = chat_kind;
         agent.conversation_entry = chat_kind;
@@ -1300,7 +1267,6 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
             agent.workspace_mode = mode;
             agent.workspace_mode_cli_locked = locked;
         }
-        agent.apply_credit_balance(app.credit_balance.clone(), app.auto_topup.clone());
         agent
             .prompt
             .slash_controller
@@ -1447,21 +1413,6 @@ pub(in crate::app::dispatch) fn handle_session_created(
             agent_id,
             session_id: session_id_clone.clone(),
         });
-        effects.push(Effect::CheckMarketplaceUpdates {
-            agent_id,
-            session_id: session_id_clone.clone(),
-        });
-        if app.plugin_cta_enabled {
-            effects.push(Effect::FetchPluginCtaCatalog {
-                agent_id,
-                session_id: session_id_clone.clone(),
-            });
-        }
-        effects.push(Effect::FetchBilling {
-            agent_id,
-            silent: true,
-            nonce: Default::default(),
-        });
         if let Some(switch) = deferred {
             effects.push(Effect::SwitchModel {
                 agent_id,
@@ -1584,21 +1535,6 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
         effects.push(Effect::RefreshAvailableCommands {
             agent_id,
             session_id: session_id_clone.clone(),
-        });
-        effects.push(Effect::CheckMarketplaceUpdates {
-            agent_id,
-            session_id: session_id_clone.clone(),
-        });
-        if app.plugin_cta_enabled {
-            effects.push(Effect::FetchPluginCtaCatalog {
-                agent_id,
-                session_id: session_id_clone.clone(),
-            });
-        }
-        effects.push(Effect::FetchBilling {
-            agent_id,
-            silent: true,
-            nonce: Default::default(),
         });
         if let Some(switch) = deferred {
             effects.push(Effect::SwitchModel {
@@ -1933,14 +1869,8 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                         format_window(selection.get())
                     )));
                 }
-                if unchanged {
-                    vec![]
-                } else {
-                    vec![Effect::PersistPreferredModel {
-                        model_id: model_id.clone(),
-                        reasoning_effort: resolved_effort,
-                    }]
-                }
+                // oc-build: opencode backend; the pick is not saved to ~/.grok/config.toml.
+                vec![]
             }
             Err(SwitchModelError::IncompatibleAgent { .. }) => {
                 if let Some(ref prev) = prev_model_id {

@@ -4,7 +4,6 @@ use super::auth::{
     scrollback_has_recent_context_too_large, scrollback_has_recent_disk_full,
     scrollback_has_recent_reauth_prompt, scrollback_has_recent_request_failed,
 };
-use super::billing::is_credit_limit_error;
 use super::ctx::{get_active_agent_mut, visible_agent_mut, with_active_agent};
 use super::interject;
 use super::queue::{
@@ -726,14 +725,12 @@ pub(super) fn dispatch_send_prompt_submission(
     let coding_data_sharing_opt_out_from_app = app.coding_data_retention_opt_out;
     let coding_data_sharing_lock_from_app = app.coding_data_sharing_lock();
     let show_tips_from_app = app.show_tips;
-    let auto_update_from_app = app.auto_update;
     let respect_manual_folds_from_app = app.appearance.scrollback.scroll.respect_manual_folds;
     let auto_mode_gate_from_app = app.auto_mode_gate;
     let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
     let voice_stt_language_from_app = app.voice_config.language.clone();
     let subagent_model_inheritance_from_app = app.subagent_model_inheritance;
     let login_method_id_from_app = app.login_method_id.as_ref().map(|id| id.0.to_string());
-    let leader_mode = app.leader_mode;
     let screen_mode_is_minimal = app.screen_mode.is_minimal();
     let Some(agent) = app.agents.get_mut(&id) else {
         return prelude;
@@ -805,52 +802,6 @@ pub(super) fn dispatch_send_prompt_submission(
     let mut effects = prelude;
     let mut tip_send_now_after_queue = false;
 
-    // oc-build: opencode backend; a typed command with no opencode equivalent says so instead of running.
-    if !literal
-        && crate::acp::opencode_shim::is_active()
-        && trimmed.starts_with('/')
-        && let Some(invocation) = crate::slash::parse_invocation(trimmed)
-        && let Some(cmd) = agent
-            .prompt
-            .slash_controller
-            .registry()
-            .get_for_dispatch(invocation.token)
-        && crate::acp::opencode_shim::is_unavailable_command(cmd.name())
-    {
-        let message = crate::acp::opencode_shim::unavailable_message(cmd.name());
-        if consume_input {
-            agent.prompt.set_text("");
-        }
-        agent.show_toast(&message);
-        return effects;
-    }
-
-    // Tier restricted command upsell
-    // A typed invocation would otherwise fall through the unknown-command path below and leak to the model as a raw prompt
-    // Upsell instead; genuinely unknown commands still pass through (shell/ACP commands depend on that)
-    if !literal
-        && trimmed.starts_with('/')
-        && let Some(invocation) = crate::slash::parse_invocation(trimmed)
-        && agent
-            .prompt
-            .slash_controller
-            .registry()
-            .is_restricted(invocation.token)
-    {
-        // Only consume the composer when the upsell can actually open
-        // With another question modal already up, `open_supergrok_upsell` would no-op and wiping the composer here would silently drop the typed text
-        // Keep it instead so the user can resubmit after closing the modal, and never fall through to passthrough for restricted commands
-        if agent.question_view.is_none() {
-            if consume_input {
-                agent.prompt.set_text("");
-            }
-            let opened =
-                super::billing::open_restricted_command_upsell(agent, login_method_id_from_app);
-            debug_assert!(opened, "no modal was open, so the upsell must open");
-        }
-        return effects;
-    }
-
     // Registry based slash command execution
     // If the text starts with `/`, run it through the slash registry.
     // `literal` (chip click) skips this so chip text is never a command.
@@ -865,8 +816,6 @@ pub(super) fn dispatch_send_prompt_submission(
                 session_id: agent.session.session_id.as_ref(),
                 bundle_state: &app.bundle_state,
                 screen_mode: app.screen_mode,
-                billing_surface_visible: app.usage_visible,
-                usage_command_visible: !app.has_external_auth_provider,
                 // PAGER-owned snapshot for slash commands.
                 pager_state: crate::settings::PagerLocalSnapshot {
                     multiline_mode: agent.multiline_mode,
@@ -885,7 +834,6 @@ pub(super) fn dispatch_send_prompt_submission(
                     // Prefer optimistic pending over confirmed active.
                     plan_mode_active: agent.plan_mode_pending.unwrap_or(agent.plan_mode_active),
                     show_tips: show_tips_from_app,
-                    auto_update: auto_update_from_app,
                     vim_mode: crate::appearance::cache::load_vim_mode(),
                     scroll_speed: crate::appearance::cache::load_scroll_speed(),
                     respect_manual_folds: respect_manual_folds_from_app,
@@ -1150,7 +1098,6 @@ pub(super) fn dispatch_send_prompt_submission(
         }
         // Reaching here means the command queued or passed text through, a real submission
         // Local-UI commands returned above and must keep the hook-block hold
-        agent.credit_limit_stashed_prompt = None;
         agent.release_hook_block_hold();
         let mut untaken = attach_prompt_state_to_last_queued(
             agent,
@@ -1188,7 +1135,7 @@ pub(super) fn dispatch_send_prompt_submission(
             .recognized_token_ranges(&text, &agent.session.models);
 
         let immediate_server_send =
-            immediate_server_send_eligible(agent, leader_mode) && agent.prompt.images.is_empty();
+            immediate_server_send_eligible(agent) && agent.prompt.images.is_empty();
         tracing::debug!(
             target: "qtrace",
             pid = std::process::id(),
@@ -1211,7 +1158,7 @@ pub(super) fn dispatch_send_prompt_submission(
 
         // Images can't use immediate server-send; a park on an empty held wait still does a Send Now
         if !immediate_server_send
-            && immediate_server_send_eligible(agent, leader_mode)
+            && immediate_server_send_eligible(agent)
             && !agent.prompt.images.is_empty()
             && parked_sendable_wait
             && !hold_behind_existing_queue
@@ -1264,7 +1211,6 @@ pub(super) fn dispatch_send_prompt_submission(
             // This immediate-send path returns early, so it must clear them here too (notably a chip click, which submits while a turn is running)
             // `clear_follow_ups` keeps `follow_up_seen` (it marks the turn boundary) so a stale re-delivery stays rejected
             agent.clear_follow_ups();
-            agent.credit_limit_stashed_prompt = None;
 
             // `agent` borrow ends here; push the optimistic echo via `app`.
             let sid_str = session_id.0.to_string();
@@ -1293,7 +1239,6 @@ pub(super) fn dispatch_send_prompt_submission(
         agent
             .session
             .enqueue_prompt_with_skill_tokens(text.clone(), skill_token_ranges);
-        agent.credit_limit_stashed_prompt = None;
         if consume_input {
             app.pending_image_notices
                 .extend(agent.unbound_image_placeholder_notice());
@@ -1362,7 +1307,6 @@ pub(super) fn dispatch_send_bash_command(app: &mut AppView, command: String) -> 
     if refuse_if_load_failed(app, id) {
         return vec![];
     }
-    let leader_mode = app.leader_mode;
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
     };
@@ -1378,7 +1322,7 @@ pub(super) fn dispatch_send_bash_command(app: &mut AppView, command: String) -> 
     // Server-authoritative immediate send for bash while running
     // A bash command typed while a turn is RUNNING is sent to the agent immediately (it's already a `session/prompt` with bash meta)
     // It is echoed into the shared queue with `kind="bash"`
-    let bash_immediate = immediate_server_send_eligible(agent, leader_mode);
+    let bash_immediate = immediate_server_send_eligible(agent);
     tracing::debug!(
         target: "qtrace",
         pid = std::process::id(),
@@ -1599,14 +1543,6 @@ pub(super) fn handle_prompt_response(
             wire_cancellation_context.as_ref(),
         );
         let rate_limited = agent.session.rate_limited;
-        // Fallback mirroring the credit-limit race guard below
-        // If the retry notification lost the race with (or never reached) this PromptResponse, detect the free-usage code from the prompt error itself
-        // The flattened 429 body embeds it
-        let free_usage_blocked = agent.session.free_usage_blocked
-            || result
-                .as_ref()
-                .err()
-                .is_some_and(|e| xai_grok_shell::sampling::error::is_free_usage_exhausted_error(e));
         let model_incompatible = agent.session.model_incompatible;
         // Context overflow: the RetryState handler already pushed the actionable block, so the generic TurnFailed and error toast are redundant
         // Derived from the scrollback (mirrors reauth), not a session flag
@@ -1621,15 +1557,6 @@ pub(super) fn handle_prompt_response(
                 .push_block(RenderBlock::session_event(SessionEvent::DiskFull));
         }
         let disk_full = disk_full_from_error || scrollback_has_recent_disk_full(&agent.scrollback);
-        // Fallback for when the retry notification didn't set the flag
-        // Detect credit-limit denials (legacy 403 or pool 402) from the PromptResponse error and HTTP status
-        // The error text is already banner-formatted ("Request failed (402): …"), so recover the status from it when the field is absent
-        let credit_limit_blocked = agent.session.credit_limit_blocked
-            || result.as_ref().err().is_some_and(|e| {
-                let status =
-                    http_status.or_else(|| crate::app::error_display::parse_http_status(e));
-                is_credit_limit_error(status, e)
-            });
         // A 401/auth failure already showed an actionable `ReAuthRequired` prompt via the RetryState handler (which runs before this PromptResponse)
         // Suppress the redundant "Turn failed" block and error toast so only the prompt shows
         // The needle matches both the raw "Unauthorized (401)" dump and the banner-formatted "Request failed (401): …" text
@@ -1643,9 +1570,7 @@ pub(super) fn handle_prompt_response(
         // The cases: rate limit, free-usage paywall, model incompatibility, credit 402/403, 401 re-auth, context overflow, and disk-full
         // A formatted RequestFailed banner from RetryState also counts
         let dedicated_ux_shown = rate_limited
-            || free_usage_blocked
             || model_incompatible
-            || credit_limit_blocked
             || reauth_prompted
             || context_overflow
             || disk_full
@@ -1667,25 +1592,6 @@ pub(super) fn handle_prompt_response(
                     "removed_from_queue": removed_from_queue,
                 })),
             );
-        }
-
-        // Stash the complete in-flight prompt before finish_turn clears it.
-        // Used by CreditLimitRecheckComplete to retry after a tier upgrade.
-        if credit_limit_blocked && let Some(prompt) = agent.session.in_flight_prompt.clone() {
-            agent.credit_limit_stashed_prompt = Some(prompt);
-        }
-        // Stash for AuthComplete after 401
-        // Prefer in_flight; fall back to compact_held (cleared for cancel-rewind during auto-compact)
-        // Skip if both None
-        if reauth_prompted {
-            let held = agent
-                .session
-                .in_flight_prompt
-                .clone()
-                .or_else(|| agent.session.compact_held_prompt.clone());
-            if let Some(prompt) = held {
-                agent.reauth_stashed_prompt = Some(prompt);
-            }
         }
 
         // qtrace: turn end on this client
@@ -1862,45 +1768,6 @@ pub(super) fn handle_prompt_response(
             return vec![];
         }
 
-        // Credit-limit (403 legacy / 402 pool): strip stale error blocks, then do a one-shot subscription re-check
-        // If the tier changed (user upgraded mid-session), the stashed prompt is retried automatically; otherwise the upsell is shown
-        if credit_limit_blocked {
-            // Strip stale error blocks that were pushed before the credit-limit was detected
-            let to_remove: Vec<usize> = super::auth::trailing_session_events(&agent.scrollback)
-                .filter(|(_, ev)| {
-                    matches!(
-                        ev,
-                        SessionEvent::RequestFailed { .. }
-                            | SessionEvent::RetryFailed { .. }
-                            | SessionEvent::TurnFailed { .. }
-                    )
-                })
-                .map(|(idx, _)| idx)
-                .collect();
-            for idx in to_remove {
-                agent.scrollback.remove_from(idx);
-            }
-
-            // Defer the upsell until the subscription re-check completes
-            // Queue drain and billing fetch happen in the CreditLimitRecheckComplete handler
-            if let Some(p) = pending_adoption {
-                agent.discard_pending_adoption_updates(&p.prompt_id);
-            }
-            return vec![Effect::CreditLimitRecheck { agent_id }];
-        }
-
-        // Free-usage paywall (a 429 with subscription:free-usage-exhausted)
-        // Driver-only by construction: viewers never receive a PromptResponse
-        // No queue drain: queued prompts would fail on the same exhausted quota
-        if free_usage_blocked {
-            let auth_method = app.login_method_id.as_ref().map(|id| id.0.to_string());
-            super::billing::open_free_usage_upsell(agent, auth_method);
-            if let Some(p) = pending_adoption {
-                agent.discard_pending_adoption_updates(&p.prompt_id);
-            }
-            return vec![];
-        }
-
         // FIFO order: a server-authoritative prompt may have drained into the running slot during this turn's teardown
         // Adopt it now (finish_turn cleared current_prompt_id) and run the turn-start shim
         // This sets `TurnRunning`, so the `maybe_drain_queue` below no-ops rather than draining a local prompt; the leader owns the drain order
@@ -1921,36 +1788,8 @@ pub(super) fn handle_prompt_response(
 
         let drain = maybe_drain_queue(agent, &mut app.pending_image_notices);
         let page_flip_entry = adopted_page_flip.or(drain.page_flip_entry);
-        let mut effects = drain.effects;
+        let effects = drain.effects;
 
-        // Predicted-next-prompt (tab autocomplete): fetch a fresh suggestion (the stale one was wiped above)
-        // It fetches only after a clean, non-bash agent turn that leaves the session idle with an empty prompt and no queued work, local or server-side
-        // A draft in progress or a draining queue means the user is already mid-thought
-        if crate::views::prompt_suggestion::resolve_enabled()
-            && result.is_ok()
-            && !was_cancelling
-            && !was_bash_turn
-            && agent.prompt.text().is_empty()
-            && agent.session.pending_prompts.is_empty()
-            && agent.shared_queue.is_empty()
-            && agent.session.state.is_idle()
-            && let Some(session_id) = agent.session.session_id.as_ref().map(|s| s.0.to_string())
-        {
-            let generation = agent.prompt.prompt_suggestion.begin_fetch();
-            let model = crate::views::prompt_suggestion::resolve_model();
-            effects.push(Effect::FetchPromptSuggestion {
-                agent_id,
-                generation,
-                model,
-                session_id: Some(session_id),
-            });
-        }
-
-        effects.push(Effect::FetchBilling {
-            agent_id,
-            silent: true,
-            nonce: Default::default(),
-        });
         note_peek_page_flip(app, agent_id, page_flip_entry);
         return effects;
     }

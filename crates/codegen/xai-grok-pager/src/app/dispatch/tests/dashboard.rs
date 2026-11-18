@@ -1000,97 +1000,6 @@ fn voice_off_target_surface_does_not_enable_or_record() {
     assert!(!app.voice_state.is_pending_cold_start());
     assert!(rx.try_recv().is_err(), "no PttPress without a target");
 }
-/// `grok dashboard` before login: the startup hook consumes the `GROK_OPEN_DASHBOARD_AT_STARTUP` env var and stashes
-/// `deferred_startup.open_dashboard`; `AuthComplete` must then open the dashboard view. Regression test for the silent drop where the user landed on the welcome screen / agent view instead.
-#[serial_test::serial(GROK_AGENT_DASHBOARD)]
-#[test]
-fn auth_complete_opens_deferred_dashboard() {
-    let mut app = test_app();
-    app.auth_state = AuthState::Authenticating {
-        request_seq: 1,
-        handle: None,
-        auth_url: None,
-        mode: AuthMode::Pending,
-    };
-    app.deferred_startup.open_dashboard = true;
-    dispatch(
-        Action::TaskComplete(TaskResult::AuthComplete {
-            request_seq: 1,
-            meta: None,
-        }),
-        &mut app,
-    );
-    assert!(matches!(app.auth_state, AuthState::Done));
-    assert!(
-        matches!(app.active_view, ActiveView::AgentDashboard),
-        "deferred `grok dashboard` must open the dashboard after login",
-    );
-    assert!(
-        !app.deferred_startup.open_dashboard,
-        "the deferred-dashboard flag must be consumed",
-    );
-}
-/// Mid-session re-auth completed from the dashboard still consumes the stash on the agent that 401'd (auth is global, not per-view).
-/// stash on the agent that 401'd (auth is global, not per-view).
-#[test]
-fn auth_complete_retries_stashed_prompt_from_dashboard() {
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    let mut image = crate::prompt_images::from_clipboard_data(&crate::clipboard::ImageData {
-        data: vec![1, 2, 3],
-        mime_type: "image/png".into(),
-    });
-    image.display_number = 1;
-    app.agents.get_mut(&id).unwrap().reauth_stashed_prompt =
-        Some(crate::app::agent::InFlightPrompt {
-            text: "retry me [Image #1]".into(),
-            images: vec![image],
-            scrollback_entry: crate::scrollback::EntryId::new(0),
-            combined_scrollback_entries: Vec::new(),
-            chip_elements: vec![crate::app::agent::ChipElement {
-                range: 9..19,
-                kind: crate::views::prompt_widget::KIND_IMAGE,
-                display: None,
-            }],
-        });
-    app.active_view = ActiveView::AgentDashboard;
-    dispatch(Action::Login, &mut app);
-    let seq = authenticating_seq(&app);
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::AuthComplete {
-            request_seq: seq,
-            meta: None,
-        }),
-        &mut app,
-    );
-    assert_eq!(app.active_view, ActiveView::AgentDashboard);
-    assert!(test_agent(&app, id).reauth_stashed_prompt.is_none());
-    assert!(
-        effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::SendPromptBlocks { .. })),
-        "stash must be retried even when login returns to the dashboard, got: {effects:?}"
-    );
-}
-/// Cancelling a mid-session re-auth from the dashboard also drops the stash (auth is global, not per-view).
-/// stash (auth is global, not per-view).
-#[test]
-fn cancel_login_from_dashboard_drops_reauth_stashed_prompt() {
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    app.agents.get_mut(&id).unwrap().reauth_stashed_prompt =
-        Some(crate::app::agent::InFlightPrompt {
-            text: "stale".into(),
-            images: Vec::new(),
-            scrollback_entry: crate::scrollback::EntryId::new(0),
-            combined_scrollback_entries: Vec::new(),
-            chip_elements: Vec::new(),
-        });
-    app.active_view = ActiveView::AgentDashboard;
-    dispatch(Action::Login, &mut app);
-    dispatch(Action::CancelLogin, &mut app);
-    assert!(test_agent(&app, id).reauth_stashed_prompt.is_none());
-}
 #[test]
 fn resolve_location_input_expands_and_joins() {
     let cwd = PathBuf::from("/work/dir");
@@ -2108,7 +2017,6 @@ fn dashboard_open_detects_standalone_grok_worktree() {
 #[test]
 fn dashboard_open_works_without_leader() {
     let mut app = test_app_with_agent();
-    app.leader_mode = false;
     app.active_view = ActiveView::Agent(AgentId(0));
     let _ = dispatch_open_dashboard(&mut app);
     assert!(
@@ -2144,7 +2052,6 @@ fn idle_roster_entry(session_id: &str, title: &str) -> crate::app::roster::Roste
 #[test]
 fn dashboard_open_without_leader_fetches_local_sessions() {
     let mut app = test_app_with_agent();
-    app.leader_mode = false;
     app.active_view = ActiveView::Agent(AgentId(0));
     let effects = dispatch_open_dashboard(&mut app);
     assert!(
@@ -2179,7 +2086,7 @@ fn workspace_dashboard_open_loads_one_snapshot_and_skips_rosters() {
     assert!(
         !effects
             .iter()
-            .any(|effect| matches!(effect, Effect::FetchRoster | Effect::FetchDashboardSessions))
+            .any(|effect| matches!(effect, Effect::FetchDashboardSessions))
     );
     let _ = dispatch_exit_dashboard(&mut app);
     let effects = dispatch_open_dashboard(&mut app);
@@ -2882,64 +2789,11 @@ fn workspace_overlay_cycle_reaches_provisional_but_not_hidden_live_agents() {
     assert!(dispatch_dashboard_overlay_cycle(&mut app, 1).is_empty());
     assert_eq!(app.active_view, ActiveView::Agent(AgentId(0)));
 }
-/// In leader mode the live FleetView roster is the source, so opening must
-/// fetch that roster immediately (not wait for the poll tick) and must NOT
-/// also fetch the local on-disk list.
-#[serial_test::serial(GROK_AGENT_DASHBOARD)]
-#[test]
-fn dashboard_open_with_leader_fetches_roster_not_local_sessions() {
-    let mut app = test_app_with_agent();
-    app.leader_mode = true;
-    app.active_view = ActiveView::Agent(AgentId(0));
-    let effects = dispatch_open_dashboard(&mut app);
-    assert!(
-        effects.iter().any(|e| matches!(e, Effect::FetchRoster)),
-        "leader dashboard open must fetch the live roster immediately",
-    );
-    assert!(
-        !effects
-            .iter()
-            .any(|e| matches!(e, Effect::FetchDashboardSessions)),
-        "leader dashboard open must not fetch the local on-disk list",
-    );
-    assert!(
-        app.dashboard_sessions_loading,
-        "leader open must show Loading sessions until RosterLoaded",
-    );
-}
-#[test]
-fn roster_loaded_clears_dashboard_sessions_loading() {
-    let mut app = test_app();
-    app.leader_mode = true;
-    app.dashboard_sessions_loading = true;
-    let _ = dispatch(
-        Action::TaskComplete(TaskResult::RosterLoaded {
-            sessions: vec![idle_roster_entry("sess-live", "Working agent")],
-        }),
-        &mut app,
-    );
-    assert!(!app.dashboard_sessions_loading);
-    assert_eq!(app.leader_roster.len(), 1);
-}
-#[test]
-fn roster_failed_clears_dashboard_sessions_loading() {
-    let mut app = test_app();
-    app.leader_mode = true;
-    app.dashboard_sessions_loading = true;
-    let _ = dispatch(
-        Action::TaskComplete(TaskResult::RosterFailed {
-            error: "timeout".into(),
-        }),
-        &mut app,
-    );
-    assert!(!app.dashboard_sessions_loading);
-}
 /// `DashboardSessionsLoaded` stores the local idle sessions, and `dashboard_roster()` surfaces them when not in leader mode.
 /// `dashboard_roster()` surfaces them when not in leader mode.
 #[test]
 fn dashboard_sessions_loaded_feeds_non_leader_roster() {
     let mut app = test_app();
-    app.leader_mode = false;
     let _ = dispatch(
         Action::TaskComplete(TaskResult::DashboardSessionsLoaded {
             sessions: vec![idle_roster_entry("sess-idle", "Fix login")],
@@ -2952,28 +2806,6 @@ fn dashboard_sessions_loaded_feeds_non_leader_roster() {
     assert_eq!(
         roster.first().map(|r| r.session_id.as_str()),
         Some("sess-idle")
-    );
-}
-/// `dashboard_roster()` switches source on `leader_mode`: the live leader
-/// roster in leader mode, the local idle-session list otherwise.
-#[test]
-fn dashboard_roster_switches_on_leader_mode() {
-    let mut app = test_app();
-    app.leader_roster = vec![idle_roster_entry("leader-sess", "Leader")];
-    app.dashboard_local_sessions = vec![idle_roster_entry("local-sess", "Local")];
-    app.leader_mode = true;
-    assert_eq!(
-        app.dashboard_roster()
-            .first()
-            .map(|r| r.session_id.as_str()),
-        Some("leader-sess")
-    );
-    app.leader_mode = false;
-    assert_eq!(
-        app.dashboard_roster()
-            .first()
-            .map(|r| r.session_id.as_str()),
-        Some("local-sess")
     );
 }
 /// Seed a model into the app catalog for `/model` tests.
@@ -3050,31 +2882,6 @@ fn dashboard_slash_model_with_a_window_stages_the_model_and_explains_the_window(
     assert_eq!(
         Some("Context window applies per session; run /context-window after spawn"),
         dashboard.error_toast.as_deref()
-    );
-}
-/// A tier-restricted command typed into the dashboard dispatch input must upsell via the feedback toast, not execute, and not fall through the unknown-command path, which would spawn a session whose first prompt is the raw slash text.
-#[serial_test::serial(GROK_AGENT_DASHBOARD)]
-#[test]
-fn dashboard_slash_restricted_command_upsells_via_toast() {
-    let mut app = test_app();
-    app.tier_restricted_commands = vec!["imagine".to_string()];
-    open_dashboard(&mut app);
-    let effects = dispatch_dashboard_dispatch_slash(&mut app, "/imagine a sunset".into());
-    assert!(effects.is_empty(), "restricted command must not dispatch");
-    assert!(
-        app.agents.is_empty(),
-        "no session may be spawned for the raw slash text"
-    );
-    let toast = app
-        .dashboard
-        .as_ref()
-        .unwrap()
-        .error_toast
-        .as_deref()
-        .expect("restricted command must set the upsell toast");
-    assert!(
-        toast.contains("/imagine") && toast.contains("SuperGrok"),
-        "toast must carry the upsell: {toast}"
     );
 }
 /// A slash command that fails (`CommandResult::Error`) surfaces on the dashboard with the `✗` error prefix: command error strings carry no glyph of their own, and the feedback badge paints the toast verbatim in a neutral colour, so without the prefix an error would be indistinguishable from a success message.
@@ -3221,41 +3028,6 @@ fn dashboard_does_not_advertise_or_dispatch_doctor() {
         assert_eq!(dashboard.error_toast.as_deref(), Some(expected.as_str()));
     }
 }
-/// External-auth hides `/usage` via `visible()`, not session-scope. Typed
-/// `/usage` on the dashboard must refuse with the command's message, not
-/// claim it only works in a session.
-#[serial_test::serial(GROK_AGENT_DASHBOARD)]
-#[test]
-fn dashboard_slash_usage_hidden_for_external_auth() {
-    let mut app = three_agent_app();
-    app.has_external_auth_provider = true;
-    app.apply_auth_meta(&xai_grok_login::AuthMeta::default());
-    open_dashboard(&mut app);
-    let before = app.agents.len();
-    let effects = dispatch_dashboard_dispatch_slash(&mut app, "/usage".into());
-    assert!(effects.is_empty(), "must not enqueue spawn effects");
-    assert_eq!(app.agents.len(), before, "must not add an agent");
-    assert_eq!(app.dashboard.as_ref().unwrap().dispatch.text(), "");
-    let toast = app
-        .dashboard
-        .as_ref()
-        .unwrap()
-        .error_toast
-        .as_deref()
-        .expect("error toast for gated /usage");
-    assert!(
-        toast.contains("/usage is not available"),
-        "unexpected toast: {toast}"
-    );
-    assert!(
-        !toast.contains("only works in a session"),
-        "must not mis-label /usage as session-scoped: {toast}"
-    );
-    assert!(
-        !toast.contains("SuperGrok"),
-        "must not upsell billing on external auth: {toast}"
-    );
-}
 /// The dashboard modal's own fetch generation and its open state.
 fn dashboard_usage_modal(app: &AppView) -> &crate::views::usage_modal::UsageInfoModalState {
     app.dashboard
@@ -3264,212 +3036,6 @@ fn dashboard_usage_modal(app: &AppView) -> &crate::views::usage_modal::UsageInfo
         .usage_modal
         .as_ref()
         .expect("usage modal open on the dashboard")
-}
-/// Regression: the dispatcher used to require an agent view and silently dropped `/usage` on the dashboard.
-#[serial_test::serial(GROK_AGENT_DASHBOARD)]
-#[test]
-fn dashboard_slash_usage_opens_dashboard_modal() {
-    use crate::views::usage_modal::UsageInfoTab;
-    let mut app = three_agent_app();
-    open_dashboard(&mut app);
-    let before = app.agents.len();
-    let effects = dispatch_dashboard_dispatch_slash(&mut app, "/usage".into());
-    let [Effect::FetchAppBilling { nonce }] = effects.as_slice() else {
-        panic!("session-less open refreshes only the account allowance, got: {effects:?}");
-    };
-    assert_ne!(
-        *nonce, 0,
-        "a modal-driven fetch must carry a real generation"
-    );
-    assert_eq!(app.agents.len(), before, "must not add an agent");
-    assert!(
-        matches!(app.active_view, ActiveView::AgentDashboard),
-        "must stay on dashboard"
-    );
-    let dashboard = app.dashboard.as_ref().unwrap();
-    assert_eq!(dashboard.dispatch.text(), "");
-    assert!(
-        dashboard.error_toast.is_none(),
-        "{:?}",
-        dashboard.error_toast
-    );
-    let modal = dashboard_usage_modal(&app);
-    assert_eq!(modal.active_tab, UsageInfoTab::UsageLimit);
-    assert_eq!(modal.fetch_nonce, *nonce);
-    assert!(modal.ctx.session_id.is_none());
-    assert!(modal.ctx.usage_visible);
-    assert!(!modal.ctx.chat_kind);
-    assert!(modal.billing_loading);
-    for agent in app.agents.values() {
-        assert!(
-            agent.active_modal.is_none(),
-            "modal must not land on a background agent"
-        );
-    }
-}
-/// A second open re-tabs the existing modal without a second fetch; the tab really changes when the action asks for another one.
-/// The session-scoped `/context` slash stays refused on the dashboard and leaves the modal alone.
-#[serial_test::serial(GROK_AGENT_DASHBOARD)]
-#[test]
-fn dashboard_usage_modal_reopen_retabs_without_refetch_and_session_slashes_stay_refused() {
-    use crate::views::usage_modal::UsageInfoTab;
-    let mut app = three_agent_app();
-    open_dashboard(&mut app);
-    let _ = dispatch_dashboard_dispatch_slash(&mut app, "/usage".into());
-    let nonce = dashboard_usage_modal(&app).fetch_nonce;
-    let effects = dispatch(Action::ShowContextInfo, &mut app);
-    assert!(
-        effects.is_empty(),
-        "re-open must not refetch, got: {effects:?}"
-    );
-    let modal = dashboard_usage_modal(&app);
-    assert_eq!(modal.active_tab, UsageInfoTab::ContextUsage);
-    assert_eq!(
-        modal.fetch_nonce, nonce,
-        "re-tab keeps the in-flight generation"
-    );
-    let effects = dispatch_dashboard_dispatch_slash(&mut app, "/usage".into());
-    assert!(effects.is_empty(), "got: {effects:?}");
-    assert_eq!(
-        dashboard_usage_modal(&app).active_tab,
-        UsageInfoTab::UsageLimit
-    );
-    let effects = dispatch_dashboard_dispatch_slash(&mut app, "/context".into());
-    assert!(effects.is_empty(), "got: {effects:?}");
-    assert_eq!(
-        dashboard_usage_modal(&app).active_tab,
-        UsageInfoTab::UsageLimit
-    );
-    let toast = app
-        .dashboard
-        .as_ref()
-        .unwrap()
-        .error_toast
-        .as_deref()
-        .expect("session-scoped /context toasts on the dashboard");
-    assert!(
-        toast.contains("/context only works in a session"),
-        "unexpected toast: {toast}"
-    );
-}
-/// The reply that carries the modal's generation settles it; a background reply (nonce 0) updates the cache but not the modal.
-#[serial_test::serial(GROK_AGENT_DASHBOARD)]
-#[test]
-fn dashboard_usage_modal_settles_only_on_its_own_app_billing_generation() {
-    let mut app = three_agent_app();
-    open_dashboard(&mut app);
-    let _ = dispatch_dashboard_dispatch_slash(&mut app, "/usage".into());
-    let nonce = dashboard_usage_modal(&app).fetch_nonce;
-    let _ = dispatch(
-        Action::TaskComplete(TaskResult::AppBillingFetched {
-            balance: Some(test_bal(10.0)),
-            autotopup: crate::views::credit_bar::AutoTopupFetch::Unchanged,
-            nonce: 0,
-        }),
-        &mut app,
-    );
-    assert!(
-        dashboard_usage_modal(&app).billing_loading,
-        "a startup/login refresh must not settle the modal's fetch"
-    );
-    assert_eq!(app.credit_balance.as_ref().map(|b| b.usage_pct), Some(10.0));
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::AppBillingFetched {
-            balance: Some(test_bal(42.0)),
-            autotopup: crate::views::credit_bar::AutoTopupFetch::Unchanged,
-            nonce,
-        }),
-        &mut app,
-    );
-    assert!(effects.is_empty(), "got: {effects:?}");
-    let modal = dashboard_usage_modal(&app);
-    assert!(!modal.billing_loading);
-    assert!(modal.billing_error.is_none());
-    assert_eq!(app.credit_balance.as_ref().map(|b| b.usage_pct), Some(42.0));
-}
-/// A failed fetch surfaces its error in the modal and keeps the last-known-good balance (the welcome warning and new-agent seed read it).
-#[serial_test::serial(GROK_AGENT_DASHBOARD)]
-#[test]
-fn dashboard_usage_modal_billing_error_keeps_cached_balance() {
-    let mut app = three_agent_app();
-    app.credit_balance = Some(test_bal(63.0));
-    open_dashboard(&mut app);
-    let _ = dispatch_dashboard_dispatch_slash(&mut app, "/usage".into());
-    let nonce = dashboard_usage_modal(&app).fetch_nonce;
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::AppBillingError {
-            error: "proxy unreachable".to_string(),
-            nonce,
-        }),
-        &mut app,
-    );
-    assert!(effects.is_empty(), "got: {effects:?}");
-    let modal = dashboard_usage_modal(&app);
-    assert!(!modal.billing_loading);
-    assert_eq!(modal.billing_error.as_deref(), Some("proxy unreachable"));
-    assert_eq!(
-        app.credit_balance.as_ref().map(|b| b.usage_pct),
-        Some(63.0),
-        "a transport failure must not wipe the cached balance"
-    );
-}
-#[serial_test::serial(GROK_AGENT_DASHBOARD)]
-#[test]
-fn dashboard_slash_usage_redirect_url_skips_billing_fetch() {
-    let mut app = three_agent_app();
-    app.usage_billing_redirect_url = Some("https://billing.example.com/me".to_string());
-    open_dashboard(&mut app);
-    let effects = dispatch_dashboard_dispatch_slash(&mut app, "/usage".into());
-    assert!(effects.is_empty(), "got: {effects:?}");
-    let modal = dashboard_usage_modal(&app);
-    assert!(!modal.billing_loading);
-    assert_eq!(modal.fetch_nonce, 0);
-    assert_eq!(
-        modal.ctx.billing_redirect_url.as_deref(),
-        Some("https://billing.example.com/me")
-    );
-}
-/// Team / API-key accounts have no consumer billing surface: no fetch, and the modal explains who manages the limits.
-#[serial_test::serial(GROK_AGENT_DASHBOARD)]
-#[test]
-fn dashboard_slash_usage_team_account_skips_billing_fetch() {
-    let mut app = three_agent_app();
-    app.usage_visible = false;
-    app.sync_billing_surface_to_agents();
-    open_dashboard(&mut app);
-    let effects = dispatch_dashboard_dispatch_slash(&mut app, "/usage".into());
-    assert!(effects.is_empty(), "got: {effects:?}");
-    let modal = dashboard_usage_modal(&app);
-    assert!(!modal.ctx.usage_visible);
-    assert!(!modal.billing_loading);
-    assert_eq!(modal.fetch_nonce, 0);
-}
-/// `--chat` processes carry `chat_kind` on every session; the dashboard modal follows so it hides Build coding credits the same way.
-#[serial_test::serial(GROK_AGENT_DASHBOARD)]
-#[test]
-fn dashboard_slash_usage_in_chat_mode_marks_modal_chat_kind() {
-    let mut app = three_agent_app();
-    app.chat_mode = true;
-    open_dashboard(&mut app);
-    let effects = dispatch_dashboard_dispatch_slash(&mut app, "/usage".into());
-    assert!(
-        effects.is_empty(),
-        "chat kind never fetches Build billing, got: {effects:?}"
-    );
-    let modal = dashboard_usage_modal(&app);
-    assert!(modal.ctx.chat_kind);
-    assert!(!modal.billing_loading);
-}
-#[serial_test::serial(GROK_AGENT_DASHBOARD)]
-#[test]
-fn dashboard_reopen_clears_usage_modal() {
-    let mut app = three_agent_app();
-    open_dashboard(&mut app);
-    let _ = dispatch_dashboard_dispatch_slash(&mut app, "/usage".into());
-    assert!(app.dashboard.as_ref().unwrap().usage_modal.is_some());
-    let _ = dispatch(Action::ExitDashboard, &mut app);
-    open_dashboard(&mut app);
-    assert!(app.dashboard.as_ref().unwrap().usage_modal.is_none());
 }
 /// Ctrl+\ passes through the open modal into the overlay; coming back through either overlay exit must not resurrect it.
 #[serial_test::serial(GROK_AGENT_DASHBOARD)]
@@ -3553,15 +3119,7 @@ fn dashboard_slash_session_modals_toast_instead_of_noop() {
     let mut app = three_agent_app();
     open_dashboard(&mut app);
     let before = app.agents.len();
-    for name in [
-        "hooks",
-        "plugins",
-        "marketplace",
-        "skills",
-        "mcps",
-        "config-agents",
-        "personas",
-    ] {
+    for name in ["plugins", "skills", "mcps", "config-agents", "personas"] {
         let command = format!("/{name}");
         let expected = format!(
             "{} /{name} only works in a session. Open an agent first.",
@@ -5632,7 +5190,6 @@ fn dashboard_upgrade_cta_paints_arms_rect_and_ctrl_o_override() {
             pinned: true,
             caption: Some(CAPTION),
         }),
-        None,
     );
     assert!(
         state.pinned_upgrade_cta_live,
@@ -5685,7 +5242,6 @@ fn dashboard_upgrade_cta_paints_arms_rect_and_ctrl_o_override() {
             pinned: true,
             caption: None,
         }),
-        None,
     );
     assert!(state.pinned_upgrade_cta_live);
     let rect = state
@@ -5717,7 +5273,6 @@ fn dashboard_upgrade_cta_paints_arms_rect_and_ctrl_o_override() {
             pinned: false,
             caption: Some(CAPTION),
         }),
-        None,
     );
     assert!(!state.pinned_upgrade_cta_live);
     let rect = state
@@ -5751,7 +5306,6 @@ fn dashboard_upgrade_cta_paints_arms_rect_and_ctrl_o_override() {
         crate::views::dashboard::WorkspaceRowInputs::default(),
         None,
         false,
-        None,
         None,
     );
     assert!(state.upgrade_cta_hit.rect.is_none());
@@ -7865,7 +7419,6 @@ fn dashboard_peek_auto_opens_for_selected_row() {
         None,
         false,
         None,
-        None,
     );
     assert!(
         app.dashboard.as_ref().unwrap().peek.is_some(),
@@ -7885,7 +7438,6 @@ fn dashboard_peek_auto_opens_for_selected_row() {
         crate::views::dashboard::WorkspaceRowInputs::default(),
         None,
         false,
-        None,
         None,
     );
     assert!(
@@ -7922,7 +7474,6 @@ fn dashboard_peek_box_grows_for_multiline_reply() {
                 crate::views::dashboard::WorkspaceRowInputs::default(),
                 None,
                 false,
-                None,
                 None,
             );
         };
@@ -8063,7 +7614,6 @@ fn dashboard_attach_roster_focuses_existing_local_agent() {
 #[test]
 fn dashboard_attach_conversation_roster_row_loads_as_chat() {
     let mut app = test_app();
-    app.leader_mode = false;
     let mut entry = idle_roster_entry("conv-dash-1", "Backend chat");
     entry.cwd = String::new();
     entry.origin.kind = "conversation".into();
@@ -8091,7 +7641,6 @@ fn dashboard_attach_conversation_roster_row_loads_as_chat() {
 #[test]
 fn dashboard_attach_build_roster_row_keeps_disk_resume() {
     let mut app = test_app();
-    app.leader_mode = false;
     app.dashboard_local_sessions = vec![idle_roster_entry("build-dash-1", "Fix login")];
     let effects = dispatch_dashboard_attach(
         &mut app,

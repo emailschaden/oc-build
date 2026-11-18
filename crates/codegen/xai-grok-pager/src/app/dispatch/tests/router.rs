@@ -1,32 +1,6 @@
 //! Tests for the action router, model switching, slash commands, and other cross-cutting dispatch behavior.
 use super::*;
 #[test]
-fn auth_copy_dispatch_preserves_all_delivery_states() {
-    for delivery in [
-        crate::clipboard::ClipboardDelivery::Confirmed,
-        crate::clipboard::ClipboardDelivery::Unverified,
-        crate::clipboard::ClipboardDelivery::Failed,
-    ] {
-        let mut app = test_app();
-        app.auth_state = AuthState::Authenticating {
-            request_seq: 1,
-            handle: None,
-            auth_url: Some("https://grok.com/auth".to_owned()),
-            mode: AuthMode::Command,
-        };
-        let effects = crate::app::dispatch::router::dispatch_copy_auth_url(&mut app, |url| {
-            assert_eq!(url, "https://grok.com/auth");
-            delivery
-        });
-        assert_eq!(app.auth_clipboard_delivery, Some(delivery));
-        assert_eq!(app.auth_clipboard_feedback_generation, 1);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::ScheduleClearAuthCopyFeedback { generation: 1 }]
-        ));
-    }
-}
-#[test]
 fn external_prompt_editor_arms_typed_request_and_preserves_composer_modes() {
     use crate::app::agent_view::PromptInputMode;
     for mode in [
@@ -505,58 +479,6 @@ fn follow_up_chip_does_not_execute_exit_alias() {
     assert!(
         matches!(effects.as_slice(), [Effect::SendPrompt { text, .. }] if text == "quit"),
         "bare 'quit' chip must be a literal prompt, got {effects:?}"
-    );
-}
-#[test]
-fn chip_submit_while_running_clears_follow_up_chips() {
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    {
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.apply_follow_ups("resp-1".into(), vec!["Summarize".into()]);
-        assert!(agent.follow_ups.is_some(), "precondition: chips shown");
-        agent.session.state = AgentState::TurnRunning;
-    }
-    let effects = dispatch(Action::SubmitFollowUp("Summarize".into()), &mut app);
-    assert!(
-        matches!(effects.as_slice(), [Effect::SendPrompt { text, .. }] if text == "Summarize"),
-        "chip must immediate-send while running, got {effects:?}"
-    );
-    assert_eq!(agent_ref(&app, id).session.queue_len(), 0);
-    assert!(
-        agent_ref(&app, id).follow_ups.is_none(),
-        "immediate-send chip path must clear chips"
-    );
-}
-#[test]
-fn chip_submit_while_reconnect_pending_keeps_chips_and_does_not_send() {
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    app.agents
-        .get_mut(&id)
-        .unwrap()
-        .apply_follow_ups("resp-1".into(), vec!["Summarize".into()]);
-    app.reconnect_pending = true;
-    let effects = dispatch(Action::SubmitFollowUp("Summarize".into()), &mut app);
-    assert!(
-        effects.is_empty(),
-        "a reconnect-pending submit must emit no effect, got {effects:?}"
-    );
-    assert_eq!(agent_ref(&app, id).session.queue_len(), 0);
-    assert!(
-        agent_ref(&app, id).follow_ups.is_some(),
-        "reconnect-pending submit must NOT clear the chips"
-    );
-    app.reconnect_pending = false;
-    app.agents.get_mut(&id).unwrap().session.state = AgentState::TurnRunning;
-    let effects2 = dispatch(Action::SubmitFollowUp("Summarize".into()), &mut app);
-    assert!(
-        matches!(effects2.as_slice(), [Effect::SendPrompt { text, .. }] if text == "Summarize"),
-        "after reconnect clears, the chip must submit, got {effects2:?}"
-    );
-    assert!(
-        agent_ref(&app, id).follow_ups.is_none(),
-        "a proceeding submit must clear the chips"
     );
 }
 #[test]
@@ -1261,15 +1183,6 @@ fn slash_model_no_args_produces_scrollback_error() {
     assert_eq!(agent_ref(&app, id).scrollback.len(), initial_scrollback + 1);
 }
 #[test]
-fn slash_hooks_opens_modal() {
-    let mut app = test_app_with_agent();
-    app.appearance.disable_plugins = false;
-    let id = AgentId(0);
-    let effects = dispatch(Action::SendPrompt("/hooks".into()), &mut app);
-    assert!(agent_ref(&app, id).extensions_modal.is_some());
-    assert_eq!(effects.len(), 6);
-}
-#[test]
 fn acp_bootstrap_command_appears_in_autocomplete() {
     let mut app = test_app();
     app.bootstrap_acp_commands = vec![acp::AvailableCommand::new(
@@ -1634,7 +1547,7 @@ fn pick_over_cli_seed_keeps_display_as_rollback_target() {
     );
 }
 #[test]
-fn deferred_switch_updates_display_and_persists() {
+fn deferred_switch_updates_display_without_persisting() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     let model_id = acp::ModelId::new(std::sync::Arc::from("model-b"));
@@ -1662,28 +1575,8 @@ fn deferred_switch_updates_display_and_persists() {
         !agent.session.model_switch_pending,
         "nothing is in flight yet — the queue must not be blocked"
     );
-    assert!(
-        matches!(
-            effects.as_slice(),
-            [Effect::PersistPreferredModel { model_id: m, .. }] if m == &model_id
-        ),
-        "expected a single PersistPreferredModel effect, got {effects:?}"
-    );
-    let effects = dispatch(
-        Action::SwitchModel(ModelChoice::new(model_id.clone())),
-        &mut app,
-    );
-    assert!(
-        effects.is_empty(),
-        "unchanged pre-session pick must not re-persist, got {effects:?}"
-    );
-}
-#[test]
-fn request_bundle_status_emits_effect() {
-    let mut app = test_app();
-    let effects = dispatch(Action::RequestBundleStatus, &mut app);
-    assert_eq!(effects.len(), 1);
-    assert!(matches!(effects.first(), Some(Effect::FetchBundleStatus)));
+    // oc-build: opencode backend; the pick is not saved to ~/.grok/config.toml.
+    assert!(effects.is_empty(), "expected no effects, got {effects:?}");
 }
 /// A resume from a conversation entry stamps LoadSession.chat_kind.
 /// Process-wide chat_mode alone does not set the entry bit (effects still stamp via SessionFlags).
@@ -2133,12 +2026,7 @@ fn find_agent_by_session_id_finds_inactive_agent() {
 fn pr13_each_setter_writes_to_its_own_mirror() {
     let mut app = test_app_with_agent();
     assert_eq!(app.show_tips, None);
-    assert_eq!(app.auto_update, None);
     let _ = dispatch(Action::SetShowTips(false), &mut app);
-    assert_eq!(app.show_tips, Some(false));
-    assert_eq!(app.auto_update, None);
-    let _ = dispatch(Action::SetAutoUpdate(false), &mut app);
-    assert_eq!(app.auto_update, Some(false));
     assert_eq!(app.show_tips, Some(false));
 }
 /// The PAGER registry default must agree with `PagerLocalSnapshot::default()` and with `AgentView::new`'s runtime initializer.

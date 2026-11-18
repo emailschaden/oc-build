@@ -1,6 +1,4 @@
 //! Tests for the dispatch module tree: shared fixtures and per-domain test modules.
-mod auth;
-mod billing;
 mod cta_e2e;
 mod dashboard;
 mod jump;
@@ -23,10 +21,6 @@ mod transcript;
 mod turn;
 mod voice;
 mod voice_clip;
-use super::billing::{
-    CreditLimitUpsellMode, credit_limit_upsell_mode, is_max_tier, open_credit_limit_upsell,
-    open_free_usage_upsell,
-};
 use super::cta::{
     CTA_MCP_ABSENT_MAX_ATTEMPTS, CTA_MCP_POLL_MAX_ATTEMPTS, cta_impression_plugin_name,
     cta_install_error_category, cta_install_relative_path, plugin_cta_phase_for,
@@ -199,7 +193,6 @@ fn test_app() -> AppView {
         coding_data_pending_write: None,
         coding_data_write_seq: 0,
         show_tips: None,
-        auto_update: None,
         ask_user_question_timeout_enabled: None,
         subagent_model_inheritance: crate::settings::FeatureOverrideState::new(
             xai_grok_shell::agent::config::Feature::SubagentModelInheritance,
@@ -306,14 +299,6 @@ fn test_app() -> AppView {
         plugin_cta_marketplace: None,
         workspace_dashboard_enabled: false,
         usage_visible: true,
-        has_external_auth_provider: false,
-        backend_billed: false,
-        tier_restricted_commands: Vec::new(),
-        leader_mode: true,
-        credit_balance: None,
-        auto_topup: None,
-        billing_poll_wanted: false,
-        leader_roster: Vec::new(),
         dashboard_local_sessions: Vec::new(),
         dashboard_sessions_loading: false,
         workspace_membership: Default::default(),
@@ -1103,18 +1088,4 @@ fn reset_mouse_capture_enabled(on: bool) {
 }
 fn mouse_capture_is_enabled() -> bool {
     crate::app::MOUSE_CAPTURE_ENABLED.load(std::sync::atomic::Ordering::Acquire)
-}
-/// Build a minimal `CreditBalance` for billing dispatch tests.
-fn test_bal(usage_pct: f64) -> crate::views::credit_bar::CreditBalance {
-    crate::views::credit_bar::CreditBalance {
-        usage_pct,
-        effective_usage_pct: usage_pct,
-        period_end_display: None,
-        pay_as_you_go: false,
-        on_demand_cap_cents: None,
-        on_demand_used_cents: None,
-        prepaid_balance_cents: None,
-        period_type: None,
-        is_unified_billing_user: None,
-    }
 }

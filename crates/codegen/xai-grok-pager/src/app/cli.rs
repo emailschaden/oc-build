@@ -1,13 +1,10 @@
 pub use crate::headless::OutputFormat;
 use clap::{ArgAction, Parser, Subcommand, ValueHint};
 use clap_complete::Shell;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 /// Top-level commands for the pager binary.
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
-    /// Run Grok without the interactive UI
-    Agent(Box<AgentArgs>),
     /// Show the configuration Grok discovers for this directory
     Inspect {
         /// Emit machine-readable JSON output.
@@ -16,30 +13,6 @@ pub enum Command {
     },
     /// Check terminal, clipboard, color, and input support without starting Grok
     Doctor(crate::doctor_cmd::DoctorArgs),
-    /// Manage running leader processes
-    Leader(LeaderMgmtArgs),
-    /// Sign out and clear cached credentials
-    Logout,
-    /// Sign in to Grok
-    Login {
-        /// Ignored (kept for backwards compatibility). OAuth2 is now the only auth method.
-        #[arg(long, hide = true)]
-        legacy: bool,
-        /// Use Grok OAuth via auth.x.ai.
-        #[arg(long = "oauth", alias = "oidc", conflicts_with_all = ["device_auth"])]
-        oauth: bool,
-        /// Use device-code authentication for headless/remote environments.
-        #[arg(
-            long = "device-auth",
-            visible_alias = "device-code",
-            conflicts_with_all = ["oauth"]
-        )]
-        device_auth: bool,
-        /// Authenticate for remote development environments (hidden).
-        /// Field is always present so match arms stay feature-unification-safe; clap registers `--devbox` only when that feature is enabled (`arg(skip)` otherwise → always false).
-        #[arg(skip)]
-        devbox: bool,
-    },
     /// Manage MCP server configurations
     Mcp(crate::mcp_cmd::McpArgs),
     /// Manage plugins and marketplace sources
@@ -50,17 +23,6 @@ pub enum Command {
     Models,
     /// List, search, or restore sessions
     Sessions(crate::sessions_cmd::SessionsArgs),
-    /// Print persisted token and cost usage for a session
-    Usage(crate::usage_cmd::UsageArgs),
-    /// Fetch and install managed configuration
-    Setup {
-        /// Print the fetched configuration as JSON instead of installing it; writes nothing to ~/.grok.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Share a session and print the share URL
-    #[command(hide = true)]
-    Share(crate::share_cmd::ShareArgs),
     /// Run any command with local clipboard support (forwards OSC 52 to the system clipboard).
     #[cfg_attr(not(any(unix, windows)), command(hide = true))]
     #[command(long_about = "\
@@ -83,38 +45,6 @@ See ~/.grok/README.md for more information.
     Wrap(WrapArgs),
     /// Export a session transcript as Markdown
     Export(crate::export_cmd::ExportArgs),
-    /// Export or upload session trace data
-    Trace(crate::trace_cmd::TraceArgs),
-    /// Check for updates or install a specific version
-    Update {
-        /// Check for updates without installing.
-        #[arg(long)]
-        check: bool,
-        /// Emit machine-readable JSON output (for --check).
-        #[arg(long)]
-        json: bool,
-        /// Force re-download and install even if already up to date.
-        #[arg(long)]
-        force_reinstall: bool,
-        /// Install a specific version (e.g. 0.1.150 or 0.1.151-alpha.2).
-        #[arg(long)]
-        version: Option<String>,
-        /// Switch to the alpha release channel (faster updates, may have bugs).
-        #[arg(long, conflicts_with_all = ["stable", "enterprise"])]
-        alpha: bool,
-        /// Switch to the stable release channel (default, weekly releases).
-        #[arg(long, conflicts_with_all = ["alpha", "enterprise"])]
-        stable: bool,
-        /// Switch to the enterprise release channel.
-        #[arg(long, conflicts_with_all = ["alpha", "stable"], hide = true)]
-        enterprise: bool,
-        /// Internal: what spawned this `grok update` (`user_command`, `auto_background`, `leader_converge`). Hidden.
-        #[arg(long, hide = true)]
-        trigger: Option<String>,
-        /// Internal compat alias for `--trigger=auto_background` (older parents still spawn children with it).
-        #[arg(long, hide = true)]
-        auto: bool,
-    },
     /// Print version information
     #[command(visible_alias = "v")]
     Version {
@@ -131,11 +61,6 @@ See ~/.grok/README.md for more information.
     /// Show what the grok home (~/.grok) uses on disk
     #[command(name = "du", visible_alias = "disk-usage")]
     DiskUsage(crate::disk_usage_cmd::DiskUsageArgs),
-    /// Expose this workspace to the Computer Hub (via the leader).
-    ///
-    /// Disabled by default and enabled server-side per account; set `GROK_WORKSPACE_COMMAND=1` to enable it locally for testing.
-    #[command(hide = true)]
-    Workspace(WorkspaceMgmtArgs),
     /// Open the Agent Dashboard view at startup.
     /// The dashboard shows every session, top-level and subagents.
     /// Disabled when `[dashboard].enabled = false` in `~/.grok/config.toml` or when the `GROK_AGENT_DASHBOARD=0` env var is set.
@@ -153,242 +78,6 @@ pub struct WrapArgs {
         value_name = "CMD"
     )]
     pub command: Vec<String>,
-}
-/// Targets a running leader process by PID (used by `grok leader` / `grok workspace`).
-#[derive(Debug, clap::Args, Clone, Default)]
-pub struct LeaderTargetArgs {
-    /// Leader process ID from `grok leader list`.
-    #[arg(long)]
-    pub pid: Option<u32>,
-}
-#[derive(Debug, clap::Args, Clone)]
-pub struct LeaderMgmtArgs {
-    #[command(subcommand)]
-    pub command: LeaderMgmtCommand,
-}
-#[derive(Debug, Subcommand, Clone)]
-pub enum LeaderMgmtCommand {
-    /// List running leader processes
-    List {
-        /// Emit machine-readable JSON output.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show details for a leader process
-    Info {
-        #[command(flatten)]
-        target: LeaderTargetArgs,
-        /// Emit machine-readable JSON output.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Stop all running leader processes
-    Kill,
-}
-#[derive(Debug, clap::Args, Clone)]
-pub struct WorkspaceMgmtArgs {
-    #[command(subcommand)]
-    pub command: WorkspaceMgmtCommand,
-}
-#[derive(Debug, Subcommand, Clone)]
-pub enum WorkspaceMgmtCommand {
-    /// Start (or update) the workspace-to-hub exposure.
-    Start(WorkspaceStartArgs),
-    /// Drain and disconnect from the hub, keeping the exposure warm.
-    Pause {
-        #[command(flatten)]
-        target: LeaderTargetArgs,
-        /// Emit machine-readable JSON output.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Reconnect a paused exposure to the hub.
-    Resume {
-        #[command(flatten)]
-        target: LeaderTargetArgs,
-        /// Emit machine-readable JSON output.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Stop exposing the workspace (the leader keeps running).
-    Stop {
-        #[command(flatten)]
-        target: LeaderTargetArgs,
-        /// Emit machine-readable JSON output.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Restart the exposure (stop, then start with the given options).
-    Restart(WorkspaceStartArgs),
-    /// Show the current workspace-exposure status.
-    #[command(visible_alias = "list")]
-    Status {
-        #[command(flatten)]
-        target: LeaderTargetArgs,
-        /// Emit machine-readable JSON output.
-        #[arg(long)]
-        json: bool,
-    },
-}
-#[derive(Debug, clap::Args, Clone)]
-pub struct WorkspaceStartArgs {
-    /// Computer Hub WebSocket URL (default: `[hub].url`, then the prod hub).
-    #[arg(long, value_name = "URL")]
-    pub hub_url: Option<String>,
-    /// Workspace root directory to expose. Defaults to the current directory.
-    #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
-    pub cwd: Option<PathBuf>,
-    /// Force leader mode for this command, overriding config.
-    #[arg(long, conflicts_with = "no_leader")]
-    pub leader: bool,
-    /// Refuse to start even when config enables leader mode.
-    #[arg(long, conflicts_with = "leader")]
-    pub no_leader: bool,
-    /// Emit machine-readable JSON output.
-    #[arg(long)]
-    pub json: bool,
-}
-/// Arguments for the `agent` subcommand.
-#[derive(Debug, clap::Args, Clone)]
-pub struct AgentArgs {
-    /// Run authentication before starting the agent
-    #[arg(
-        long = "reauth",
-        visible_alias = "--reauthenticate",
-        default_value = "false"
-    )]
-    pub reauthenticate: bool,
-    /// Model ID to use
-    #[arg(short = 'm', long = "model", value_name = "MODEL")]
-    pub model: Option<String>,
-    /// Reasoning effort for reasoning models
-    #[clap(
-        long = "reasoning-effort",
-        visible_alias = "effort",
-        value_name = "EFFORT",
-        overrides_with = "reasoning_effort"
-    )]
-    pub reasoning_effort: Option<String>,
-    /// Auto-approve all tool executions
-    #[arg(long = "always-approve", alias = "yolo")]
-    pub yolo: bool,
-    /// Path to an agent profile file.
-    #[arg(long = "agent-profile", value_name = "PATH")]
-    pub agent_profile: Option<PathBuf>,
-    /// Load a plugin from this directory for this process only (repeatable).
-    /// Highest-priority plugin scope; always trusted: hooks and MCP servers activate without a prompt.
-    /// Used by the Agent SDKs to inject per-connection plugins.
-    #[arg(long = "plugin-dir", value_name = "DIR", value_hint = ValueHint::DirPath)]
-    pub plugin_dirs: Vec<PathBuf>,
-    /// Connect to a shared leader process instead of starting a new agent.
-    /// Allows multiple clients to share one backend.
-    /// Defaults to [cli] use_leader in config.toml.
-    #[arg(long, conflicts_with = "no_leader")]
-    pub leader: bool,
-    /// Start a new agent even when config enables leader mode.
-    #[arg(long, conflicts_with = "leader")]
-    pub no_leader: bool,
-    #[command(flatten)]
-    pub headless: HeadlessArgs,
-    /// Override the CLI chat proxy base URL.
-    #[arg(long = "cli-chat-proxy-base-url")]
-    pub cli_chat_proxy_base_url: Option<String>,
-    /// Override the public xAI API base URL.
-    #[arg(long = "xai-api-base-url")]
-    pub xai_api_base_url: Option<String>,
-    /// Agent runtime mode
-    #[command(subcommand)]
-    pub mode: Option<AgentCmd>,
-}
-impl AgentArgs {
-    /// Canonicalized `--plugin-dir` paths, warning to stderr and skipping anything that isn't an existing directory.
-    /// stderr is safe: JSON-RPC uses stdout.
-    pub fn canonical_plugin_dirs(&self) -> Vec<PathBuf> {
-        self.plugin_dirs
-            .iter()
-            .filter_map(|p| match dunce::canonicalize(p) {
-                Ok(canonical) if canonical.is_dir() => Some(canonical),
-                Ok(_) => {
-                    eprintln!(
-                        "grok: --plugin-dir {}: not a directory; skipping",
-                        p.display()
-                    );
-                    None
-                }
-                Err(e) => {
-                    eprintln!("grok: --plugin-dir {}: {e}; skipping", p.display());
-                    None
-                }
-            })
-            .collect()
-    }
-}
-/// Agent sub-subcommands.
-#[derive(Debug, Subcommand, Clone)]
-pub enum AgentCmd {
-    /// Run the agent over stdio
-    Stdio,
-    /// Run the agent headlessly over the Grok WebSocket relay
-    Headless(HeadlessArgs),
-    /// Run the agent as a WebSocket server
-    Serve(ServeArgs),
-    /// Run as the shared leader process for other clients
-    Leader(LeaderArgs),
-}
-/// WebSocket URL override arguments, used by headless / leader / serve modes.
-#[derive(Debug, clap::Args, Clone, Default)]
-pub struct HeadlessArgs {
-    #[arg(long = "grok-ws-origin")]
-    pub grok_ws_origin: Option<String>,
-    #[arg(long = "grok-ws-url")]
-    pub grok_ws_url: Option<String>,
-}
-/// Arguments for the `agent serve` subcommand.
-#[derive(Debug, clap::Args, Clone)]
-pub struct ServeArgs {
-    /// Address for the server to listen on
-    #[arg(long, default_value = "127.0.0.1:2419")]
-    pub bind: SocketAddr,
-    /// Secret token for client authentication (auto-generated if not provided)
-    #[arg(long, env = "GROK_AGENT_SECRET")]
-    pub secret: Option<String>,
-    /// Remote agent URL for proxy mode
-    #[arg(long)]
-    pub remote: Option<String>,
-    /// Authentication and WebSocket URL overrides
-    #[command(flatten)]
-    pub headless: HeadlessArgs,
-}
-impl ServeArgs {
-    /// Get the secret, generating a random one if not provided.
-    pub fn get_secret(&self) -> String {
-        self.secret
-            .clone()
-            .unwrap_or_else(|| generate_random_key(12))
-    }
-}
-/// Generate a random alphanumeric key of the given length.
-fn generate_random_key(len: usize) -> String {
-    let raw = uuid::Uuid::new_v4().to_string().replace('-', "");
-    raw.chars().cycle().take(len).collect()
-}
-/// Arguments for the `agent leader` subcommand.
-#[derive(Debug, clap::Args, Clone)]
-pub struct LeaderArgs {
-    /// Keep the leader running after the last client disconnects.
-    #[arg(long)]
-    pub no_exit_on_disconnect: bool,
-    /// Defer the grok.com relay WebSocket until the first headless IPC client registers.
-    /// Without this flag the leader connects the relay eagerly at startup.
-    /// Passed by leaders auto-spawned from interactive clients (TUI/IDE), which only need the relay if a headless client appears.
-    #[arg(long)]
-    pub relay_on_demand: bool,
-    /// Disable periodic auto-update checks for the leader.
-    #[arg(long)]
-    pub no_auto_update: bool,
-    /// All environment URL overrides (passed from follower process)
-    #[command(flatten)]
-    pub headless: HeadlessArgs,
 }
 #[derive(Debug, Clone, Parser)]
 #[command(
@@ -418,16 +107,6 @@ pub struct PagerArgs {
     /// Working directory.
     #[arg(long)]
     pub cwd: Option<PathBuf>,
-    /// Use a custom leader socket path instead of the default `~/.grok/leader.sock`.
-    /// A local/branch build can thus run an isolated leader without colliding with the default one already running on the machine
-    /// Name it `~/.grok/leader-*.sock` to keep `grok leader list/kill` able to find it; any other location works but won't be auto-discovered
-    #[arg(
-        long = "leader-socket",
-        value_name = "PATH",
-        global = true,
-        value_hint = ValueHint::FilePath
-    )]
-    pub leader_socket: Option<PathBuf>,
     /// Enable debug logging.
     #[arg(long = "debug", global = true)]
     pub debug: bool,
@@ -716,9 +395,6 @@ pub struct PagerArgs {
     /// Enable client-side file writes.
     #[arg(long = "fs-write", hide = true)]
     pub fs_write: bool,
-    /// Disable automatic updates for this session.
-    #[arg(long = "no-auto-update", hide = true)]
-    pub no_auto_update: bool,
     /// Enable the runtime turn-end TodoGate for this session.
     /// Session-scoped (not persisted).
     /// Highest precedence: overrides remote `todo_gate_enabled` and the built-in default (which is `false`).
@@ -863,9 +539,6 @@ impl PagerArgs {
         self.apply_cwd_from(launch_dir.as_deref())
     }
     fn apply_cwd_from(mut self, launch_dir: Option<&std::path::Path>) -> anyhow::Result<Self> {
-        if let Some(socket) = self.leader_socket.take() {
-            self.leader_socket = Some(anchor_to_launch_dir(socket, launch_dir));
-        }
         if let Some(file) = self.debug_file.take() {
             self.debug_file = Some(anchor_to_launch_dir(file, launch_dir));
         }
@@ -1189,38 +862,6 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
     #[test]
-    fn agent_plugin_dir_repeatable_and_canonicalized() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("plugin");
-        std::fs::create_dir(&dir).unwrap();
-        let file = tmp.path().join("file.txt");
-        std::fs::write(&file, "x").unwrap();
-        let missing = tmp.path().join("missing");
-        let args = PagerArgs::try_parse_from([
-            "grok".as_ref(),
-            "agent".as_ref(),
-            "--no-leader".as_ref(),
-            "--plugin-dir".as_ref(),
-            dir.as_os_str(),
-            "--plugin-dir".as_ref(),
-            file.as_os_str(),
-            "--plugin-dir".as_ref(),
-            missing.as_os_str(),
-            "stdio".as_ref(),
-        ])
-        .unwrap();
-        let Some(Command::Agent(agent)) = args.command else {
-            panic!("expected agent subcommand");
-        };
-        assert_eq!(agent.plugin_dirs, vec![dir.clone(), file, missing]);
-        assert!(matches!(agent.mode, Some(AgentCmd::Stdio)));
-        assert!(agent.no_leader);
-        assert_eq!(
-            agent.canonical_plugin_dirs(),
-            vec![dunce::canonicalize(&dir).unwrap()]
-        );
-    }
-    #[test]
     fn resolve_startup_sandbox_cases() {
         use SandboxStartup::{Apply, Conflict};
         assert_eq!(
@@ -1274,27 +915,6 @@ mod tests {
         );
     }
     #[test]
-    fn launch_directory_anchoring_precedes_cwd_change() {
-        let args = PagerArgs::try_parse_from([
-            "grok",
-            "--leader-socket",
-            "relative.sock",
-            "--debug-file",
-            "relative.log",
-        ])
-        .unwrap()
-        .apply_cwd_from(Some(std::path::Path::new("/launch")))
-        .unwrap();
-        assert_eq!(
-            args.leader_socket.as_deref(),
-            Some(std::path::Path::new("/launch/relative.sock"))
-        );
-        assert_eq!(
-            args.debug_file.as_deref(),
-            Some(std::path::Path::new("/launch/relative.log"))
-        );
-    }
-    #[test]
     fn launch_directory_anchoring_normalizes_dot_components() {
         for (input, expected) in [
             ("./leader.sock", "/launch/leader.sock"),
@@ -1309,65 +929,6 @@ mod tests {
         }
     }
     #[test]
-    fn leader_socket_flag_parses_at_root() {
-        let args = PagerArgs::try_parse_from(["grok", "--leader-socket", "/tmp/leader-x.sock"])
-            .expect("--leader-socket parses at the root");
-        assert_eq!(
-            args.leader_socket.as_deref(),
-            Some(std::path::Path::new("/tmp/leader-x.sock"))
-        );
-    }
-    #[test]
-    fn leader_socket_flag_is_global_for_subcommands() {
-        let args = PagerArgs::try_parse_from([
-            "grok",
-            "agent",
-            "leader",
-            "--leader-socket",
-            "/tmp/leader-y.sock",
-        ])
-        .expect("--leader-socket parses after a subcommand (global)");
-        assert_eq!(
-            args.leader_socket.as_deref(),
-            Some(std::path::Path::new("/tmp/leader-y.sock"))
-        );
-    }
-    #[test]
-    fn leader_socket_flag_defaults_to_none() {
-        let args = PagerArgs::try_parse_from(["grok"]).expect("bare grok parses");
-        assert!(args.leader_socket.is_none());
-    }
-    #[test]
-    fn leader_mgmt_list_info_kill_parse() {
-        let list = PagerArgs::try_parse_from(["grok", "leader", "list", "--json"])
-            .expect("grok leader list --json");
-        assert!(matches!(
-            list.command,
-            Some(Command::Leader(LeaderMgmtArgs {
-                command: LeaderMgmtCommand::List { json: true },
-            }))
-        ));
-        let info = PagerArgs::try_parse_from(["grok", "leader", "info", "--pid", "42"])
-            .expect("grok leader info --pid");
-        assert!(matches!(
-            info.command,
-            Some(Command::Leader(LeaderMgmtArgs {
-                command: LeaderMgmtCommand::Info {
-                    target: LeaderTargetArgs { pid: Some(42) },
-                    json: false,
-                },
-            }))
-        ));
-        let kill = PagerArgs::try_parse_from(["grok", "leader", "kill"]).expect("grok leader kill");
-        assert!(matches!(
-            kill.command,
-            Some(Command::Leader(LeaderMgmtArgs {
-                command: LeaderMgmtCommand::Kill,
-            }))
-        ));
-        assert!(PagerArgs::try_parse_from(["grok", "leader", "profile"]).is_err());
-    }
-    #[test]
     fn debug_file_flag_parses_and_is_global() {
         let root = PagerArgs::try_parse_from(["grok", "--debug-file", "/tmp/fire.txt"])
             .expect("--debug-file parses at the root");
@@ -1375,9 +936,8 @@ mod tests {
             root.debug_file.as_deref(),
             Some(std::path::Path::new("/tmp/fire.txt"))
         );
-        let sub =
-            PagerArgs::try_parse_from(["grok", "agent", "stdio", "--debug-file", "/tmp/f.txt"])
-                .expect("--debug-file parses after a subcommand (global)");
+        let sub = PagerArgs::try_parse_from(["grok", "doctor", "--debug-file", "/tmp/f.txt"])
+            .expect("--debug-file parses after a subcommand (global)");
         assert_eq!(
             sub.debug_file.as_deref(),
             Some(std::path::Path::new("/tmp/f.txt"))
@@ -1410,30 +970,9 @@ mod tests {
     }
     #[test]
     fn subcommand_takes_precedence_over_positional_prompt() {
-        let args = PagerArgs::try_parse_from(["grok", "logout"]).expect("subcommand parses");
-        assert!(matches!(args.command, Some(Command::Logout)));
+        let args = PagerArgs::try_parse_from(["grok", "doctor"]).expect("subcommand parses");
+        assert!(matches!(args.command, Some(Command::Doctor(_))));
         assert!(args.prompt.is_none());
-    }
-    #[test]
-    fn usage_command_parses_session_and_optional_turn() {
-        let session_only = PagerArgs::try_parse_from(["grok", "usage", "sess-1"])
-            .expect("grok usage <session-id>");
-        assert!(matches!(
-            session_only.command,
-            Some(Command::Usage(crate::usage_cmd::UsageArgs {
-                ref session_id,
-                turn: None,
-            })) if session_id == "sess-1"
-        ));
-        let with_turn = PagerArgs::try_parse_from(["grok", "usage", "sess-1", "3"])
-            .expect("grok usage <session-id> <turn>");
-        assert!(matches!(
-            with_turn.command,
-            Some(Command::Usage(crate::usage_cmd::UsageArgs {
-                ref session_id,
-                turn: Some(3),
-            })) if session_id == "sess-1"
-        ));
     }
     #[test]
     fn positional_prompt_conflicts_with_headless_single() {
@@ -1492,14 +1031,5 @@ mod tests {
             PagerArgs::try_parse_from(["grok", "--effort", "high", "--reasoning-effort", "low"])
                 .expect("both effort flag names parse (reverse order)");
         assert_eq!(reverse.reasoning_effort.as_deref(), Some("low"));
-    }
-    #[test]
-    fn agent_args_effort_alias_parses() {
-        let args = PagerArgs::try_parse_from(["grok", "agent", "--effort", "max", "stdio"])
-            .expect("agent --effort parses");
-        let Command::Agent(agent) = args.command.expect("agent subcommand") else {
-            panic!("expected agent subcommand");
-        };
-        assert_eq!(agent.reasoning_effort.as_deref(), Some("max"));
     }
 }

@@ -258,10 +258,6 @@ pub enum TickDemand {
 pub const SLOW_TICK_INTERVAL: Duration = Duration::from_millis(83);
 /// Welcome toast lifetime (wall clock, so the duration holds whether the event loop is ticking Slow or Fast).
 const WELCOME_TOAST_DURATION: Duration = Duration::from_secs(2);
-fn reconnect_success_hides_mismatch(current: Option<&str>, incoming: &str) -> bool {
-    current.is_some_and(crate::acp::is_version_mismatch_banner)
-        && (incoming.starts_with("Reconnected.") || incoming.starts_with("Session restored."))
-}
 /// Entry from the session list wire: welcome/resume pickers and non-leader dashboard roster fallback (`session_picker_entry_to_roster`).
 #[derive(Debug, Clone)]
 pub struct SessionPickerEntry {
@@ -446,24 +442,6 @@ fn parse_esc_ttl(raw: Option<String>) -> Duration {
         .map(|ms| Duration::from_millis(ms.min(ESC_DOUBLE_PRESS_TEST_MS)))
         .unwrap_or(PendingAction::ESC_DOUBLE_PRESS_TTL)
 }
-/// Slash commands unavailable on the free and X Basic subscription tiers.
-/// To restrict another command for these tiers, add its canonical name (no leading `/`) here.
-/// Matching covers aliases automatically via [`crate::slash::registry::CommandRegistry::set_restricted_commands`].
-pub(crate) const TIER_RESTRICTED_COMMANDS: &[&str] =
-    &["usage", "imagine", "imagine-video", "voice"];
-/// Whether a subscription-tier display name is a tier with restricted commands: the free tier and X Basic.
-/// Free covers no subscription (`None`) or an explicit "Free"; X Basic covers CCP display name "X Basic" with JWT claim fallback "x_basic".
-/// The pager's *cosmetic* slash-command gate treats an absent tier (`None`) as restricted (it recovers live on the next settings update).
-fn is_restricted_tier(tier: Option<&str>) -> bool {
-    match tier {
-        None => true,
-        Some(t) => xai_grok_shell::tier::is_restricted_tier_name(t),
-    }
-}
-/// True for API-key labels from shell/CCP: `"ApiKey"`, `"API Key"`, `"api_key"`.
-pub(crate) fn is_api_key_label(s: &str) -> bool {
-    s.trim().to_ascii_lowercase().replace([' ', '_', '-'], "") == "apikey"
-}
 /// Pending re-exec into another screen mode (see `/minimal` / `/fullscreen`).
 #[derive(Debug, Clone)]
 pub struct ScreenModeRelaunch {
@@ -482,18 +460,6 @@ pub struct PendingCodingDataWrite {
     /// What a failure reverts to: the click-time mirror (possibly the unconfirmed fail-safe default), overwritten by an auth-meta refresh or a superseded write's success.
     /// Replies are not ordered by server commit, so a late older success can still overwrite a newer value here.
     pub rollback_to_opted_in: bool,
-}
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthIdentity {
-    pub email: Option<String>,
-    pub team_id: Option<String>,
-    pub team_principal: bool,
-}
-impl AuthIdentity {
-    /// An absent email never matches: two users without one would otherwise compare equal.
-    pub fn matches(&self, other: &AuthIdentity) -> bool {
-        self.email.is_some() && self == other
-    }
 }
 /// Root view component: owns all application state.
 pub struct AppView {
@@ -594,36 +560,11 @@ pub struct AppView {
     pub plugin_cta_marketplace: Option<String>,
     pub workspace_dashboard_enabled: bool,
     /// Consumer billing surface (credit fetches / warnings). False for team and API-key auth.
-    /// `/usage` itself stays available for session token/cost unless [`Self::has_external_auth_provider`].
     pub usage_visible: bool,
-    /// External `auth_provider_command` deployment.
-    /// No grok.com billing session exists; `/usage` and credit UI stay off.
-    pub has_external_auth_provider: bool,
-    /// `AuthMeta::backend_billed`: the agent's backend handles billing itself.
-    pub backend_billed: bool,
-    /// Slash commands denied for the current subscription tier ([`TIER_RESTRICTED_COMMANDS`] on the free / X Basic tier, empty otherwise).
-    /// Recomputed by [`Self::apply_tier_restrictions`] and fanned out to every slash registry (welcome prompt, agents, dashboard).
-    /// Deny wins over all other visibility gates.
-    pub tier_restricted_commands: Vec<String>,
-    /// Whether the pager is connected via a leader (leader mode).
-    /// The Agent Dashboard entry points (`/dashboard`, `Ctrl+\`, `grok dashboard`, the startup hook) are gated on this flag.
-    /// They are only meaningful when a leader is coordinating a fleet of sessions.
-    pub leader_mode: bool,
-    /// App-level credit balance used to show the usage warning on the welcome screen before any agent session exists.
-    pub credit_balance: Option<crate::views::credit_bar::CreditBalance>,
-    /// App-level auto top-up rule paired with `credit_balance` for the warning.
-    pub auto_topup: Option<crate::views::credit_bar::AutoTopupInfo>,
-    /// Periodic billing poll requested (credits >= 99%).
-    pub billing_poll_wanted: bool,
-    /// Leader-mode session roster (FleetView dashboard).
-    /// Populated from `x.ai/sessions/list` polls and `x.ai/sessions/changed` broadcasts.
-    /// Empty in non-leader mode, which gates roster rendering.
-    pub leader_roster: Vec<crate::app::roster::RosterEntry>,
-    /// Local on-disk session list (dormant/idle sessions) shown on the dashboard when NOT in leader mode.
-    /// There is no live leader roster to poll outside leader mode.
+    /// Local on-disk session list (dormant/idle sessions) shown on the dashboard.
     /// We fetch the same `x.ai/session/list` the resume picker uses and render those as idle rows.
     pub dashboard_local_sessions: Vec<crate::app::roster::RosterEntry>,
-    /// Whether the dashboard is currently loading local sessions (non-leader mode).
+    /// Whether the dashboard is currently loading local sessions.
     pub dashboard_sessions_loading: bool,
     pub(crate) workspace_membership: crate::app::workspace_membership::WorkspaceMembership,
     /// Server-authoritative shared prompt queues, keyed by `sessionId`.
@@ -986,8 +927,6 @@ pub struct AppView {
     pub coding_data_write_seq: u64,
     /// Persisted `[cli].show_tips` mirror. `None` means no override (default `true`).
     pub show_tips: Option<bool>,
-    /// Persisted `[cli].auto_update` mirror. `None` means no override (default `true`).
-    pub auto_update: Option<bool>,
     /// Persisted `[toolset.ask_user_question].timeout_enabled` mirror, seeded from the effective TOML merge like `show_tips`.
     /// `None` means unset in TOML (default `true`); toggles write the user layer.
     pub ask_user_question_timeout_enabled: Option<bool>,
@@ -1156,20 +1095,6 @@ impl AppView {
     pub fn feedback_trace_offer(&self) -> bool {
         self.shell_feedback_trace_offer && !self.feedback_trace_choice_latched
     }
-    /// A cached team credential from before `canAdministerTeam` reads unknown and nothing refetches `/user` at startup; a personal account (which also carries a `team_id`) reads unknown on every call and is not asked.
-    pub fn needs_team_capability_hydration(&self) -> bool {
-        self.is_team_principal
-            && self.can_administer_team.is_none()
-            && !self.is_api_key_auth
-            && self.account_email.is_some()
-    }
-    pub fn auth_identity(&self) -> AuthIdentity {
-        AuthIdentity {
-            email: self.account_email.clone(),
-            team_id: self.team_id.clone(),
-            team_principal: self.is_team_principal,
-        }
-    }
     /// Why `coding_data_sharing` is locked for this user (`None` means editable).
     pub fn coding_data_sharing_lock(&self) -> Option<crate::settings::CodingDataSharingLock> {
         if self.is_zdr {
@@ -1234,108 +1159,6 @@ impl AppView {
             && !self.is_zdr_blocked()
             && matches!(self.trust_state, TrustState::Done)
             && matches!(self.consent_state, ConsentState::Done)
-    }
-    /// Extract `GateInfo` from `RemoteSettings`.
-    pub fn gate_from_settings(
-        rs: &xai_grok_shell::util::config::RemoteSettings,
-    ) -> Option<xai_grok_login::GateInfo> {
-        let msg = rs.gate_message.as_ref()?;
-        if msg.is_empty() {
-            return None;
-        }
-        Some(xai_grok_login::GateInfo {
-            message: msg.clone(),
-            url: rs.gate_url.clone(),
-            label: rs.gate_label.clone(),
-        })
-    }
-    /// Apply typed auth metadata from the shell.
-    pub fn apply_auth_meta(&mut self, meta: &xai_grok_login::AuthMeta) {
-        self.pending_gate_verification = None;
-        let was_gated = self.gate.is_some();
-        self.account_email = meta.email.clone();
-        self.team_id = meta.team_id.clone();
-        self.is_team_principal = meta.is_team_principal;
-        self.team_name = meta.team_name.clone();
-        self.is_zdr = meta.is_zdr;
-        self.team_role = meta.team_role.clone();
-        if let Some(pending) = self.coding_data_pending_write.as_mut() {
-            pending.rollback_to_opted_in = !meta.coding_data_retention_opt_out;
-        }
-        self.can_administer_team = meta.can_administer_team;
-        self.coding_data_retention_opt_out = meta.coding_data_retention_opt_out;
-        self.shell_feedback_trace_offer = meta.feedback_trace_offer;
-        self.gate = meta.gate.clone();
-        if was_gated && self.gate.is_none() {
-            self.paywall_check_started = None;
-            xai_grok_telemetry::session_ctx::log_event(
-                xai_grok_telemetry::events::SubscriptionActivated {
-                    auth_method: self.login_method_id.as_ref().map(|id| id.0.to_string()),
-                    upsell_shown_this_session: self.access_gate_shown_logged,
-                },
-            );
-        }
-        self.subscription_tier = meta.subscription_tier.clone();
-        self.backend_billed = meta.backend_billed;
-        let was_api_key = self.is_api_key_auth;
-        self.is_api_key_auth = meta.auth_mode.as_deref().is_some_and(is_api_key_label)
-            || meta
-                .subscription_tier
-                .as_deref()
-                .is_some_and(is_api_key_label);
-        self.usage_visible = self.team_name.is_none() && self.consumer_account();
-        self.sync_billing_surface_to_agents();
-        self.apply_tier_restrictions();
-        if self.is_api_key_auth {
-            self.ensure_voice_for_api_key();
-        } else if was_api_key && is_restricted_tier(self.subscription_tier.as_deref()) {
-            self.voice_reset();
-            self.voice_ui_active = false;
-            self.apply_voice_mode_enabled(false);
-        }
-        if let Some(show) = meta.show_resolved_model {
-            self.show_resolved_model = show;
-        }
-        super::dispatch::refresh_open_settings_modals(self);
-    }
-    /// Mirror the billing and `/usage` gates onto every slash surface (agents, welcome, dashboard dispatch / peek-reply).
-    pub(crate) fn sync_billing_surface_to_agents(&mut self) {
-        let billing = self.usage_visible;
-        let usage_cmd = !self.has_external_auth_provider;
-        for agent in self.agents.values_mut() {
-            agent.set_billing_surface_visible(billing);
-            agent.set_usage_command_visible(usage_cmd);
-        }
-        self.welcome_prompt
-            .slash_controller
-            .set_billing_surface_visible(billing);
-        self.welcome_prompt
-            .slash_controller
-            .set_usage_command_visible(usage_cmd);
-        if let Some(dash) = self.dashboard.as_mut() {
-            dash.dispatch
-                .slash_controller
-                .set_billing_surface_visible(billing);
-            dash.dispatch
-                .slash_controller
-                .set_usage_command_visible(usage_cmd);
-            dash.peek_reply
-                .slash_controller
-                .set_billing_surface_visible(billing);
-            dash.peek_reply
-                .slash_controller
-                .set_usage_command_visible(usage_cmd);
-        }
-    }
-    /// Force voice on for API-key sessions when only a remote rule left it off.
-    /// Requirement / env / config pins still win.
-    pub(crate) fn ensure_voice_for_api_key(&mut self) {
-        if !self.is_api_key_auth || self.voice_mode_enabled {
-            return;
-        }
-        if crate::app::resolve_voice_mode_live(None, false) {
-            self.apply_voice_mode_enabled(true);
-        }
     }
     /// Create a new AppView with the given ACP connection details.
     pub fn new(
@@ -1468,8 +1291,7 @@ impl AppView {
             default_yolo: false,
             permission_mode_from_soft_default: true,
             // oc-build: opencode backend; no auto-review classifier, so Auto stays out of the cycle.
-            auto_mode_gate: !crate::acp::opencode_shim::is_active()
-                && xai_grok_shell::util::config::auto_permission_mode_enabled_from_disk(),
+            auto_mode_gate: false,
             yolo_policy_block: None,
             yolo_launch_block_notice: None,
             screen_mode_switch_hint: None,
@@ -1535,7 +1357,6 @@ impl AppView {
             coding_data_pending_write: None,
             coding_data_write_seq: 0,
             show_tips: None,
-            auto_update: None,
             ask_user_question_timeout_enabled: None,
             subagent_model_inheritance: crate::settings::FeatureOverrideState::new(
                 xai_grok_shell::agent::config::Feature::SubagentModelInheritance,
@@ -1571,14 +1392,6 @@ impl AppView {
             plugin_cta_marketplace: None,
             workspace_dashboard_enabled: false,
             usage_visible: true,
-            has_external_auth_provider: false,
-            backend_billed: false,
-            tier_restricted_commands: Vec::new(),
-            leader_mode: false,
-            credit_balance: None,
-            auto_topup: None,
-            billing_poll_wanted: false,
-            leader_roster: Vec::new(),
             dashboard_local_sessions: Vec::new(),
             dashboard_sessions_loading: false,
             workspace_membership: Default::default(),
@@ -1666,40 +1479,6 @@ impl AppView {
         if let Some(dashboard) = self.dashboard.as_mut() {
             dashboard.set_auto_mode_available(available);
         }
-    }
-    /// Recompute the tier-restricted slash commands from the current auth state.
-    /// Sync the deny list into every slash surface (welcome prompt, all agents, dashboard) so restricted commands hide/show in lockstep.
-    /// A mid-session upgrade thus lifts the restrictions without a restart.
-    pub fn apply_tier_restrictions(&mut self) {
-        let restricted = self.team_name.is_none()
-            && self.consumer_account()
-            && is_restricted_tier(self.subscription_tier.as_deref());
-        let names: Vec<String> = if restricted {
-            TIER_RESTRICTED_COMMANDS
-                .iter()
-                .map(|n| (*n).to_string())
-                .collect()
-        } else {
-            Vec::new()
-        };
-        for agent in self.agents.values_mut() {
-            agent.set_restricted_commands(&names);
-        }
-        self.welcome_prompt.set_restricted_commands(&names);
-        if let Some(dashboard) = self.dashboard.as_mut() {
-            dashboard.set_restricted_commands(&names);
-        }
-        self.tier_restricted_commands = names;
-    }
-    /// A personal subscription login. API keys, external auth providers, and backend-billed accounts carry no subscription tier
-    pub(super) fn consumer_account(&self) -> bool {
-        !self.backend_billed && !self.is_api_key_auth && !self.has_external_auth_provider
-    }
-    /// Whether voice mode is withheld for the current subscription tier (free / X Basic personal accounts).
-    /// Derived from the computed [`Self::tier_restricted_commands`] deny list so it stays in lockstep with the slash-command gate.
-    /// Used to gate the Ctrl+Space / F8 voice keybinding, which bypasses the slash registry entirely (see [`crate::app::dispatch::voice`]).
-    pub fn is_voice_tier_restricted(&self) -> bool {
-        self.tier_restricted_commands.iter().any(|c| c == "voice")
     }
     /// Draw-time expiry can flip the live-announcement predicate between pushes.
     /// Resync the slash gate only when it diverges from the stored flags (checked per frame, fan-out runs only on change).
@@ -1849,8 +1628,6 @@ impl AppView {
         self.dispatch_depth == 0 && crate::app::dispatch::flush_image_notices(self)
     }
     /// Show a toast on the currently active view.
-    /// Registration (and thus the mismatch notif) finishes during reconnect.
-    /// The later "Reconnected." / "Session restored…" line would hide a still-true skew.
     pub fn show_toast(&mut self, msg: &str) {
         match self.active_view {
             ActiveView::Agent(id) => {
@@ -1858,39 +1635,18 @@ impl AppView {
                     if let Some(child_sid) = agent.active_subagent.clone()
                         && let Some(child) = agent.subagent_views.get_mut(&child_sid)
                     {
-                        if reconnect_success_hides_mismatch(
-                            child.toast.as_ref().map(|(m, _)| m.as_str()),
-                            msg,
-                        ) {
-                            return;
-                        }
                         child.show_toast(msg);
                     } else {
-                        if reconnect_success_hides_mismatch(
-                            agent.toast.as_ref().map(|(m, _)| m.as_str()),
-                            msg,
-                        ) {
-                            return;
-                        }
                         agent.show_toast(msg);
                     }
                 }
             }
             ActiveView::AgentDashboard => {
                 if let Some(d) = self.dashboard.as_mut() {
-                    if reconnect_success_hides_mismatch(d.error_toast.as_deref(), msg) {
-                        return;
-                    }
                     d.error_toast = Some(crate::glyphs::sanitize_toast_message(msg).into_owned());
                 }
             }
             ActiveView::Welcome => {
-                if reconnect_success_hides_mismatch(
-                    self.welcome_toast.as_ref().map(|(m, _)| m.as_str()),
-                    msg,
-                ) {
-                    return;
-                }
                 self.welcome_toast = Some((
                     crate::glyphs::sanitize_toast_message(msg).into_owned(),
                     std::time::Instant::now() + WELCOME_TOAST_DURATION,
@@ -1898,31 +1654,10 @@ impl AppView {
             }
         }
     }
-    /// Insert or replace a leader roster entry, keyed by `session_id`.
-    pub fn upsert_roster_entry(&mut self, entry: crate::app::roster::RosterEntry) {
-        if let Some(existing) = self
-            .leader_roster
-            .iter_mut()
-            .find(|e| e.session_id == entry.session_id)
-        {
-            *existing = entry;
-        } else {
-            self.leader_roster.push(entry);
-        }
-    }
-    /// Remove a leader roster entry by `session_id`.
-    pub fn remove_roster_entry(&mut self, sid: &str) {
-        self.leader_roster.retain(|e| e.session_id != sid);
-    }
-    /// The roster source the dashboard renders alongside locally-hosted agents.
-    /// With no leader there is nothing to poll, so we fall back to the local on-disk session list ([`Self::dashboard_local_sessions`]).
-    /// The dashboard thus still shows idle/dormant sessions instead of being empty.
+    /// The roster source the dashboard renders alongside locally-hosted agents: the local
+    /// on-disk session list ([`Self::dashboard_local_sessions`]), so idle/dormant sessions show.
     pub fn dashboard_roster(&self) -> &[crate::app::roster::RosterEntry] {
-        if self.leader_mode {
-            &self.leader_roster
-        } else {
-            &self.dashboard_local_sessions
-        }
+        &self.dashboard_local_sessions
     }
     /// Reconcile the shared prompt queue for a session from a `x.ai/queue/changed` broadcast.
     /// Returns `(old_id, new_id)` for echoes retired via the kind-and-text fallback (re-keyed: the old id never appears in any broadcast).
@@ -3559,22 +3294,6 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
         if key.kind == KeyEventKind::Release {
             return InputOutcome::Unchanged;
         }
-        if ctx.is_zdr_blocked && matches!(ctx.auth_state, AuthState::Done) {
-            return handle_menu_shortcuts(
-                key,
-                ctx.menu_index,
-                &['l', 'q'],
-                dispatch_zdr_menu_action,
-            );
-        }
-        if !ctx.has_access && matches!(ctx.auth_state, AuthState::Done) {
-            return handle_menu_shortcuts(
-                key,
-                ctx.menu_index,
-                &['g', 'l', 'q'],
-                dispatch_access_gate_menu_action,
-            );
-        }
         if (crate::input::key::is_paste_key(key) || crate::input::key::is_inline_paste_key(key))
             && matches!(ctx.auth_state, AuthState::Done)
         {
@@ -3665,106 +3384,21 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
                 );
             }
         }
-        match ctx.auth_state {
-            AuthState::Done => {
-                if key!('c', CONTROL).matches(key) || key!('d', CONTROL).matches(key) {
-                    return InputOutcome::Action(Action::Quit);
-                }
-            }
-            AuthState::Pending { .. } => {
-                if key!('q').matches(key)
-                    || key!('c', CONTROL).matches(key)
-                    || key!('d', CONTROL).matches(key)
-                {
-                    if ctx.mid_session_login {
-                        return InputOutcome::Action(Action::CancelLogin);
-                    }
-                    return InputOutcome::Action(Action::QuitConfirmed);
-                }
-                if key!('l').matches(key) || key!(Enter).matches(key) {
-                    return InputOutcome::Action(Action::Login);
-                }
-            }
-            AuthState::Authenticating { .. } if *ctx.show_raw_url => {
-                if key!('q', CONTROL).matches(key) || key!('c', CONTROL).matches(key) {
-                    return InputOutcome::Action(Action::HideRawAuthUrl);
-                }
-                return InputOutcome::Unchanged;
-            }
-            AuthState::Authenticating {
-                mode: AuthMode::Loopback,
-                ..
-            } => {
-                if key!(Esc).matches(key)
-                    || key!('q', CONTROL).matches(key)
-                    || key!('c', CONTROL).matches(key)
-                {
-                    if ctx.mid_session_login {
-                        return InputOutcome::Action(Action::CancelLogin);
-                    }
-                    return InputOutcome::Action(Action::QuitConfirmed);
-                }
-                if key!(Enter).matches(key) {
-                    let trimmed = ctx.auth_code_input.text().trim().to_string();
-                    if !trimmed.is_empty() {
-                        return InputOutcome::Action(Action::SubmitAuthCode(trimmed));
-                    }
-                    return InputOutcome::Unchanged;
-                }
-                let outcome = if crate::input::key::is_paste_key(key) {
-                    let Some(text) = crate::clipboard::system_clipboard_get() else {
-                        return InputOutcome::Unchanged;
-                    };
-                    ctx.auth_code_input.insert_paste(&text)
-                } else if key.modifiers.intersects(
-                    crossterm::event::KeyModifiers::CONTROL
-                        | crossterm::event::KeyModifiers::ALT
-                        | crossterm::event::KeyModifiers::SUPER,
-                ) && !crate::input::key::is_altgr(key.modifiers)
-                {
-                    return InputOutcome::Changed;
-                } else {
-                    ctx.auth_code_input
-                        .handle_key_with_insert_policy(key, |character| !character.is_control())
-                };
-                return match outcome {
-                    LineEditOutcome::TextChanged
-                    | LineEditOutcome::CursorChanged
-                    | LineEditOutcome::HandledNoChange => InputOutcome::Changed,
-                    LineEditOutcome::Unhandled => InputOutcome::Unchanged,
-                };
-            }
-            AuthState::Authenticating { .. } => {
-                if key!(Esc).matches(key)
-                    || key!('q', CONTROL).matches(key)
-                    || key!('c', CONTROL).matches(key)
-                {
-                    if ctx.mid_session_login {
-                        return InputOutcome::Action(Action::CancelLogin);
-                    }
-                    return InputOutcome::Action(Action::QuitConfirmed);
-                }
-            }
+        // oc-build: opencode backend; there is no login screen.
+        if matches!(ctx.auth_state, AuthState::Done)
+            && (key!('c', CONTROL).matches(key) || key!('d', CONTROL).matches(key))
+        {
+            return InputOutcome::Action(Action::Quit);
         }
     }
-    if let Event::Paste(text) = ev {
-        match ctx.auth_state {
-            AuthState::Done => {
-                if !ctx.has_access || ctx.is_zdr_blocked {
-                    return InputOutcome::Unchanged;
-                }
-                *ctx.prompt_focused = true;
-                return InputOutcome::ActionThenForward(Action::LeaveHome);
-            }
-            AuthState::Authenticating {
-                mode: AuthMode::Loopback,
-                ..
-            } => {
-                let _ = ctx.auth_code_input.insert_paste(text);
-                return InputOutcome::Changed;
-            }
-            _ => {}
+    if let Event::Paste(text) = ev
+        && matches!(ctx.auth_state, AuthState::Done)
+    {
+        if !ctx.has_access || ctx.is_zdr_blocked {
+            return InputOutcome::Unchanged;
         }
+        *ctx.prompt_focused = true;
+        return InputOutcome::ActionThenForward(Action::LeaveHome);
     }
     if matches!(ev, Event::Resize(_, _)) {
         return InputOutcome::Changed;
@@ -3779,15 +3413,6 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
                         && mouse.row >= rect.y
                         && mouse.row < rect.y + rect.height
                     {
-                        if matches!(ctx.auth_state, AuthState::Pending { .. }) {
-                            return dispatch_pending_menu_action(i);
-                        }
-                        if ctx.is_zdr_blocked {
-                            return dispatch_zdr_menu_action(i);
-                        }
-                        if !ctx.has_access {
-                            return dispatch_access_gate_menu_action(i);
-                        }
                         if ctx.has_claude_import
                             && i == 0
                             && mouse.column >= rect.x + rect.width.saturating_sub(4)
@@ -3802,16 +3427,6 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
                             ctx.changelog_markdown.as_deref(),
                         );
                     }
-                }
-                if let Some(rect) = ctx.refresh_rect
-                    && rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
-                {
-                    return InputOutcome::Action(Action::CheckSubscription);
-                }
-                if let Some(rect) = ctx.gate_url_rect
-                    && rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
-                {
-                    return InputOutcome::Action(Action::OpenSupergrokUrl);
                 }
                 if let Some(rect) = ctx.upgrade_cta_rect
                     && rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
@@ -3859,18 +3474,6 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
                 {
                     *ctx.announcement_expanded = !*ctx.announcement_expanded;
                     return InputOutcome::Changed;
-                }
-                if let Some(rect) = ctx.auth_url_rect
-                    && matches!(ctx.auth_state, AuthState::Authenticating { .. })
-                    && rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
-                {
-                    return InputOutcome::Action(Action::CopyAuthUrl);
-                }
-                if let Some(rect) = ctx.auth_fallback_rect
-                    && matches!(ctx.auth_state, AuthState::Authenticating { .. })
-                    && rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
-                {
-                    return InputOutcome::Action(Action::ShowRawAuthUrl);
                 }
                 if let Some(rect) = ctx.import_banner_rect
                     && matches!(ctx.auth_state, AuthState::Done)
@@ -3973,29 +3576,6 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
 fn is_quit_signal(key: &crossterm::event::KeyEvent) -> bool {
     key!('c', CONTROL).matches(key) || key!('d', CONTROL).matches(key)
 }
-/// `shortcuts[i]` triggers `menu_dispatch(i)`.
-fn handle_menu_shortcuts(
-    key: &crossterm::event::KeyEvent,
-    menu_index: &mut Option<usize>,
-    shortcuts: &[char],
-    menu_dispatch: fn(usize) -> InputOutcome,
-) -> InputOutcome {
-    if is_quit_signal(key) {
-        return InputOutcome::Action(Action::Quit);
-    }
-    for (i, &ch) in shortcuts.iter().enumerate() {
-        if key.code == KeyCode::Char(ch) {
-            return menu_dispatch(i);
-        }
-    }
-    if key!(Enter).matches(key) {
-        return menu_dispatch(menu_index.unwrap_or(0));
-    }
-    if let Some(outcome) = handle_menu_nav(key, menu_index, shortcuts.len()) {
-        return outcome;
-    }
-    InputOutcome::Unchanged
-}
 fn handle_menu_nav(
     key: &crossterm::event::KeyEvent,
     index: &mut Option<usize>,
@@ -4017,34 +3597,6 @@ fn handle_menu_nav(
             Some(InputOutcome::Changed)
         }
         _ => None,
-    }
-}
-/// Dispatch an action for a welcome menu item when not yet authenticated.
-/// Menu layout: item 0 is Login, item 1 is Quit.
-fn dispatch_pending_menu_action(index: usize) -> InputOutcome {
-    match index {
-        0 => InputOutcome::Action(Action::Login),
-        1 => InputOutcome::Action(Action::Quit),
-        _ => InputOutcome::Unchanged,
-    }
-}
-/// Dispatch an action for a welcome menu item when ZDR-blocked.
-/// Menu layout: item 0 is Switch account, item 1 is Quit.
-fn dispatch_zdr_menu_action(index: usize) -> InputOutcome {
-    match index {
-        0 => InputOutcome::Action(Action::SwitchAccount),
-        1 => InputOutcome::Action(Action::Quit),
-        _ => InputOutcome::Unchanged,
-    }
-}
-/// Menu actions when user is access-gated: item 0 is Subscribe CTA, item 1 is Logout, item 2 is Quit.
-/// "Refresh" (ctrl-r) is handled as a direct key shortcut, not a menu item.
-fn dispatch_access_gate_menu_action(index: usize) -> InputOutcome {
-    match index {
-        0 => InputOutcome::Action(Action::OpenSupergrokUrl),
-        1 => InputOutcome::Action(Action::Logout),
-        2 => InputOutcome::Action(Action::Quit),
-        _ => InputOutcome::Unchanged,
     }
 }
 /// Dispatch an action for a welcome menu item by index.
@@ -4464,8 +4016,6 @@ impl AppView {
                                     .session_picker_pending_delete
                                     .is_some(),
                                 chat_mode: self.chat_mode,
-                                credit_balance: self.credit_balance.as_ref(),
-                                auto_topup: self.auto_topup.as_ref(),
                                 usage_visible: self.usage_visible,
                                 is_api_key_auth: self.is_api_key_auth,
                                 changelog_bullets: &self.changelog_bullets,
@@ -4779,11 +4329,7 @@ impl AppView {
                                     }
                                 }
                                 let dashboard_roster: &[crate::app::roster::RosterEntry] =
-                                    if self.leader_mode {
-                                        &self.leader_roster
-                                    } else {
-                                        &self.dashboard_local_sessions
-                                    };
+                                    &self.dashboard_local_sessions;
                                 let dash_upgrade_cta = crate::views::announcements::promo_cta(
                                     &self.active_announcements,
                                     &self.hidden_announcement_ids,
@@ -4817,7 +4363,6 @@ impl AppView {
                                     self.dashboard_session_picker.as_mut(),
                                     self.dashboard_sessions_loading,
                                     dash_upgrade_cta,
-                                    self.credit_balance.as_ref(),
                                 );
                                 let (popup_cursor, popup_post_flush, drawn_popup_agent) =
                                     if let Some(agent_id) = dashboard.attached_agent {

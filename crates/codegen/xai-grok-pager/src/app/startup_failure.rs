@@ -6,7 +6,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use xai_grok_telemetry::startup::{AgentKind, PhaseSnapshot, StartupOutcome, StartupPhase};
+use xai_grok_telemetry::startup::{AgentKind, PhaseSnapshot};
 
 #[derive(Debug)]
 pub struct StartupFailure {
@@ -23,50 +23,9 @@ enum Reason {
     Cancelled,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct EarlierAttempt {
-    pub(crate) target: AgentKind,
-    pub(crate) wait: Duration,
-    pub(crate) outcome: StartupOutcome,
-    pub(crate) longest_step: Option<StartupPhase>,
-}
-
-impl EarlierAttempt {
-    fn shaped_the_wait(&self) -> bool {
-        self.wait.as_secs() > 0
-    }
-
-    /// The leader is still running and still wedged, so clearing it is what stops the next start paying the same wait.
-    fn wedged_leader(&self) -> bool {
-        self.outcome == StartupOutcome::Timeout
-            && self.longest_step == Some(StartupPhase::LeaderConnect)
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum ConnectAttempt {
-    First,
-    AfterFallback(EarlierAttempt),
-}
-
-impl ConnectAttempt {
-    fn earlier(self) -> Option<EarlierAttempt> {
-        match self {
-            Self::First => None,
-            Self::AfterFallback(earlier) => Some(earlier),
-        }
-    }
-
-    fn earlier_wait(self) -> Duration {
-        self.earlier()
-            .map_or(Duration::ZERO, |earlier| earlier.wait)
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct Context {
     pub(crate) target: AgentKind,
-    pub(crate) attempt: ConnectAttempt,
     pub(crate) version: String,
     pub(crate) log_path: PathBuf,
 }
@@ -74,10 +33,7 @@ pub(crate) struct Context {
 impl StartupFailure {
     pub(crate) fn timed_out(context: Context, waited: Duration, timings: PhaseSnapshot) -> Self {
         Self {
-            reason: Reason::TimedOut {
-                waited: waited + context.attempt.earlier_wait(),
-                timings,
-            },
+            reason: Reason::TimedOut { waited, timings },
             context,
         }
     }

@@ -1,16 +1,8 @@
 //! Async task-result application: routes task results into state.
-use super::auth::{
-    ensure_login_method, handle_auth_complete, handle_auth_url_ready, handle_mcp_auth_trigger_done,
-    handle_mcp_setup_submit_done,
-};
-use super::billing::{
-    PAYWALL_AUTO_CHECK_TIMEOUT, apply_auto_topup, handle_billing_fetched,
-    handle_check_subscription_complete, handle_credit_limit_recheck_complete,
-    handle_gate_refreshed, handle_gate_verify_timeout,
-};
+use super::auth::{handle_mcp_auth_trigger_done, handle_mcp_setup_submit_done};
 use super::cta::{
     handle_cta_plugin_install_done, handle_cta_plugin_reload_done,
-    handle_plugin_cta_catalog_loaded, handle_plugin_cta_debounce_expired,
+    handle_plugin_cta_debounce_expired,
     handle_plugin_cta_mcps_loaded,
 };
 use super::ctx::{find_agent_by_session_id, get_active_agent_mut};
@@ -48,7 +40,7 @@ use super::status::{
     usage_modal_state_mut,
 };
 use super::transcript::{
-    handle_hooks_list_loaded, handle_marketplace_list_loaded, handle_marketplace_updates_available,
+    handle_marketplace_updates_available,
     handle_mcp_toggle_done, handle_plugins_list_loaded, handle_skills_toggle_done,
 };
 use super::turn::{clear_pending_kill, handle_bg_task_killed};
@@ -553,70 +545,6 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::ForkSessionFailed { agent_id, error } => {
             handle_fork_session_failed(app, agent_id, error)
         }
-        TaskResult::BillingFetched {
-            agent_id,
-            balance,
-            silent,
-            subscription_tier,
-            autotopup,
-            nonce,
-        } => handle_billing_fetched(
-            app,
-            agent_id,
-            balance,
-            silent,
-            subscription_tier,
-            autotopup,
-            nonce,
-        ),
-        TaskResult::BillingError {
-            agent_id,
-            error,
-            silent,
-            nonce,
-        } => {
-            if let Some(agent) = app.agents.get_mut(&agent_id) {
-                if let Some(state) = usage_modal_state_mut(agent)
-                    && state.fetch_nonce == nonce
-                {
-                    state.billing_loading = false;
-                    state.billing_error = Some(error.clone());
-                }
-                if !silent {
-                    agent.scrollback.push_block(RenderBlock::System(
-                        crate::scrollback::blocks::SystemMessageBlock::new(format!(
-                            "Billing error: {error}"
-                        )),
-                    ));
-                }
-            }
-            vec![]
-        }
-        TaskResult::AppBillingFetched {
-            balance,
-            autotopup,
-            nonce,
-        } => {
-            app.credit_balance = balance;
-            apply_auto_topup(&mut app.auto_topup, &autotopup);
-            if let Some(state) = app.dashboard.as_mut().and_then(|d| d.usage_modal.as_mut())
-                && state.fetch_nonce == nonce
-            {
-                state.billing_loading = false;
-                state.billing_error = None;
-            }
-            vec![]
-        }
-        TaskResult::AppBillingError { error, nonce } => {
-            if let Some(state) = app.dashboard.as_mut().and_then(|d| d.usage_modal.as_mut())
-                && state.fetch_nonce == nonce
-            {
-                state.billing_loading = false;
-                state.billing_error = Some(error);
-            }
-            vec![]
-        }
-        TaskResult::GateRefreshed { settings } => handle_gate_refreshed(app, settings),
         TaskResult::SessionLoaded {
             agent_id,
             session_id,
@@ -748,16 +676,6 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             },
             query,
         ),
-        TaskResult::RosterLoaded { sessions } => {
-            app.leader_roster = sessions;
-            app.dashboard_sessions_loading = false;
-            vec![]
-        }
-        TaskResult::RosterFailed { error } => {
-            tracing::debug!(error = %error, "leader roster fetch failed");
-            app.dashboard_sessions_loading = false;
-            vec![]
-        }
         TaskResult::DashboardSessionsLoaded { sessions } => {
             app.dashboard_local_sessions = sessions;
             app.dashboard_sessions_loading = false;
@@ -903,16 +821,6 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
-        TaskResult::PreferredModelPersisted { result } => {
-            if let Err(err) = result
-                && let Some(agent) = get_active_agent_mut(app)
-            {
-                agent.scrollback.push_block(RenderBlock::system(format!(
-                    "Couldn't save preferred model: {err} (still active for this session)"
-                )));
-            }
-            vec![]
-        }
         TaskResult::CancelComplete => {
             tracing::trace!("Cancel notification sent successfully");
             vec![]
@@ -932,17 +840,6 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             );
             vec![]
         }
-        TaskResult::ConsentRecorded { notice_id, version } => match app.account_email.clone() {
-            Some(account) => {
-                vec![Effect::PersistConsentAnswer {
-                    account: Some(account),
-                    notice_id,
-                    version,
-                    acked: true,
-                }]
-            }
-            None => vec![],
-        },
         TaskResult::KillSubagentComplete {
             session_id,
             subagent_id,
@@ -1161,29 +1058,6 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
-        TaskResult::AuthComplete { request_seq, meta } => {
-            handle_auth_complete(app, request_seq, meta)
-        }
-        TaskResult::AuthFailed { request_seq, error } => {
-            if let AuthState::Authenticating {
-                request_seq: current_seq,
-                ..
-            } = &app.auth_state
-                && *current_seq == request_seq
-            {
-                app.auth_state = AuthState::Pending { error: Some(error) };
-                app.auth_code_input.reset();
-            }
-            vec![]
-        }
-        TaskResult::AuthUrlReady {
-            request_seq,
-            auth_url,
-            external,
-            mode,
-        } => handle_auth_url_ready(app, request_seq, auth_url, external, mode),
-        TaskResult::AuthCodeSubmitted { .. } => vec![],
-        TaskResult::AuthCancelComplete => vec![],
         TaskResult::McpsListLoaded { agent_id, result } => {
             use crate::views::extensions_modal::TabDataState;
             if let Some(agent) = app.agents.get_mut(&agent_id)
@@ -1208,9 +1082,6 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             server_name,
             result,
         } => handle_mcp_setup_submit_done(app, agent_id, server_name, result),
-        TaskResult::HooksListLoaded { agent_id, result } => {
-            handle_hooks_list_loaded(app, agent_id, result)
-        }
         TaskResult::PluginsListLoaded { agent_id, result } => {
             handle_plugins_list_loaded(app, agent_id, result)
         }
@@ -1268,9 +1139,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
-        TaskResult::HooksActionResult { agent_id, result }
-        | TaskResult::PluginsActionResult { agent_id, result }
-        | TaskResult::MarketplaceActionResult { agent_id, result } => {
+        TaskResult::PluginsActionResult { agent_id, result } => {
             dispatch_action_result(app, agent_id, result)
         }
         TaskResult::CtaPluginInstallDone {
@@ -1304,15 +1173,6 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::McpToggleDone { agent_id, result } => {
             handle_mcp_toggle_done(app, agent_id, result)
         }
-        TaskResult::MarketplaceUpdatesAvailable { agent_id, updates } => {
-            handle_marketplace_updates_available(app, agent_id, updates)
-        }
-        TaskResult::MarketplaceListLoaded { agent_id, result } => {
-            handle_marketplace_list_loaded(app, agent_id, result)
-        }
-        TaskResult::PluginCtaCatalogLoaded { agent_id, result } => {
-            handle_plugin_cta_catalog_loaded(app, agent_id, result)
-        }
         TaskResult::SkillsListLoaded {
             agent_id,
             session_id,
@@ -1326,23 +1186,6 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             {
                 modal.pending_action = None;
                 modal.pending_entry_index = None;
-            }
-            vec![]
-        }
-        TaskResult::WorkflowsListLoaded {
-            agent_id,
-            session_id,
-            result,
-        } => {
-            use crate::views::extensions_modal::TabDataState;
-            if let Some(agent) = app.agents.get_mut(&agent_id)
-                && agent.session.session_id.as_ref() == Some(&session_id)
-                && let Some(ref mut modal) = agent.extensions_modal
-            {
-                modal.workflows_data = match result {
-                    Ok(workflows) => TabDataState::Loaded(workflows),
-                    Err(e) => TabDataState::Error(e),
-                };
             }
             vec![]
         }
@@ -1544,15 +1387,11 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             if after == AfterSessionDelete::Stay {
                 app.dashboard_local_sessions
                     .retain(|entry| entry.session_id != session_id);
-                app.leader_roster
-                    .retain(|entry| entry.session_id != session_id);
                 app.show_toast(delete_notice);
                 return vec![];
             }
             if after == AfterSessionDelete::UnusedHusk {
                 app.dashboard_local_sessions
-                    .retain(|entry| entry.session_id != session_id);
-                app.leader_roster
                     .retain(|entry| entry.session_id != session_id);
                 return vec![];
             }
@@ -1583,8 +1422,6 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 None
             };
             app.dashboard_local_sessions
-                .retain(|entry| entry.session_id != session_id);
-            app.leader_roster
                 .retain(|entry| entry.session_id != session_id);
             let attached_was_removed = app
                 .dashboard
@@ -2002,30 +1839,6 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
-        TaskResult::BundleStatusReady {
-            has_cache,
-            version,
-            personas,
-            roles,
-            agents,
-            skills,
-            persona_details,
-            role_details,
-        } => {
-            app.bundle_state.has_cache = has_cache;
-            app.bundle_state.version = version.unwrap_or_default();
-            app.bundle_state.personas = personas;
-            app.bundle_state.roles = roles;
-            app.bundle_state.agents = agents;
-            app.bundle_state.skills = skills;
-            app.bundle_state.persona_details = persona_details;
-            app.bundle_state.role_details = role_details;
-            vec![]
-        }
-        TaskResult::BundleStatusFailed { error } => {
-            tracing::warn!(error = %error, "bundle status fetch failed");
-            vec![]
-        }
         TaskResult::BtwResponse {
             agent_id,
             result,
@@ -2118,60 +1931,6 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             app.on_status_line_command_finished(id, outcome);
             vec![]
         }
-        TaskResult::AuthCopyFeedbackTimeout { generation } => {
-            if generation == app.auth_clipboard_feedback_generation {
-                app.auth_clipboard_delivery = None;
-            }
-            vec![]
-        }
-        TaskResult::PaywallCheckTick => {
-            let timed_out = app
-                .paywall_check_started
-                .is_some_and(|t| t.elapsed() >= PAYWALL_AUTO_CHECK_TIMEOUT);
-            if !app.has_access() && !timed_out {
-                vec![
-                    Effect::CheckSubscription { verify: None },
-                    Effect::SchedulePaywallCheck,
-                ]
-            } else {
-                vec![]
-            }
-        }
-        TaskResult::CheckSubscriptionComplete { verify, meta } => {
-            handle_check_subscription_complete(app, verify, meta)
-        }
-        TaskResult::TeamCapabilityHydrated {
-            identity,
-            can_administer_team,
-        } => {
-            if can_administer_team.is_some()
-                && app.can_administer_team.is_none()
-                && identity.matches(&app.auth_identity())
-            {
-                app.can_administer_team = can_administer_team;
-                refresh_open_settings_modals(app);
-            }
-            vec![]
-        }
-        TaskResult::GateVerifyTimeout { generation } => handle_gate_verify_timeout(app, generation),
-        TaskResult::CreditLimitRecheckComplete { agent_id, meta } => {
-            handle_credit_limit_recheck_complete(app, agent_id, meta)
-        }
-        TaskResult::LogoutComplete => {
-            app.auth_state = AuthState::Pending { error: None };
-            app.logout_pending = false;
-            app.access_gate_shown_logged = false;
-            app.announcement_cta_impressions_logged.clear();
-            app.gate = None;
-            app.pending_gate_verification = None;
-            app.last_subscription_check_at = None;
-            app.login_method_id = None;
-            ensure_login_method(app);
-            app.auth_clipboard_delivery = None;
-            let effects = dispatch_exit_session(app);
-            app.welcome_prompt_focused = false;
-            effects
-        }
         TaskResult::DeepSearchResults {
             host,
             generation,
@@ -2235,21 +1994,6 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 agent.shell_completion_tab();
             }
             agent.pending_effects.split_off(mark)
-        }
-        TaskResult::PromptSuggestionLoaded {
-            agent_id,
-            suggestion,
-            generation,
-        } => {
-            if let Some(agent) = app.agents.get_mut(&agent_id) {
-                agent
-                    .prompt
-                    .prompt_suggestion
-                    .on_loaded(suggestion, generation);
-                agent.refresh_prompt_suggestion_gate();
-                agent.log_prompt_suggestion_shown_if_visible();
-            }
-            vec![]
         }
         TaskResult::SettingPersisted { key, value } => {
             tracing::trace!(target: "settings", ?key, ?value, "setting persisted");

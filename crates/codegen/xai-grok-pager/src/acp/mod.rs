@@ -1,6 +1,6 @@
 //! ACP (Agent Communication Protocol) connection management.
 //!
-//! This module spawns the agent process, initializes the protocol, authenticates, and provides the channel for communication.
+//! This module spawns the agent process, initializes the protocol and provides the channel for communication.
 /// Shared plan-file size cap for the pager keep.
 pub(crate) const MAX_PLAN_FILE_BYTES: usize = 256 * 1024;
 pub mod meta;
@@ -12,8 +12,6 @@ pub mod spawn;
 pub(crate) mod subagent_label_registry;
 mod subagent_message;
 pub mod tracker;
-mod version_mismatch;
-pub(crate) use version_mismatch::{is_version_mismatch_banner, version_mismatch_banner};
 /// Ext methods that carry a session-scoped update and may stamp `isReplay`.
 /// TUI dispatch, headless dispatch, and the session-load ACP barrier all share this list.
 /// A new method thus cannot be handled in one path and classified `Unrelated` in another.
@@ -27,7 +25,6 @@ pub use model_state::ModelState;
 use std::io::Write;
 use tokio_util::sync::CancellationToken;
 use xai_acp_lib::{AcpAgentTx, AcpClientRx, acp_send};
-use xai_grok_shell::agent::auth_method::AuthMethodKind;
 use xai_grok_shell::agent::config::Config as AgentConfig;
 use xai_grok_shell::sampling::types::ReasoningEffort;
 use xai_grok_telemetry::process_info::{
@@ -45,16 +42,6 @@ pub(crate) fn wait_for_exit_not_supported(context: &str) -> acp::Error {
         acp::ErrorCode::MethodNotFound.into(),
         format!("{context} does not handle WaitForTerminalExit"),
     )
-}
-/// Initial auth mode hint from the agent's auth method metadata.
-/// Determined at startup from `AuthMethod.meta.external_provider`.
-/// Used by the welcome screen to decide whether to show a browser-opening message or a manual token paste input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthStartMode {
-    /// Mode not yet known (will be resolved after AuthenticateRequest).
-    Pending,
-    /// External provider (meta.external_provider == true); the browser opens automatically.
-    Command,
 }
 /// The pager's connection to an agent that is running but has not been set up yet.
 /// It holds the channel for sending requests to the agent, the channel for receiving its replies, the token that stops the agent, and the place the agent runs.
@@ -86,8 +73,6 @@ pub struct AcpConnection {
     pub models: ModelState,
     /// Whether the agent is a grok-shell instance.
     pub is_grok_shell: bool,
-    /// Auth methods advertised by the agent.
-    pub auth_methods: Vec<acp::AuthMethod>,
     /// Cancellation token to stop the agent.
     pub cancel: CancellationToken,
     /// In-process agent worker thread. Join after cancel so the agent can flush.
@@ -95,25 +80,11 @@ pub struct AcpConnection {
     /// ACP-advertised slash commands parsed from `InitializeResponse.meta.availableCommands`.
     /// Seeded into every new `AgentSession` so autocomplete has shell builtins and skills immediately, before any `AvailableCommandsUpdate` arrives.
     pub available_commands: Vec<acp::AvailableCommand>,
-    pub needs_login: bool,
-    /// Login button label from `AuthMethod.name` (e.g., "grok.com", "Acme Corp").
-    pub login_label: Option<String>,
-    /// The auth method ID to use for login (copied from the first advertised method).
-    pub login_method_id: Option<acp::AuthMethodId>,
-    /// Initial auth mode hint (Command vs Pending) from method metadata.
-    pub auth_start_mode: AuthStartMode,
-    /// Auth response metadata from eager authentication (cached token or API key).
-    /// Contains `team_name`, etc. `None` when interactive login is required.
-    pub auth_meta: Option<serde_json::Value>,
     /// Whether cancel-rewind is enabled (resolved by shell from config layers).
     pub cancel_rewind_enabled: bool,
     /// Whether the session-recap feature is rolled out for this connection. The client gates its automatic away-recap
     /// poll and the manual `/recap` on this so a disabled feature produces zero `x.ai/recap` traffic.
     pub session_recap_available: bool,
-    /// Shell-side feedback trace-offer eligibility (see `feedbackTraceOffer`).
-    pub feedback_trace_offer: bool,
-    /// `AuthManager` for pager-side authenticated channels (voice STT and TTS).
-    pub auth_manager: std::sync::Arc<xai_grok_login::AuthManager>,
 }
 /// CLI flags that affect agent configuration, threaded from PagerArgs.
 #[derive(Debug, Clone, Default)]
@@ -163,12 +134,12 @@ pub struct ConnectFlags {
     /// Ignored when `default_yolo_mode` is true.
     pub default_auto_mode: bool,
 }
-/// Finishes connecting to an agent. Sends it `initialize`, works out whether the user must log in first, and returns the `AcpConnection`.
+/// Finishes connecting to an agent. Sends it `initialize` and returns the `AcpConnection`.
+// oc-build: opencode backend; no login or eager authenticate step.
 /// Every agent target is connected through this function, so these steps are written once.
 pub(in crate::acp) async fn initialize_connection(
     endpoint: AgentEndpoint,
     flags: &ConnectFlags,
-    auth_manager: std::sync::Arc<xai_grok_login::AuthManager>,
 ) -> Result<AcpConnection> {
     let AgentEndpoint {
         tx,
@@ -178,38 +149,16 @@ pub(in crate::acp) async fn initialize_connection(
     } = endpoint;
     startup::enter(StartupPhase::AcpInitialize);
     let agent = initialize(&tx, flags).await?;
-    let (needs_login, login_label, login_method_id, auth_start_mode) =
-        startup_auth_metadata(&agent.auth_methods);
-    startup::enter(StartupPhase::EagerAuth);
-    let (needs_login, login_label, login_method_id, auth_start_mode, auth_meta) =
-        bounded_eager_auth(
-            &tx,
-            &agent.auth_methods,
-            agent.default_auth_method_id.as_ref(),
-            needs_login,
-            login_label,
-            login_method_id,
-            auth_start_mode,
-        )
-        .await;
     Ok(AcpConnection {
         tx,
         rx,
         models: agent.models,
         is_grok_shell: agent.is_grok_shell,
-        auth_methods: agent.auth_methods,
         cancel,
         agent_thread: Some(thread),
         available_commands: agent.available_commands,
-        needs_login,
-        login_label,
-        login_method_id,
-        auth_start_mode,
-        auth_meta,
         cancel_rewind_enabled: agent.cancel_rewind_enabled,
         session_recap_available: agent.session_recap_available,
-        feedback_trace_offer: agent.feedback_trace_offer,
-        auth_manager,
     })
 }
 /// Build the per-session `_meta` for `InitializeRequest`.
@@ -258,24 +207,13 @@ fn client_capabilities_meta(flags: &ConnectFlags) -> serde_json::Value {
     }
     meta
 }
-/// Parse `defaultAuthMethodId` from `InitializeResponse.meta`.
-/// The agent is the source of truth for preferred-method selection (including `[auth] preferred_method`).
-/// Clients must not re-derive api_key vs session.
-pub fn parse_default_auth_method_id(meta: Option<&acp::Meta>) -> Option<acp::AuthMethodId> {
-    meta.and_then(|m| m.get("defaultAuthMethodId"))
-        .and_then(|v| v.as_str())
-        .map(|s| acp::AuthMethodId::new(s.to_owned()))
-}
 /// The parsed `InitializeResponse`.
 pub(crate) struct InitializedAgent {
     pub(crate) models: ModelState,
     pub(crate) is_grok_shell: bool,
-    pub(crate) auth_methods: Vec<acp::AuthMethod>,
-    pub(crate) default_auth_method_id: Option<acp::AuthMethodId>,
     pub(crate) available_commands: Vec<acp::AvailableCommand>,
     pub(crate) cancel_rewind_enabled: bool,
     pub(crate) session_recap_available: bool,
-    pub(crate) feedback_trace_offer: bool,
 }
 /// Send InitializeRequest and parse the response.
 async fn initialize(tx: &AcpAgentTx, flags: &ConnectFlags) -> Result<InitializedAgent> {
@@ -315,17 +253,12 @@ async fn initialize(tx: &AcpAgentTx, flags: &ConnectFlags) -> Result<Initialized
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
     let session_recap_available = parse_session_recap_available(resp.meta.as_ref());
-    let feedback_trace_offer = parse_feedback_trace_offer(resp.meta.as_ref());
-    let default_auth_method_id = parse_default_auth_method_id(resp.meta.as_ref());
     Ok(InitializedAgent {
         models,
         is_grok_shell,
-        auth_methods: resp.auth_methods,
-        default_auth_method_id,
         available_commands,
         cancel_rewind_enabled,
         session_recap_available,
-        feedback_trace_offer,
     })
 }
 /// Parse `availableCommands` from an `InitializeResponse.meta` value.
@@ -343,209 +276,6 @@ pub fn parse_session_recap_available(meta: Option<&acp::Meta>) -> bool {
     meta.and_then(|m| m.get("sessionRecap"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
-}
-pub fn parse_feedback_trace_offer(meta: Option<&acp::Meta>) -> bool {
-    meta.and_then(|m| m.get("feedbackTraceOffer"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-}
-/// Determine whether interactive login is needed based on the advertised auth methods. Otherwise, authenticate
-/// eagerly.
-pub fn startup_auth_metadata(
-    auth_methods: &[acp::AuthMethod],
-) -> (
-    bool,
-    Option<String>,
-    Option<acp::AuthMethodId>,
-    AuthStartMode,
-) {
-    let first_method = auth_methods.first();
-    let needs_login = first_method
-        .map(|m| AuthMethodKind::from_id(m.id()).needs_interactive_login())
-        .unwrap_or(false);
-    if !needs_login {
-        return (false, None, None, AuthStartMode::Pending);
-    }
-    let method = first_method.unwrap();
-    let login_label = Some(method.name().to_string());
-    let login_method_id = Some(method.id().clone());
-    let is_provider = method
-        .meta()
-        .as_ref()
-        .and_then(|v| v.get("external_provider"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let auth_start_mode = if is_provider {
-        AuthStartMode::Command
-    } else {
-        AuthStartMode::Pending
-    };
-    (needs_login, login_label, login_method_id, auth_start_mode)
-}
-/// Find an interactive login method from the auth methods list.
-/// Used when eager auth (cached_token or API key) fails and we need to fall back to the welcome screen with a working login button.
-/// Scans the list for a `grok.com` or `oidc` method; these are the ones that can trigger a browser-based re-auth flow.
-pub fn find_interactive_login_method(
-    auth_methods: &[acp::AuthMethod],
-) -> (Option<String>, Option<acp::AuthMethodId>, AuthStartMode) {
-    let interactive = auth_methods
-        .iter()
-        .find(|m| AuthMethodKind::from_id(m.id()).needs_interactive_login());
-    match interactive {
-        Some(method) => {
-            let is_provider = method
-                .meta()
-                .as_ref()
-                .and_then(|v| v.get("external_provider"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let mode = if is_provider {
-                AuthStartMode::Command
-            } else {
-                AuthStartMode::Pending
-            };
-            (
-                Some(method.name().to_string()),
-                Some(method.id().clone()),
-                mode,
-            )
-        }
-        None => (None, None, AuthStartMode::Pending),
-    }
-}
-/// Attempt eager auth; on failure fall back to the interactive login screen. The shell owns unpinned fallthrough,
-/// and a failed api_key must not open a browser. Otherwise hand the interactive method for the login screen. Empty
-/// `auth_methods` is fail-closed: needs_login without an interactive method.
-async fn eager_auth_or_login_fallback(
-    tx: &AcpAgentTx,
-    auth_methods: &[acp::AuthMethod],
-    default_auth_method_id: Option<&acp::AuthMethodId>,
-    needs_login: bool,
-    login_label: Option<String>,
-    login_method_id: Option<acp::AuthMethodId>,
-    auth_start_mode: AuthStartMode,
-) -> (
-    bool,
-    Option<String>,
-    Option<acp::AuthMethodId>,
-    AuthStartMode,
-    Option<serde_json::Value>,
-) {
-    if auth_methods.is_empty() {
-        return (true, None, None, AuthStartMode::Pending, None);
-    }
-    if needs_login {
-        return (
-            needs_login,
-            login_label,
-            login_method_id,
-            auth_start_mode,
-            None,
-        );
-    }
-    match authenticate(tx, auth_methods, default_auth_method_id).await {
-        Ok(meta) => (
-            needs_login,
-            login_label,
-            login_method_id,
-            auth_start_mode,
-            meta,
-        ),
-        Err(_) => {
-            let has_api_key = auth_methods
-                .iter()
-                .any(|m| AuthMethodKind::from_id(m.id()) == AuthMethodKind::XaiApiKey);
-            if has_api_key {
-                return (false, login_label, login_method_id, auth_start_mode, None);
-            }
-            let (label, method_id, mode) = find_interactive_login_method(auth_methods);
-            (true, label, method_id, mode, None)
-        }
-    }
-}
-/// [`eager_auth_or_login_fallback`] bounded by `STARTUP_AUTH_REFRESH_TIMEOUT`, so a hung agent cannot gate the first draw.
-/// On timeout the inputs pass through unchanged and the agent finishes authentication in the background.
-async fn bounded_eager_auth(
-    tx: &AcpAgentTx,
-    auth_methods: &[acp::AuthMethod],
-    default_auth_method_id: Option<&acp::AuthMethodId>,
-    needs_login: bool,
-    login_label: Option<String>,
-    login_method_id: Option<acp::AuthMethodId>,
-    auth_start_mode: AuthStartMode,
-) -> (
-    bool,
-    Option<String>,
-    Option<acp::AuthMethodId>,
-    AuthStartMode,
-    Option<serde_json::Value>,
-) {
-    match tokio::time::timeout(
-        xai_grok_shell::http::STARTUP_AUTH_REFRESH_TIMEOUT,
-        eager_auth_or_login_fallback(
-            tx,
-            auth_methods,
-            default_auth_method_id,
-            needs_login,
-            login_label.clone(),
-            login_method_id.clone(),
-            auth_start_mode,
-        ),
-    )
-    .await
-    {
-        Ok(resolved) => resolved,
-        Err(_) => (
-            needs_login,
-            login_label,
-            login_method_id,
-            auth_start_mode,
-            None,
-        ),
-    }
-}
-/// Authenticate with the agent using the agent's chosen default method. Do not re-derive api_key vs session
-/// ordering client-side (that has regressed OIDC refresh before).
-async fn authenticate(
-    tx: &AcpAgentTx,
-    auth_methods: &[acp::AuthMethod],
-    default_auth_method_id: Option<&acp::AuthMethodId>,
-) -> Result<Option<serde_json::Value>> {
-    let method_id = select_eager_auth_method(auth_methods, default_auth_method_id)
-        .ok_or_else(|| anyhow::anyhow!("No auth methods available"))?;
-    crate::unified_log::info(
-        "pager eager auth method selected",
-        None,
-        Some(serde_json::json!({
-            "method_id": method_id.0.as_ref(),
-            "from_default_auth_method_id": default_auth_method_id
-                .is_some_and(|d| d.0.as_ref() == method_id.0.as_ref()),
-            "methods_count": auth_methods.len(),
-            "first_method": auth_methods.first().map(|m| m.id().0.as_ref()),
-        })),
-    );
-    let resp: acp::AuthenticateResponse =
-        acp_send(acp::AuthenticateRequest::new(method_id), tx).await?;
-    Ok(resp.meta.map(serde_json::Value::Object))
-}
-/// Pick the method id for eager authenticate.
-/// 1. Agent's `defaultAuthMethodId` when present in the advertised list
-/// 2. Legacy: `cached_token` if advertised, else first method
-pub fn select_eager_auth_method(
-    auth_methods: &[acp::AuthMethod],
-    default_auth_method_id: Option<&acp::AuthMethodId>,
-) -> Option<acp::AuthMethodId> {
-    if let Some(default_id) = default_auth_method_id
-        && auth_methods.iter().any(|m| m.id() == default_id)
-    {
-        return Some(default_id.clone());
-    }
-    let cached_token_method = auth_methods
-        .iter()
-        .find(|m| AuthMethodKind::from_id(m.id()) == AuthMethodKind::CachedToken);
-    cached_token_method
-        .or_else(|| auth_methods.first())
-        .map(|m| m.id().clone())
 }
 #[cfg(test)]
 mod tests {
@@ -621,109 +351,6 @@ mod tests {
     fn parse_session_recap_available_non_bool_defaults_off() {
         let meta = serde_json::json!({ "sessionRecap": "yes" });
         assert!(!parse_session_recap_available(meta.as_object()));
-    }
-    fn make_auth_method(id: &str, name: &str, meta: Option<serde_json::Value>) -> acp::AuthMethod {
-        let mut agent = acp::AuthMethodAgent::new(acp::AuthMethodId::new(id), name.to_string());
-        if let Some(m) = meta.and_then(|v| v.as_object().cloned()) {
-            agent = agent.meta(m);
-        }
-        acp::AuthMethod::Agent(agent)
-    }
-    #[test]
-    fn startup_auth_empty_methods_no_login() {
-        let (needs, label, method_id, mode) = startup_auth_metadata(&[]);
-        assert!(!needs);
-        assert!(label.is_none());
-        assert!(method_id.is_none());
-        assert_eq!(mode, AuthStartMode::Pending);
-    }
-    #[test]
-    fn startup_auth_grok_com_no_provider_needs_login_pending() {
-        let methods = vec![make_auth_method("grok.com", "grok.com", None)];
-        let (needs, label, method_id, mode) = startup_auth_metadata(&methods);
-        assert!(needs);
-        assert_eq!(label.as_deref(), Some("grok.com"));
-        assert_eq!(method_id.as_ref().unwrap().0.as_ref(), "grok.com");
-        assert_eq!(mode, AuthStartMode::Pending);
-    }
-    #[test]
-    fn startup_auth_grok_com_with_external_provider_command() {
-        let meta = serde_json::json!({ "external_provider": true });
-        let methods = vec![make_auth_method("grok.com", "Acme Corp", Some(meta))];
-        let (needs, label, method_id, mode) = startup_auth_metadata(&methods);
-        assert!(needs);
-        assert_eq!(label.as_deref(), Some("Acme Corp"));
-        assert_eq!(method_id.as_ref().unwrap().0.as_ref(), "grok.com");
-        assert_eq!(mode, AuthStartMode::Command);
-    }
-    #[test]
-    fn startup_auth_non_grok_com_no_login() {
-        let methods = vec![make_auth_method("api-key", "API Key", None)];
-        let (needs, label, method_id, mode) = startup_auth_metadata(&methods);
-        assert!(!needs);
-        assert!(label.is_none());
-        assert!(method_id.is_none());
-        assert_eq!(mode, AuthStartMode::Pending);
-    }
-    /// Enterprise/BYOK configs MUST. It calls the shell-side `build_auth_methods()` with the exact inputs
-    /// `MvpAgent::initialize()` would compute for an enterprise user. It fails because `startup_auth_metadata()`
-    /// returns `needs_login = true`.
-    #[test]
-    fn shell_built_auth_methods_for_byok_user_skip_login_screen() {
-        use xai_grok_shell::agent::auth_method::{AuthMethodsBuildInputs, build_auth_methods};
-        let built = build_auth_methods(AuthMethodsBuildInputs {
-            has_external_api_key: true,
-            has_cached_token: false,
-            has_enterprise_oidc: false,
-            enterprise_oidc_issuer: None,
-            login_label: None,
-            has_auth_provider_command: false,
-            preferred_method: None,
-        });
-        let (needs, label, method_id, mode) = startup_auth_metadata(&built.methods);
-        assert!(
-            !needs,
-            "shell built auth_methods for a BYOK user, but the pager still \
-             reports needs_login = true. Either the shell stopped putting \
-             xai.api_key first or the pager stopped treating xai.api_key as \
-             a no-login method.",
-        );
-        assert!(label.is_none());
-        assert!(method_id.is_none());
-        assert_eq!(mode, AuthStartMode::Pending);
-    }
-    /// Inverse direction: when `xai.api_key` is NOT in the list, the pager MUST show the login screen. The pager only
-    /// inspects `auth_methods.first()`. This locks the failure mode of the regression. It then either passes or fails
-    /// on a meaningful new code path.
-    #[test]
-    fn startup_auth_xai_api_key_not_first_still_requires_login() {
-        use xai_grok_shell::agent::auth_method::{GROK_COM_METHOD_ID, XAI_API_KEY_METHOD_ID};
-        let methods = vec![
-            make_auth_method(GROK_COM_METHOD_ID, "Grok", None),
-            make_auth_method(XAI_API_KEY_METHOD_ID, "xai.api_key", None),
-        ];
-        let (needs, _, _, _) = startup_auth_metadata(&methods);
-        assert!(
-            needs,
-            "with grok.com first, the pager must require login -- pinning \
-             the BAD-ordering failure mode (xai.api_key not first)",
-        );
-    }
-    #[test]
-    fn startup_auth_method_id_is_copied_not_synthesized() {
-        let methods = vec![make_auth_method("grok.com", "My Login", None)];
-        let (_, _, method_id, _) = startup_auth_metadata(&methods);
-        let Some(first) = methods.first() else {
-            panic!("expected an auth method");
-        };
-        assert_eq!(&method_id.unwrap(), first.id());
-    }
-    #[test]
-    fn startup_auth_external_provider_false_is_pending() {
-        let meta = serde_json::json!({ "external_provider": false });
-        let methods = vec![make_auth_method("grok.com", "grok.com", Some(meta))];
-        let (_, _, _, mode) = startup_auth_metadata(&methods);
-        assert_eq!(mode, AuthStartMode::Pending);
     }
     #[test]
     fn build_initialize_meta_includes_rules_when_set() {

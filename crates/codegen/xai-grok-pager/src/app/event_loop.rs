@@ -1130,86 +1130,8 @@ pub(crate) async fn run(
         .unwrap_or(true);
     app.cancel_rewind_enabled = connection.cancel_rewind_enabled;
     apply_session_recap_available(&mut app, connection.session_recap_available);
-    app.shell_feedback_trace_offer = connection.feedback_trace_offer;
-    app.auth_methods = connection.auth_methods.clone();
-    let needs_interactive_login = connection.needs_login;
-    if needs_interactive_login {
-        app.welcome_prompt_focused = false;
-        if connection.needs_login {
-            app.login_label = connection.login_label;
-            app.login_method_id = connection.login_method_id;
-            app.auth_start_mode = match connection.auth_start_mode {
-                crate::acp::AuthStartMode::Pending => super::app_view::AuthMode::Pending,
-                crate::acp::AuthStartMode::Command => super::app_view::AuthMode::Command,
-            };
-        } else {
-            let grok_com = connection
-                .auth_methods
-                .iter()
-                .find(|m| m.id().0.as_ref() == "grok.com");
-            if let Some(method) = grok_com {
-                app.login_label = Some(method.name().to_string());
-                app.login_method_id = Some(method.id().clone());
-                let is_provider = method
-                    .meta()
-                    .as_ref()
-                    .and_then(|v| v.get("external_provider"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                app.auth_start_mode = if is_provider {
-                    super::app_view::AuthMode::Command
-                } else {
-                    super::app_view::AuthMode::Pending
-                };
-            } else if let Some(first) = connection.auth_methods.first() {
-                app.login_label = Some(first.name().to_string());
-                app.login_method_id = Some(first.id().clone());
-                app.auth_start_mode = super::app_view::AuthMode::Pending;
-            }
-        }
-        tracing::info!(
-            method_id = ?app.login_method_id,
-            methods_empty = connection.auth_methods.is_empty(),
-            "auto-triggering login at startup"
-        );
-    }
-    let mut post_render_effects = if needs_interactive_login {
-        if connection.auth_methods.is_empty() {
-            app.auth_state = super::app_view::AuthState::Pending {
-                error: Some(
-                    xai_grok_shell::agent::auth_method::PREFERRED_API_KEY_UNAVAILABLE.to_string(),
-                ),
-            };
-            vec![]
-        } else {
-            dispatch::dispatch(Action::Login, &mut app)
-        }
-    } else {
-        vec![]
-    };
-    app.has_external_auth_provider =
-        crate::slash::commands::usage::detect_external_auth_provider(&app.auth_methods);
-    if let Some(meta) = connection.auth_meta.as_ref() {
-        match serde_json::from_value::<xai_grok_login::AuthMeta>(meta.clone()) {
-            Ok(auth_meta) => {
-                app.apply_auth_meta(&auth_meta);
-                if app.needs_team_capability_hydration() {
-                    post_render_effects.push(Effect::HydrateTeamCapability {
-                        identity: app.auth_identity(),
-                    });
-                }
-            }
-            Err(e) => tracing::warn!("failed to deserialize auth_meta: {e}"),
-        }
-    } else {
-        app.is_api_key_auth = app.auth_methods.iter().any(|m| {
-            m.id().0.as_ref() == xai_grok_shell::agent::auth_method::XAI_API_KEY_METHOD_ID
-        });
-        if !app.consumer_account() {
-            app.usage_visible = false;
-            app.sync_billing_surface_to_agents();
-        }
-    }
+    // oc-build: opencode backend; no login, auth metadata or billing surface.
+    let mut post_render_effects: Vec<Effect> = vec![];
     let voice_mode_enabled = crate::app::resolve_voice_mode_live(
         remote_settings.as_ref().and_then(|s| s.voice_mode_enabled),
         app.is_api_key_auth,
@@ -1222,14 +1144,6 @@ pub(crate) async fn run(
     crate::views::dock::set_enabled(crate::app::resolve_dock_enabled(
         remote_settings.as_ref().and_then(|s| s.dock_enabled),
     ));
-    if app.gate.is_none()
-        && let Some(rs) = remote_settings.as_ref()
-    {
-        app.gate = AppView::gate_from_settings(rs);
-    }
-    if let Some(gate) = app.gate.take() {
-        post_render_effects.extend(app.impose_gate(gate));
-    }
     app.hidden_announcement_ids = xai_grok_announcements::read_hidden_announcement_ids().await;
     let requirements = xai_grok_shell::config::load_merged_requirements();
     let user_config = xai_grok_shell::config::load_from_disk().ok();
@@ -1279,9 +1193,6 @@ pub(crate) async fn run(
         config_layers.as_ref(),
         remote_settings.as_ref(),
     );
-    app.subscription_watch_interval_secs = remote_settings
-        .as_ref()
-        .and_then(|rs| rs.subscription_watch_interval_secs);
     crate::appearance::cache::set_show_thinking_blocks(
         xai_grok_shell::util::config::resolve_show_thinking_blocks(
             requirements.as_ref(),
@@ -1503,7 +1414,6 @@ pub(crate) async fn run(
     );
     let config_session_bools = load_initial_config_session_bools();
     app.show_tips = config_session_bools.show_tips;
-    app.auto_update = config_session_bools.auto_update;
     app.ask_user_question_timeout_enabled = config_session_bools.ask_user_question_timeout_enabled;
     crate::appearance::cache::prime(&app.current_ui);
     crate::appearance::cache::apply_remote_keep_text_selection_default(
@@ -1545,14 +1455,11 @@ pub(crate) async fn run(
     let (progress_tx, mut progress_rx) =
         tokio::sync::mpsc::unbounded_channel::<effects::RestoreProgressMsg>();
     let mut voice_rx = None::<tokio::sync::mpsc::Receiver<xai_grok_voice::TaggedVoiceEvent>>;
-    let voice_auth_factory = connection.auth_manager.clone();
     let mut tick_interval = tick_interval;
     let mut animation_tick_at: Option<Instant> = None;
     let ack_deadlines = crate::app::prompt_ack::PromptAckDeadlines::from_process_env();
     let mut gboom_keyboard_pushed = false;
     let mut cursor_color_on_wire = crate::theme::cursor_color_escape();
-    const BILLING_POLL_INTERVAL: Duration = Duration::from_secs(30);
-    let mut billing_poll_at: Option<Instant> = None;
     let mut status_line_refresh_interval: Option<Duration> =
         if super::status_line::draws_a_row(&app.current_ui.status_line) {
             app.status_line_refresh_interval()
@@ -1561,14 +1468,6 @@ pub(crate) async fn run(
         };
     let mut status_line_refresh_at: Option<Instant> =
         status_line_refresh_interval.map(|interval| Instant::now() + interval);
-    const GATE_POLL_INTERVAL: Duration = Duration::from_secs(30);
-    let mut gate_poll_at: Option<Instant> = None;
-    let mut subscription_watch_at: Option<Instant> = if app.subscription_watch_wanted() {
-        app.subscription_watch_interval()
-            .map(|iv| Instant::now() + iv)
-    } else {
-        None
-    };
     const DASHBOARD_POLL_INTERVAL: Duration = Duration::from_secs(1);
     let mut dashboard_poll_at: Option<Instant> = Some(Instant::now());
     const RECAP_POLL_INTERVAL: Duration = Duration::from_secs(20);
@@ -1578,22 +1477,9 @@ pub(crate) async fn run(
     let mut suspend_wait_reports = SuspendWaitReports::default();
     presenter.request_presentation(&mut app, terminal, false);
     if matches!(app.auth_state, AuthState::Done) {
-        let effs = dispatch::dispatch(Action::RequestBundleStatus, &mut app);
-        if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
-            return Ok(finish_run(&mut app));
-        }
-        if app.usage_visible {
-            let effs = vec![super::actions::Effect::FetchAppBilling { nonce: 0 }];
-            if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
-                return Ok(finish_run(&mut app));
-            }
-        }
         let effs = vec![super::actions::Effect::FetchChangelog];
         if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
             return Ok(finish_run(&mut app));
-        }
-        if !app.has_access() {
-            gate_poll_at = Some(Instant::now() + GATE_POLL_INTERVAL);
         }
     }
     if !post_render_effects.is_empty()
@@ -1787,10 +1673,6 @@ pub(crate) async fn run(
                 &mut animation_tick_at,
                 tick_interval,
                 &mut resize_debounce_at,
-                &mut billing_poll_at,
-                BILLING_POLL_INTERVAL,
-                &mut gate_poll_at,
-                GATE_POLL_INTERVAL,
                 &mut presenter,
             );
         }
@@ -1830,38 +1712,12 @@ pub(crate) async fn run(
         ) {
             break;
         }
-        if let VoiceState::ColdStart { hold, target } = app.voice_state {
-            if app.voice_cmd_tx.is_none() && app.voice_can_start_pipeline() {
-                let stt_routes = crate::voice::build_stt_routes(voice_auth_factory.clone());
-                app.voice_auth = Some(stt_routes.auth.clone());
-                let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(32);
-                let (event_tx, event_rx) = tokio::sync::mpsc::channel(128);
-                let voice_config = app.voice_config.clone();
-                tokio::spawn(xai_grok_voice::run_voice_pipeline(
-                    voice_config,
-                    stt_routes,
-                    cmd_rx,
-                    event_tx,
-                ));
-                app.voice_cmd_tx = Some(cmd_tx);
-                voice_rx = Some(event_rx);
-                tracing::info!("voice pipeline started (/voice or Ctrl+Space)");
-                if matches!(
-                    app.active_view,
-                    ActiveView::Agent(_) | ActiveView::AgentDashboard
-                ) {
-                    app.voice_begin_recording(target, hold);
-                } else {
-                    app.voice_reset();
-                    app.voice_ui_active = false;
-                }
-            } else if app.voice_cmd_tx.is_none() {
-                app.voice_reset();
-                app.voice_ui_active = false;
-                app.show_toast("Voice could not start. Restart Grok.");
-            } else {
-                app.voice_reset();
-            }
+        // oc-build: opencode backend; dictation went to the xAI voice service, so a press never
+        // starts the pipeline.
+        if let VoiceState::ColdStart { .. } = app.voice_state {
+            app.voice_reset();
+            app.voice_ui_active = false;
+            app.show_toast("Voice input is not available.");
             presenter.request_presentation(&mut app, terminal, false);
         }
         app.enforce_voice_session_bound();
@@ -1895,12 +1751,6 @@ pub(crate) async fn run(
             dashboard_poll_at = None;
         } else if dashboard_poll_at.is_none() {
             dashboard_poll_at = Some(Instant::now());
-        }
-        if subscription_watch_at.is_none()
-            && app.subscription_watch_wanted()
-            && let Some(iv) = app.subscription_watch_interval()
-        {
-            subscription_watch_at = Some(Instant::now() + iv);
         }
         let animation_tick = async {
             match animation_tick_at {
@@ -1944,26 +1794,8 @@ pub(crate) async fn run(
                 None => std::future::pending().await,
             }
         };
-        let billing_poll = async {
-            match billing_poll_at {
-                Some(at) => sleep_until(at).await,
-                None => std::future::pending().await,
-            }
-        };
         let status_line_refresh = async {
             match status_line_refresh_at {
-                Some(at) => sleep_until(at).await,
-                None => std::future::pending().await,
-            }
-        };
-        let gate_poll = async {
-            match gate_poll_at {
-                Some(at) => sleep_until(at).await,
-                None => std::future::pending().await,
-            }
-        };
-        let subscription_watch = async {
-            match subscription_watch_at {
                 Some(at) => sleep_until(at).await,
                 None => std::future::pending().await,
             }
@@ -2242,10 +2074,6 @@ pub(crate) async fn run(
                             &mut animation_tick_at,
                             tick_interval,
                             &mut resize_debounce_at,
-                            &mut billing_poll_at,
-                            BILLING_POLL_INTERVAL,
-                            &mut gate_poll_at,
-                            GATE_POLL_INTERVAL,
                             &mut presenter,
                         );
                     }
@@ -2337,42 +2165,6 @@ pub(crate) async fn run(
             // Only opens the gate; the next loop-top attempt owns the blocking handoff so no select arm performs it inline
             _ = suspend_retry => {
                 suspend_retry_after = None;
-            }
-
-            _ = billing_poll => {
-                billing_poll_at = None;
-                if let ActiveView::Agent(id) = app.active_view {
-                    let effs = vec![Effect::FetchBilling {
-                        agent_id: id,
-                        silent: true,
-                        nonce: Default::default(),
-                    }];
-                    if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
-                        break;
-                    }
-                }
-                if app.billing_poll_wanted {
-                    billing_poll_at = Some(Instant::now() + BILLING_POLL_INTERVAL);
-                }
-            }
-
-            _ = gate_poll => {
-                gate_poll_at = None;
-                let effs = vec![Effect::RefreshGate];
-                if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
-                    break;
-                }
-                if !app.has_access() {
-                    gate_poll_at = Some(Instant::now() + GATE_POLL_INTERVAL);
-                }
-            }
-
-            _ = subscription_watch => {
-                subscription_watch_at = None;
-                let effs = app.fire_subscription_check("watch");
-                if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
-                    break;
-                }
             }
 
             _ = dashboard_poll => {
@@ -2536,7 +2328,6 @@ pub(crate) fn load_initial_ui_config() -> xai_grok_shell::agent::config::UiConfi
 #[derive(Default)]
 struct InitialConfigSessionBools {
     show_tips: Option<bool>,
-    auto_update: Option<bool>,
     ask_user_question_timeout_enabled: Option<bool>,
 }
 fn load_initial_config_session_bools() -> InitialConfigSessionBools {
@@ -2546,7 +2337,6 @@ fn load_initial_config_session_bools() -> InitialConfigSessionBools {
     let cli_bool = |key: &str| -> Option<bool> { root.get("cli")?.get(key)?.as_bool() };
     InitialConfigSessionBools {
         show_tips: cli_bool("show_tips"),
-        auto_update: cli_bool("auto_update"),
         ask_user_question_timeout_enabled: root
             .get("toolset")
             .and_then(|t| t.get("ask_user_question"))
@@ -2594,30 +2384,15 @@ fn should_pregenerate_away_recap(app: &AppView) -> bool {
         .is_some_and(crate::app::agent_view::AgentView::is_eligible_for_auto_recap)
 }
 /// Bookkeeping shared by the JoinSet arm and the deferred SessionLoaded drain.
-/// A deferred load that sets `billing_poll_wanted` must arm the poll here; waiting for an unrelated later event would stall billing/gate timers.
 fn after_task_complete_dispatch(
     app: &AppView,
     animation_tick_at: &mut Option<Instant>,
     tick_interval: Duration,
     resize_debounce_at: &mut Option<Instant>,
-    billing_poll_at: &mut Option<Instant>,
-    billing_poll_interval: Duration,
-    gate_poll_at: &mut Option<Instant>,
-    gate_poll_interval: Duration,
     presenter: &mut Presenter,
 ) {
     schedule_tick(animation_tick_at, app, tick_interval);
     *resize_debounce_at = None;
-    if app.billing_poll_wanted && billing_poll_at.is_none() {
-        *billing_poll_at = Some(Instant::now() + billing_poll_interval);
-    } else if !app.billing_poll_wanted {
-        *billing_poll_at = None;
-    }
-    if !app.has_access() && gate_poll_at.is_none() {
-        *gate_poll_at = Some(Instant::now() + gate_poll_interval);
-    } else if app.has_access() {
-        *gate_poll_at = None;
-    }
     presenter.request(false);
 }
 /// Schedule the next animation tick when demanded and none is pending.
@@ -2815,10 +2590,6 @@ async fn drain_and_process(
                     && crate::clipboard::clipboard_image_probe_supported()
                 {
                     crate::clipboard::prewarm_image_probe();
-                }
-                let effs = app.fire_subscription_check("focus");
-                if process_effects(effs, tasks, app, progress_tx) {
-                    return true;
                 }
                 match app.active_view {
                     ActiveView::Agent(id) => {
@@ -3527,27 +3298,7 @@ fn process_effects(
         else {
             continue;
         };
-        let (quit, meta) = effects::execute(eff, tasks, &app.acp_tx, &app.cwd, &flags, progress_tx);
-        if let Some((seq, abort_handle)) = meta.auth_abort_handle
-            && let super::app_view::AuthState::Authenticating {
-                request_seq,
-                handle,
-                ..
-            } = &mut app.auth_state
-            && *request_seq == seq
-        {
-            *handle = Some(abort_handle);
-        }
-        if let Some((seq, abort_handle)) = meta.auth_url_poll_handle {
-            let still_current = matches!(
-                &app.auth_state,
-                super::app_view::AuthState::Authenticating { request_seq, .. }
-                    if *request_seq == seq
-            );
-            if still_current {
-                app.auth_url_poll_handle = Some((seq, abort_handle));
-            }
-        }
+        let quit = effects::execute(eff, tasks, &app.acp_tx, &app.cwd, &flags, progress_tx);
         if quit {
             return true;
         }

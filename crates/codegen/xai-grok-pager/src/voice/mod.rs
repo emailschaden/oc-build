@@ -18,9 +18,7 @@
 //! The user always submits with Enter; nothing is auto-sent.
 //! Submit promotes any remaining interim text into the bound prompt, then resets capture; a clip that has shown no
 //! partial yet keeps its target so its one final lands as the next draft.
-mod auth;
 mod handle;
-pub use auth::build_stt_routes;
 pub use handle::handle_tagged_voice_event;
 #[cfg(test)]
 pub(crate) use handle::handle_voice_event;

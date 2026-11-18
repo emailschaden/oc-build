@@ -46,7 +46,6 @@ pub mod status_blocks;
 pub(crate) mod status_line;
 mod status_line_policy;
 pub mod subagent;
-pub mod subscription;
 pub(crate) mod voice_state;
 pub(crate) mod worktree_session;
 pub(crate) use dispatch::dashboard_stop_readiness;
@@ -85,11 +84,7 @@ pub(crate) mod workspace_test_fixtures;
 mod xt_filter;
 pub(crate) use crate::terminal::{kitty_flags_pushed, kitty_releases_reported};
 use anyhow::Context as _;
-pub use cli::{
-    AgentArgs, AgentCmd, Command, HeadlessArgs, LeaderArgs, LeaderMgmtArgs, LeaderMgmtCommand,
-    LeaderTargetArgs, OutputFormat, PagerArgs, ServeArgs, WrapArgs,
-};
-pub use cli::{WorkspaceMgmtArgs, WorkspaceMgmtCommand, WorkspaceStartArgs};
+pub use cli::{Command, OutputFormat, PagerArgs, WrapArgs};
 use crossterm::cursor::{self, SetCursorStyle};
 use crossterm::event;
 use crossterm::execute;
@@ -478,105 +473,6 @@ pub(crate) struct ExitSummary {
     /// `None` when the newest prompt is still unanswered.
     pub last_response: Option<String>,
 }
-/// Resolve leader mode, reporting both why it is off and what turned it off.
-///
-/// Precedence, highest first: `--no-leader`, `--leader`, eligibility, local config `use_leader`, remote `leader_mode` (release-dist), default off.
-/// `requested_confinement` then vetoes leader use when `Some` (in-process tools stay under the OS sandbox) without reclaiming a shared leader.
-/// `policy_disable_reason` is `Some("config"|"remote")` only when leader mode is *definitively* off by policy.
-/// Never reclaim a leader on an unknown signal.
-pub fn resolve_leader_mode<'p>(
-    leader_flag: bool,
-    no_leader_flag: bool,
-    raw_config: &toml::Value,
-    _remote_settings: Option<&xai_grok_shell::util::config::RemoteSettings>,
-    eligible: bool,
-    requested_confinement: Option<&'p str>,
-) -> LeaderMode<'p> {
-    let (use_leader, policy_disable_reason) = 'policy: {
-        if no_leader_flag {
-            break 'policy (false, None);
-        }
-        if leader_flag {
-            break 'policy (true, None);
-        }
-        if !eligible {
-            break 'policy (false, None);
-        }
-        if let Some(v) = config::use_leader_from_toml_opt(raw_config) {
-            break 'policy (v, (!v).then_some("config"));
-        }
-        #[cfg(feature = "release-dist")]
-        if let Some(remote_val) = _remote_settings.and_then(|s| s.leader_mode) {
-            break 'policy (remote_val, (!remote_val).then_some("remote"));
-        }
-        (false, None)
-    };
-    if let Some(profile) = requested_confinement {
-        return LeaderMode {
-            use_leader: false,
-            policy_disable_reason,
-            disabled_by_confinement: use_leader.then_some(profile),
-        };
-    }
-    LeaderMode {
-        use_leader,
-        policy_disable_reason,
-        disabled_by_confinement: None,
-    }
-}
-/// Leader mode as resolved, plus the sandbox profile that overrode it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LeaderMode<'p> {
-    pub use_leader: bool,
-    /// `Some` only when leader mode is *definitively* off by policy, which is what licenses reclaiming a leftover leader.
-    pub policy_disable_reason: Option<&'static str>,
-    /// The profile that turned leader mode off, set only when leader mode was otherwise on (the case worth telling the user about).
-    pub disabled_by_confinement: Option<&'p str>,
-}
-/// The leader-mode decision alone, for callers with nothing to report.
-///
-/// See [`resolve_leader_mode`] for the precedence chain and the `policy_disable_reason` contract.
-pub fn resolve_use_leader(
-    leader_flag: bool,
-    no_leader_flag: bool,
-    raw_config: &toml::Value,
-    remote_settings: Option<&xai_grok_shell::util::config::RemoteSettings>,
-    eligible: bool,
-    requested_confinement: Option<&str>,
-) -> (bool, Option<&'static str>) {
-    let resolved = resolve_leader_mode(
-        leader_flag,
-        no_leader_flag,
-        raw_config,
-        remote_settings,
-        eligible,
-        requested_confinement,
-    );
-    (resolved.use_leader, resolved.policy_disable_reason)
-}
-/// Tell the user at startup that the sandbox turned leader mode off.
-/// Writes to the dup'd terminal stderr, which survives the TUI's fd-2 redirect (`redirect_native_stderr`).
-/// A fullscreen TUI still paints over it, leaving the line to be read on exit.
-pub fn warn_leader_disabled_by_sandbox(profile: &str) {
-    xai_grok_shell::util::with_locked_stderr(|stderr| {
-        print_leader_disabled_by_sandbox(profile, stderr)
-    });
-}
-/// Says only that the profile was *requested*.
-/// Enforcement can still fail (`apply_sandbox` warns and continues) while the leader is refused either way.
-/// Write errors are dropped; `eprintln!` would panic on a closed stderr.
-fn print_leader_disabled_by_sandbox(profile: &str, w: &mut impl Write) {
-    let _ = writeln!(
-        w,
-        "note: sandbox profile '{profile}' was requested, so leader mode is off for this \
-         session and tool calls stay in this process instead of the shared leader. \
-         Disable the profile at the source that selected it (CLI, env, config, or a \
-         managed requirement) to use the leader."
-    );
-}
-/// Startup proceeds without remote settings (`leader_mode`, announcements)
-/// after this; the fetch keeps running and the agent boot consumes it.
-pub const EARLY_PREFETCH_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// First non-blank value of CLI, then env, then config.
 /// `None` means nothing was set; `acp::initialize` canonicalizes and applies the default.
 fn resolve_hunk_tracker_mode(
@@ -601,24 +497,20 @@ struct ConnectFailure {
 /// Slice the connect wait so a launch-profile escalation can extend the budget
 /// without parking on the original timeout.
 const CONNECT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-/// Bound connect so a hung leader/spawn cannot blank-screen forever.
+/// Bound connect so a hung opencode server cannot blank-screen forever.
 async fn bounded_connect(
     cancel: &CancellationToken,
     timeout: std::time::Duration,
     connect_ui_timeout_env: Option<&str>,
     target: crate::acp::AgentKind,
-    attempt: startup_failure::ConnectAttempt,
     timer: &crate::acp::StartupTimer,
     connect: impl std::future::Future<Output = anyhow::Result<crate::acp::AcpConnection>>,
 ) -> Result<crate::acp::AcpConnection, ConnectFailure> {
     use crate::acp::StartupOutcome;
     let context = || startup_failure::Context {
         target,
-        attempt,
-        version: xai_grok_version::display_version_with_commit(
-            xai_grok_version::full_version(),
-            xai_grok_update::channel_label(),
-        ),
+        // oc-build: opencode backend; plain version string (no update channel).
+        version: xai_grok_version::full_version().to_string(),
         log_path: xai_grok_telemetry::unified_log::path(),
     };
     let started = std::time::Instant::now();
@@ -692,7 +584,6 @@ async fn bounded_connect(
 // oc-build: opencode backend; the opencode shim is the only agent (no xAI login, auth refresh,
 // remote settings, leader mode or update check).
 pub async fn run(args: PagerArgs) -> anyhow::Result<bool> {
-    crate::acp::opencode_shim::set_active();
     let screen_mode_override = screen_mode_relaunch::take_screen_mode_env_override();
     let cancel = CancellationToken::new();
     let startup_start = std::time::Instant::now();
@@ -965,7 +856,6 @@ pub async fn run(args: PagerArgs) -> anyhow::Result<bool> {
         connect_ui_timeout,
         connect_ui_timeout_env.as_deref(),
         connect_target,
-        startup_failure::ConnectAttempt::First,
         &timer,
         crate::acp::opencode_shim::connect(&cancel, connect_flags, opencode),
     )
@@ -1592,10 +1482,6 @@ mod tests {
     fn empty_config() -> toml::Value {
         toml::Value::Table(Default::default())
     }
-    fn config_with_leader(enabled: bool) -> toml::Value {
-        let toml_str = format!("[cli]\nuse_leader = {enabled}");
-        toml::from_str(&toml_str).unwrap()
-    }
     #[test]
     fn terminal_title_strips_control_characters() {
         assert_eq!(
@@ -1642,131 +1528,6 @@ mod tests {
             Some("disabled".to_string()),
         );
     }
-    #[test]
-    fn no_leader_flag_wins_over_leader_flag_and_config() {
-        let cfg = config_with_leader(true);
-        let (use_leader, reason) = resolve_use_leader(true, true, &cfg, None, true, None);
-        assert!(!use_leader);
-        assert_eq!(reason, None);
-    }
-    #[test]
-    fn leader_flag_enables() {
-        let (use_leader, reason) =
-            resolve_use_leader(true, false, &empty_config(), None, true, None);
-        assert!(use_leader);
-        assert_eq!(reason, None);
-    }
-    #[test]
-    fn not_eligible_returns_false() {
-        let cfg = config_with_leader(true);
-        let (use_leader, reason) = resolve_use_leader(false, false, &cfg, None, false, None);
-        assert!(!use_leader);
-        assert_eq!(reason, None);
-    }
-    #[test]
-    fn config_toml_enables() {
-        let cfg = config_with_leader(true);
-        let (use_leader, reason) = resolve_use_leader(false, false, &cfg, None, true, None);
-        assert!(use_leader);
-        assert_eq!(reason, None);
-    }
-    #[test]
-    fn config_toml_disables() {
-        let cfg = config_with_leader(false);
-        let (use_leader, reason) = resolve_use_leader(false, false, &cfg, None, true, None);
-        assert!(!use_leader);
-        assert_eq!(reason, Some("config"));
-    }
-    #[test]
-    fn default_is_false() {
-        let (use_leader, reason) =
-            resolve_use_leader(false, false, &empty_config(), None, true, None);
-        assert!(!use_leader);
-        assert_eq!(reason, None);
-    }
-    #[test]
-    fn cli_flag_overrides_config() {
-        let cfg = config_with_leader(false);
-        let (use_leader, reason) = resolve_use_leader(true, false, &cfg, None, true, None);
-        assert!(use_leader);
-        assert_eq!(reason, None);
-    }
-    #[test]
-    fn sandbox_confinement_refuses_leader_even_with_leader_flag_and_config_on() {
-        let cfg = config_with_leader(true);
-        let (use_leader, reason) =
-            resolve_use_leader(true, false, &cfg, None, true, Some("strict"));
-        assert!(!use_leader);
-        assert_eq!(reason, None);
-    }
-    /// `disabled_by_confinement` across the four leader/sandbox cells, driven by every input that can decide leader mode, not just
-    /// `[cli] use_leader`.
-    #[test]
-    fn matrix_reports_the_profile_only_when_the_sandbox_takes_leader_mode_away() {
-        let on = config_with_leader(true);
-        let off = config_with_leader(false);
-        let sandbox = Some("strict");
-        for (label, leader_flag, cfg) in [
-            ("config on", false, &on),
-            ("--leader", true, &empty_config()),
-            ("--leader over config off", true, &off),
-        ] {
-            let resolved = resolve_leader_mode(leader_flag, false, cfg, None, true, sandbox);
-            assert!(!resolved.use_leader, "{label}: leader must be vetoed");
-            assert_eq!(
-                resolved.disabled_by_confinement,
-                Some("strict"),
-                "{label}: the profile that took leader mode away must be named"
-            );
-        }
-        for (label, cfg, expect_leader) in [("leader on", &on, true), ("leader off", &off, false)] {
-            let resolved = resolve_leader_mode(false, false, cfg, None, true, None);
-            assert_eq!(resolved.use_leader, expect_leader, "{label}");
-            assert_eq!(resolved.disabled_by_confinement, None, "{label}");
-        }
-        for (label, leader_flag, no_leader_flag, cfg, eligible) in [
-            ("config off", false, false, &off, true),
-            ("--no-leader over config on", false, true, &on, true),
-            ("default", false, false, &empty_config(), true),
-            ("ineligible mode with config on", false, false, &on, false),
-        ] {
-            let resolved =
-                resolve_leader_mode(leader_flag, no_leader_flag, cfg, None, eligible, sandbox);
-            assert!(!resolved.use_leader, "{label}");
-            assert_eq!(
-                resolved.disabled_by_confinement, None,
-                "{label}: the sandbox took nothing away, so it must stay silent"
-            );
-        }
-    }
-    #[test]
-    fn sandbox_notice_names_the_profile_without_promising_enforcement() {
-        let mut out = Vec::new();
-        print_leader_disabled_by_sandbox("strict", &mut out);
-        let msg = String::from_utf8(out).expect("utf-8");
-        assert!(msg.contains("'strict'"), "must name the profile: {msg}");
-        assert!(
-            msg.contains("was requested"),
-            "must describe the request, not enforcement: {msg}"
-        );
-        assert!(
-            !msg.contains("is active"),
-            "must not claim the profile is enforced: {msg}"
-        );
-        assert!(
-            msg.contains("Disable the profile at the source"),
-            "must say how to get leader mode back: {msg}"
-        );
-        assert_eq!(msg.lines().count(), 1, "single line: {msg}");
-    }
-    #[test]
-    fn sandbox_confinement_preserves_config_off_reclaim_reason() {
-        let cfg = config_with_leader(false);
-        let (use_leader, reason) =
-            resolve_use_leader(false, false, &cfg, None, true, Some("strict"));
-        assert!(!use_leader);
-        assert_eq!(reason, Some("config"));
-    }
     fn try_parse_pager(args: &[&str]) -> Result<PagerArgs, clap::Error> {
         use clap::Parser;
         PagerArgs::try_parse_from(args)
@@ -1795,68 +1556,6 @@ mod tests {
         let args = try_parse_pager(&["grok-pager", "--memory-flush"]).unwrap();
         assert!(args.memory_flush);
         assert!(!try_parse_pager(&["grok-pager"]).unwrap().memory_flush);
-    }
-    #[test]
-    fn no_leader_flag_overrides_config_for_tui_fallback() {
-        let cfg = config_with_leader(true);
-        let (use_leader, reason) = resolve_use_leader(false, true, &cfg, None, true, None);
-        assert!(!use_leader);
-        assert_eq!(reason, None);
-    }
-    #[test]
-    fn remote_settings_none_falls_through_to_default() {
-        let (use_leader, reason) =
-            resolve_use_leader(false, false, &empty_config(), None, true, None);
-        assert!(!use_leader);
-        assert_eq!(reason, None);
-    }
-    #[cfg(feature = "release-dist")]
-    #[test]
-    fn remote_settings_leader_mode_true_enables_leader() {
-        let rs = xai_grok_shell::util::config::RemoteSettings {
-            leader_mode: Some(true),
-            ..Default::default()
-        };
-        let (use_leader, reason) =
-            resolve_use_leader(false, false, &empty_config(), Some(&rs), true, None);
-        assert!(use_leader);
-        assert_eq!(reason, None);
-    }
-    #[cfg(feature = "release-dist")]
-    #[test]
-    fn remote_settings_leader_mode_false_disables_leader() {
-        let rs = xai_grok_shell::util::config::RemoteSettings {
-            leader_mode: Some(false),
-            ..Default::default()
-        };
-        let (use_leader, reason) =
-            resolve_use_leader(false, false, &empty_config(), Some(&rs), true, None);
-        assert!(!use_leader);
-        assert_eq!(reason, Some("remote"));
-    }
-    #[cfg(feature = "release-dist")]
-    #[test]
-    fn remote_settings_unknown_leader_mode_is_not_policy_disable() {
-        let rs = xai_grok_shell::util::config::RemoteSettings {
-            leader_mode: None,
-            ..Default::default()
-        };
-        let (use_leader, reason) =
-            resolve_use_leader(false, false, &empty_config(), Some(&rs), true, None);
-        assert!(!use_leader);
-        assert_eq!(reason, None);
-    }
-    #[cfg(feature = "release-dist")]
-    #[test]
-    fn config_toml_overrides_remote_settings() {
-        let rs = xai_grok_shell::util::config::RemoteSettings {
-            leader_mode: Some(true),
-            ..Default::default()
-        };
-        let cfg = config_with_leader(false);
-        let (use_leader, reason) = resolve_use_leader(false, false, &cfg, Some(&rs), true, None);
-        assert!(!use_leader);
-        assert_eq!(reason, Some("config"));
     }
     #[test]
     fn cli_resume_parses_session_id() {
@@ -1983,19 +1682,6 @@ mod tests {
         assert!(try_parse_pager(&["grok-pager", "--local-workspace-attach=srv"]).is_err());
         assert!(try_parse_pager(&["grok-pager", "--local-workspace"]).is_err());
         assert!(try_parse_pager(&["grok-pager", "--local-workspace-cwd=/tmp"]).is_err());
-    }
-    #[test]
-    fn chat_mode_leader_guard_truth_table() {
-        assert!(session_startup::chat_mode_conflicts_with_leader(true, true));
-        assert!(!session_startup::chat_mode_conflicts_with_leader(
-            true, false
-        ));
-        assert!(!session_startup::chat_mode_conflicts_with_leader(
-            false, true
-        ));
-        assert!(!session_startup::chat_mode_conflicts_with_leader(
-            false, false
-        ));
     }
     #[test]
     fn cli_worktree_flag_parses() {
@@ -2233,7 +1919,6 @@ mod tests {
         print_exit_resume_hint(&bare_exit_info("sess-abc", true), 80, &mut w);
         print_exit_resume_hint(&full_exit_info("sess-abc"), 80, &mut w);
         print_relaunch_failure_hint(&"exec failed", "sess-xyz", true, &mut w);
-        print_leader_disabled_by_sandbox("strict", &mut w);
     }
     /// Close the *read* end so writes on the write end get EPIPE.
     /// SIGPIPE is SIG_IGN, so the write returns BrokenPipe instead of killing the process.
@@ -2252,6 +1937,5 @@ mod tests {
         print_exit_resume_hint(&bare_exit_info("pipe-sid", true), 80, &mut writer);
         print_exit_resume_hint(&full_exit_info("pipe-sid"), 80, &mut writer);
         print_relaunch_failure_hint(&"exec failed", "pipe-sid", false, &mut writer);
-        print_leader_disabled_by_sandbox("strict", &mut writer);
     }
 }

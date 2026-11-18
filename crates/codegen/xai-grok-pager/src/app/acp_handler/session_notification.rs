@@ -656,8 +656,6 @@ pub(super) fn handle_session_notification_with_origin(
                 let mut child_view = AgentView::new(child_session, child_scrollback);
                 child_view.set_input_mode(InputMode::Vim);
                 child_view.set_sharing_enabled(agent.sharing_enabled);
-                child_view.set_billing_surface_visible(agent.billing_surface_visible);
-                child_view.set_usage_command_visible(agent.usage_command_visible);
                 child_view.set_has_session_announcements(
                     agent.prompt.slash_controller.has_session_announcements(),
                 );
@@ -679,12 +677,6 @@ pub(super) fn handle_session_notification_with_origin(
                     .get("voice")
                     .is_some();
                 child_view.set_voice_mode_available(voice_visible);
-                let restricted = agent
-                    .prompt
-                    .slash_controller
-                    .registry()
-                    .restricted_commands();
-                child_view.set_restricted_commands(&restricted);
                 let link = crate::app::agent_view::ChildLink::unaddressable(acp::SessionId::new(
                     parent_session_id,
                 ));
@@ -949,25 +941,8 @@ pub(super) fn handle_session_notification_with_origin(
             }
             redraw
         }
-        XaiSessionUpdate::HooksChanged {
-            hooks,
-            project_trusted,
-            load_errors,
-        } => {
-            if let Some(ref mut modal) = agent.extensions_modal {
-                use crate::views::extensions_modal::TabDataState;
-                modal.seed_hook_groups_once(&hooks);
-                modal.hooks_data =
-                    TabDataState::Loaded(xai_hooks_plugins_types::HooksListResponse {
-                        hooks,
-                        project_trusted,
-                        load_errors,
-                    });
-                true
-            } else {
-                false
-            }
-        }
+        // oc-build: opencode backend; the Extensions modal has no Hooks tab.
+        XaiSessionUpdate::HooksChanged { .. } => false,
         XaiSessionUpdate::PluginsChanged { plugins } => {
             if let Some(ref mut modal) = agent.extensions_modal {
                 use crate::views::extensions_modal::TabDataState;
@@ -1882,7 +1857,8 @@ pub(super) fn apply_retry_state(
                     },
                 );
             }
-            is_credit_limit = super::super::dispatch::is_credit_limit_error(None, reason);
+            // oc-build: opencode backend; no xAI credit limit.
+            is_credit_limit = false;
             let is_free_usage = *rate_limited
                 && xai_grok_shell::sampling::error::is_free_usage_exhausted_error(reason);
             if is_credit_limit {
@@ -1916,7 +1892,7 @@ pub(super) fn apply_retry_state(
             if wire == crate::app::error_display::WireErrorType::EncryptedContentMismatch {
                 session.model_incompatible = true;
             }
-            is_credit_limit = super::super::dispatch::is_credit_limit_error(None, message);
+            is_credit_limit = false;
             if is_credit_limit {
                 session.credit_limit_blocked = true;
             } else if is_reauthable_failure(Some(error_type.as_str()), message) {

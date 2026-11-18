@@ -309,14 +309,6 @@ impl PagerArgs {
 /// User-facing refusal when process-wide `--chat` would open a local Build disk row.
 pub const CHAT_MODE_LOCAL_BUILD_REFUSAL: &str = "cannot open a local Build session while --chat is active; \
 resume a conversation or start a new chat (/chat)";
-/// User-facing error when `--chat` is combined with leader mode.
-pub const CHAT_MODE_LEADER_CONFLICT: &str = "gateway chat mode (--chat) cannot run with leader mode; \
-pass --no-leader or disable [cli] use_leader in config";
-/// Startup guard used by TUI `run` (and unit-tested): sticky `--chat` + leader is invalid.
-#[inline]
-pub fn chat_mode_conflicts_with_leader(chat: bool, use_leader: bool) -> bool {
-    chat && use_leader
-}
 /// User-facing error for `--fork-session` with `--chat` (forking is a Build disk concept; chat sessions have no local copy to fork).
 pub const CHAT_MODE_FORK_CONFLICT: &str = "--fork-session is not supported with --chat";
 /// User-facing error for `--restore-code` with `--chat` (code restore is a Build and worktree concept; chat sessions carry no codebase).
@@ -1896,10 +1888,7 @@ mod tests {
     }
     #[test]
     fn remote_restore_follows_compiled_restore_stack() {
-        assert_eq!(
-            MaterializeCtx::from_pager_args(&parse(&["grok"])).allow_remote_restore,
-            false
-        );
+        assert!(!MaterializeCtx::from_pager_args(&parse(&["grok"])).allow_remote_restore);
     }
     #[test]
     fn from_pager_args_does_not_probe_tty_for_progress() {

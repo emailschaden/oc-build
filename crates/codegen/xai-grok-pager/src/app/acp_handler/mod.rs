@@ -110,10 +110,7 @@ use session_notification::{
 #[cfg(test)]
 #[allow(unused_imports)]
 use settings::*;
-use settings::{
-    handle_announcements_update, handle_models_update, handle_sessions_changed,
-    handle_settings_update,
-};
+use settings::{handle_announcements_update, handle_models_update};
 pub(crate) use subagent_activity::finalize_killed_subagent;
 #[cfg(test)]
 #[allow(unused_imports)]
@@ -204,7 +201,6 @@ fn handle_inner(msg: AcpClientMessage, app: &mut AppView) -> bool {
                         }
                     }
                     let mut plan_mode_modal_refresh_needed = false;
-                    let mut workflows_modal_refresh = false;
                     let mutated = if dedup_drop {
                         tracing::debug!(
                             session_id = notif.request.session_id.0.as_ref(),
@@ -359,15 +355,11 @@ fn handle_inner(msg: AcpClientMessage, app: &mut AppView) -> bool {
                             note_first_turn_activity(agent);
                         }
                         if let Some(commands) = agent.session.tracker.take_pending_acp_commands() {
-                            let workflows_changed = workflow_commands(&commands)
-                                != workflow_commands(&agent.session.available_commands);
                             agent.session.replace_available_commands(
                                 commands,
                                 CommandCatalogSource::SessionUpdate,
                             );
                             refresh_workflow_run_capabilities(agent);
-                            workflows_modal_refresh =
-                                workflows_changed && agent.extensions_modal.is_some();
                         }
                         if let Some(tools) = agent.session.tracker.take_pending_acp_tools() {
                             agent.session.available_tools = Some(tools.into_iter().collect());
@@ -393,9 +385,6 @@ fn handle_inner(msg: AcpClientMessage, app: &mut AppView) -> bool {
                     };
                     if plan_mode_modal_refresh_needed {
                         crate::app::dispatch::refresh_open_settings_modals(app);
-                    }
-                    if workflows_modal_refresh {
-                        queue_open_workflows_modal_refresh(app, id);
                     }
                     if mutated
                         && !meta.is_replay
@@ -546,23 +535,6 @@ pub(super) fn note_first_turn_activity(agent: &mut AgentView) {
         );
     }
 }
-fn workflow_commands(
-    commands: &[acp::AvailableCommand],
-) -> Vec<(&str, &str, Option<&str>, Option<&str>)> {
-    commands
-        .iter()
-        .filter_map(|command| {
-            let meta = command.meta.as_ref()?;
-            let source = meta.get("workflowSource")?.as_str();
-            Some((
-                command.name.as_str(),
-                command.description.as_str(),
-                source,
-                meta.get("workflowPath").and_then(serde_json::Value::as_str),
-            ))
-        })
-        .collect()
-}
 pub(super) fn is_builtin_workflow_handle(
     commands: &[acp::AvailableCommand],
     display_name: &str,
@@ -596,30 +568,6 @@ pub(crate) fn refresh_workflow_run_capabilities(agent: &mut AgentView) {
         run.builtin = is_builtin_workflow_handle(&agent.session.available_commands, &run.name);
     }
 }
-fn queue_open_workflows_modal_refresh(app: &mut AppView, agent_id: AgentId) {
-    let Some(session_id) = app
-        .agents
-        .get(&agent_id)
-        .and_then(|agent| agent.session.session_id.clone())
-    else {
-        return;
-    };
-    let already_pending = app.pending_effects.iter().any(|effect| {
-        matches!(
-            effect,
-            Effect::FetchWorkflowsList {
-                agent_id: pending_id,
-                ..
-            } if *pending_id == agent_id
-        )
-    });
-    if !already_pending {
-        app.pending_effects.push(Effect::FetchWorkflowsList {
-            agent_id,
-            session_id,
-        });
-    }
-}
 fn handle_ext_notification(notif: &acp::ExtNotification, app: &mut AppView) -> bool {
     let method = notif.method.as_ref();
     if crate::acp::is_session_update_ext_method(method) {
@@ -630,8 +578,8 @@ fn handle_ext_notification(notif: &acp::ExtNotification, app: &mut AppView) -> b
         "x.ai/task_backgrounded" => handle_task_backgrounded(notif, app),
         "x.ai/task_completed" => handle_task_completed(notif, app),
         "x.ai/models/update" => handle_models_update(notif, app),
-        "x.ai/settings/update" => handle_settings_update(notif, app),
-        "x.ai/sessions/changed" => handle_sessions_changed(notif, app),
+        // oc-build: opencode backend; `x.ai/settings/update` (xAI remote settings) and the
+        // leader's `x.ai/sessions/changed` roster broadcast are gone.
         "x.ai/queue/changed" => handle_queue_changed(notif, app),
         "x.ai/session/prompt_complete" => handle_prompt_complete(notif, app),
         "x.ai/session/interjection" => handle_interjection(notif, app),
@@ -641,7 +589,6 @@ fn handle_ext_notification(notif: &acp::ExtNotification, app: &mut AppView) -> b
         "x.ai/scheduled_task_deleted" => handle_scheduled_task_deleted(notif, app),
         "x.ai/announcements/update" => handle_announcements_update(notif, app),
         "x.ai/git_head_changed" => handle_git_head_changed(notif, app),
-        "x.ai/leader/version_mismatch" => handle_version_mismatch(notif, app),
         "x.ai/mcp/init_progress" => handle_mcp_init_progress(notif, app),
         "x.ai/session/setup" => handle_session_setup_phase(notif, app),
         "x.ai/mcp/tools_changed" | "x.ai/mcp_initialized" => handle_mcp_tools_changed(notif, app),
@@ -684,14 +631,6 @@ fn handle_session_setup_phase(notif: &acp::ExtNotification, app: &mut AppView) -
     };
     agent.session_new_phase = Some(phase);
     false
-}
-fn handle_version_mismatch(notif: &acp::ExtNotification, app: &mut AppView) -> bool {
-    let Some(banner) = crate::acp::version_mismatch_banner(notif.params.get()) else {
-        tracing::warn!("ignoring x.ai/leader/version_mismatch without usable versions");
-        return false;
-    };
-    app.show_toast(&banner);
-    true
 }
 fn user_message_text(update: &acp::SessionUpdate) -> Option<&str> {
     let acp::SessionUpdate::UserMessageChunk(chunk) = update else {

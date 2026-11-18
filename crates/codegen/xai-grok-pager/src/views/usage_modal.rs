@@ -18,7 +18,6 @@ use crate::views::drag_select::{
 
 use crate::scrollback::blocks::ContextInfoBlock;
 use crate::theme::Theme;
-use crate::views::credit_bar::CreditBalance;
 use crate::views::modal_window::{
     self as mw, ModalSizing, ModalWindowConfig, ModalWindowState, Shortcut,
 };
@@ -47,7 +46,8 @@ impl UsageInfoTab {
     pub fn label(self) -> &'static str {
         match self {
             UsageInfoTab::ContextUsage => "Context usage",
-            UsageInfoTab::UsageLimit => "Usage limit",
+            // oc-build: opencode backend; session totals only, no xAI account allowance.
+            UsageInfoTab::UsageLimit => "Session usage",
             UsageInfoTab::SessionInfo => "Session info",
         }
     }
@@ -68,18 +68,9 @@ impl UsageInfoTab {
 pub struct UsageInfoContext {
     /// Session ID for the copy shortcut (`None` before the session starts).
     pub session_id: Option<String>,
-    /// False for team/enterprise accounts, which have no consumer billing.
-    pub usage_visible: bool,
-    /// True for gateway chat sessions, which have no Build coding credits.
-    pub chat_kind: bool,
-    /// Remote-settings kill switch: link out instead of showing billing.
-    pub billing_redirect_url: Option<String>,
-    /// Plan name for the allowance header (e.g. "SuperGrok").
-    pub subscription_tier: Option<String>,
 }
 
-/// Modal state. Billing figures are NOT stored here.
-/// The render reads the agent's cached `credit_balance` mirror, so a silent billing refresh updates the open modal for free.
+/// Modal state.
 pub struct UsageInfoModalState {
     pub window: ModalWindowState,
     pub active_tab: UsageInfoTab,
@@ -92,8 +83,6 @@ pub struct UsageInfoModalState {
     pub session_error: Option<String>,
     /// Pre-formatted session token/cost summary (`session_usage_block_text`).
     pub session_usage_text: Option<String>,
-    pub billing_loading: bool,
-    pub billing_error: Option<String>,
     /// Fetch generation stamped at open; results from an earlier open (same session, modal reopened) are dropped instead of overwriting.
     pub fetch_nonce: u64,
     /// Hit rects for copyable value rows, refreshed every render.
@@ -146,8 +135,6 @@ impl UsageInfoModalState {
             context_error: None,
             session_error: None,
             session_usage_text: None,
-            billing_loading: false,
-            billing_error: None,
             fetch_nonce: Default::default(),
             session_fields: None,
             copy_hits: Vec::new(),
@@ -538,7 +525,6 @@ pub fn render_usage_modal(
     buf: &mut Buffer,
     area: Rect,
     state: &mut UsageInfoModalState,
-    balance: Option<&CreditBalance>,
     compact: bool,
     theme: &Theme,
 ) {
@@ -623,7 +609,7 @@ pub fn render_usage_modal(
         return;
     };
     let content = mca.content;
-    let tab = tab_content(state, balance, theme, content.width);
+    let tab = tab_content(state, theme, content.width);
     state.content_rect = content;
     let plain_lines: Vec<String> = tab.lines.iter().map(ToString::to_string).collect();
     // Endpoints index these strings; drop any gesture if the painted text changed.
@@ -703,19 +689,12 @@ impl TabContent {
     }
 }
 
-fn tab_content(
-    state: &UsageInfoModalState,
-    balance: Option<&CreditBalance>,
-    theme: &Theme,
-    width: u16,
-) -> TabContent {
+fn tab_content(state: &UsageInfoModalState, theme: &Theme, width: u16) -> TabContent {
     match state.active_tab {
         UsageInfoTab::ContextUsage => {
             TabContent::from_lines(context_tab_lines(state, theme, width))
         }
-        UsageInfoTab::UsageLimit => {
-            TabContent::from_lines(usage_limit_lines(state, balance, theme))
-        }
+        UsageInfoTab::UsageLimit => TabContent::from_lines(usage_limit_lines(state, theme)),
         UsageInfoTab::SessionInfo => session_info_content(state, theme),
     }
 }
@@ -750,30 +729,9 @@ fn context_tab_lines(state: &UsageInfoModalState, theme: &Theme, width: u16) -> 
     vec![muted_line(theme, "Loading context usage\u{2026}")]
 }
 
-/// Account allowance followed by this session's token/cost totals.
-fn usage_limit_lines(
-    state: &UsageInfoModalState,
-    balance: Option<&CreditBalance>,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
+/// This session's token/cost totals.
+fn usage_limit_lines(state: &UsageInfoModalState, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-
-    if state.ctx.chat_kind {
-        // Gateway chat sessions have no Build coding credits to show.
-    } else if !state.ctx.usage_visible {
-        lines.push(muted_line(theme, "Usage limits are managed by your team."));
-    } else if let Some(url) = &state.ctx.billing_redirect_url {
-        lines.push(plain(theme, format!("Please check your usage on {url}")));
-    } else if let Some(bal) = balance {
-        lines.extend(allowance_lines(state, bal, theme));
-    } else if let Some(error) = &state.billing_error {
-        lines.push(muted_line(theme, format!("Couldn't load usage: {error}")));
-    } else if state.billing_loading {
-        lines.push(muted_line(theme, "Loading usage\u{2026}"));
-    } else {
-        lines.push(muted_line(theme, "No billing data available."));
-    }
-
     if let Some(usage_text) = &state.session_usage_text {
         if !lines.is_empty() {
             lines.push(Line::default());
@@ -790,67 +748,6 @@ fn usage_limit_lines(
             lines.push(Line::default());
         }
         lines.push(muted_line(theme, "Loading session usage\u{2026}"));
-    }
-    lines
-}
-
-fn allowance_lines(
-    state: &UsageInfoModalState,
-    bal: &CreditBalance,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    // "Weekly limit", "Monthly limit", or "Usage", plus the plan name
-    let header = match &state.ctx.subscription_tier {
-        Some(tier) => format!("{} ({tier})", bal.usage_label()),
-        None => bal.usage_label().to_string(),
-    };
-    lines.push(Line::styled(header, header_style(theme)));
-    lines.push(Line::default());
-
-    const BAR_WIDTH: usize = 30;
-    let pct = bal.usage_pct.clamp(0.0, 100.0);
-    let filled = (((pct / 100.0) * BAR_WIDTH as f64).round() as usize).min(BAR_WIDTH);
-    lines.push(Line::from(vec![
-        Span::styled(
-            "\u{2588}".repeat(filled),
-            Style::default().fg(theme.gray_bright),
-        ),
-        Span::styled(
-            "\u{2591}".repeat(BAR_WIDTH - filled),
-            Style::default().fg(theme.gray_dim),
-        ),
-        // Floored to match the backend's truncation.
-        Span::styled(
-            format!("  {}%", bal.usage_pct.floor() as i64),
-            Style::default().fg(theme.text_primary),
-        ),
-    ]));
-
-    if let Some(reset) = &bal.period_end_display {
-        lines.push(muted_line(theme, format!("Resets: {reset}")));
-    }
-
-    // Prepaid credits (stored as negative cents, an accounting convention)
-    if let Some(prepaid) = bal.prepaid_balance_cents.map(i64::abs).filter(|c| *c > 0) {
-        lines.push(Line::default());
-        lines.push(plain(
-            theme,
-            format!("Credits: ${:.2}", prepaid as f64 / 100.0),
-        ));
-    }
-
-    // Legacy on-demand (pay-as-you-go) billing.
-    if bal.pay_as_you_go {
-        let used = bal.on_demand_used_cents.unwrap_or(0).abs() as f64 / 100.0;
-        let cap = bal.on_demand_cap_cents.unwrap_or(0).abs() as f64 / 100.0;
-        lines.push(Line::default());
-        lines.push(Line::styled("Pay as you go: Enabled", header_style(theme)));
-        lines.push(muted_line(
-            theme,
-            format!("Usage: ${used:.2} / ${cap:.2} per month"),
-        ));
     }
     lines
 }
@@ -958,10 +855,6 @@ mod tests {
             UsageInfoTab::UsageLimit,
             UsageInfoContext {
                 session_id: Some("sid-123".to_string()),
-                usage_visible: true,
-                chat_kind: false,
-                billing_redirect_url: None,
-                subscription_tier: Some("SuperGrok".to_string()),
             },
         )
     }
@@ -997,89 +890,13 @@ mod tests {
     }
 
     #[test]
-    fn usage_limit_tab_shows_allowance_and_payg() {
-        let state = state_with_session();
-        let bal = CreditBalance {
-            usage_pct: 50.67,
-            effective_usage_pct: 50.67,
-            period_end_display: Some("May 29, 00:00".to_string()),
-            pay_as_you_go: true,
-            on_demand_cap_cents: Some(10_000),
-            on_demand_used_cents: Some(0),
-            prepaid_balance_cents: None,
-            period_type: Some("USAGE_PERIOD_TYPE_WEEKLY".to_string()),
-            is_unified_billing_user: None,
-        };
-        let theme = Theme::current();
-        let lines = usage_limit_lines(&state, Some(&bal), &theme);
-        let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
-        assert_eq!(
-            text.first().map(String::as_str),
-            Some("Weekly limit (SuperGrok)")
-        );
-        assert!(
-            text.get(2).is_some_and(|l| l.ends_with("50%")),
-            "bar row: {:?}",
-            text.get(2)
-        );
-        assert!(text.iter().any(|l| l.contains("Resets: May 29, 00:00")));
-        assert!(text.iter().any(|l| l == "Pay as you go: Enabled"));
-        assert!(
-            text.iter().any(|l| l == "Usage: $0.00 / $100.00 per month"),
-            "{text:?}"
-        );
-        assert!(
-            !text.iter().any(|l| l.to_lowercase().contains("top")),
-            "no auto top-up surface: {text:?}"
-        );
-    }
-
-    #[test]
-    fn usage_limit_tab_states() {
-        let theme = Theme::current();
-        let mut state = state_with_session();
-        state.billing_loading = true;
-        let lines = usage_limit_lines(&state, None, &theme);
-        assert!(
-            lines
-                .first()
-                .is_some_and(|l| l.to_string().contains("Loading usage"))
-        );
-
-        state.ctx.billing_redirect_url = Some("https://x.example/usage".to_string());
-        let lines = usage_limit_lines(&state, None, &theme);
-        assert!(
-            lines
-                .first()
-                .is_some_and(|l| l.to_string().contains("https://x.example/usage"))
-        );
-
-        state.ctx.usage_visible = false;
-        let lines = usage_limit_lines(&state, None, &theme);
-        assert!(
-            lines
-                .first()
-                .is_some_and(|l| l.to_string().contains("managed by your team"))
-        );
-
-        // Gateway chat sessions show no billing at all
-        state.ctx.chat_kind = true;
-        let lines = usage_limit_lines(&state, None, &theme);
-        assert!(
-            lines
-                .first()
-                .is_some_and(|l| l.to_string().contains("Loading session usage"))
-        );
-    }
-
-    #[test]
     fn render_smoke_shows_tabs_and_copy_shortcut() {
         let area = Rect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
         let mut state = state_with_session();
         state.session_usage_text = Some("Session usage: no model calls yet.".to_string());
         let theme = Theme::current();
-        render_usage_modal(&mut buf, area, &mut state, None, false, &theme);
+        render_usage_modal(&mut buf, area, &mut state, false, &theme);
         let text: String = (0..area.height)
             .map(|y| {
                 (0..area.width)
@@ -1090,7 +907,7 @@ mod tests {
             .collect();
         for needle in [
             "Context usage",
-            "Usage limit",
+            "Session usage",
             "Session info",
             "copy session ID",
             "Session usage: no model calls yet.",
@@ -1119,7 +936,7 @@ mod tests {
             Some("Session ID: sid-123\nModel Hash: fp-abc\nTurn: 3")
         );
         let theme = Theme::current();
-        render_usage_modal(&mut buf, area, &mut state, None, false, &theme);
+        render_usage_modal(&mut buf, area, &mut state, false, &theme);
         let text: String = (0..area.height)
             .map(|y| {
                 (0..area.width)
@@ -1160,7 +977,7 @@ mod tests {
             field("Session ID", "sid-123", false),
             field("Model Hash", "fp-abc", true),
         ]);
-        render_usage_modal(&mut buf, area, &mut state, None, false, &Theme::current());
+        render_usage_modal(&mut buf, area, &mut state, false, &Theme::current());
         let values: Vec<&str> = state.copy_hits.iter().map(|h| h.value.as_str()).collect();
         assert_eq!(values, ["sid-123", "Model Hash: fp-abc"]);
         let hit = state
@@ -1197,7 +1014,7 @@ mod tests {
         state.set_tab(UsageInfoTab::SessionInfo);
         state.session_fields = Some(vec![field("Model Hash", "fp-abc", true)]);
         let theme = Theme::current();
-        render_usage_modal(&mut buf, area, &mut state, None, false, &theme);
+        render_usage_modal(&mut buf, area, &mut state, false, &theme);
 
         let line_idx = state
             .plain_lines
@@ -1227,7 +1044,7 @@ mod tests {
             UsageModalOutcome::Changed
         );
 
-        render_usage_modal(&mut buf, area, &mut state, None, false, &theme);
+        render_usage_modal(&mut buf, area, &mut state, false, &theme);
         let Some(cell) = buf.cell((x0, y)) else {
             panic!("cell ({x0},{y}) missing");
         };
@@ -1253,7 +1070,7 @@ mod tests {
         let mut state = state_with_session();
         state.set_tab(UsageInfoTab::SessionInfo);
         state.session_fields = Some(vec![field("Title", "t", false)]);
-        render_usage_modal(&mut buf, area, &mut state, None, false, &Theme::current());
+        render_usage_modal(&mut buf, area, &mut state, false, &Theme::current());
 
         let blank = state
             .plain_lines
@@ -1297,7 +1114,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         let mut state = state_with_session();
         state.set_tab(UsageInfoTab::SessionInfo);
-        render_usage_modal(&mut buf, area, &mut state, None, false, &Theme::current());
+        render_usage_modal(&mut buf, area, &mut state, false, &Theme::current());
         let rect = state.content_rect;
         assert_eq!(
             handle_usage_modal_mouse(
@@ -1309,7 +1126,7 @@ mod tests {
             UsageModalOutcome::Changed
         );
         state.session_fields = Some(vec![field("Title", "t", false)]);
-        render_usage_modal(&mut buf, area, &mut state, None, false, &Theme::current());
+        render_usage_modal(&mut buf, area, &mut state, false, &Theme::current());
         assert_eq!(
             handle_usage_modal_mouse(
                 &mut state,
@@ -1328,7 +1145,7 @@ mod tests {
         let mut state = state_with_session();
         state.set_tab(UsageInfoTab::SessionInfo);
         state.session_fields = Some(vec![field("Model Hash", "fp-abc", true)]);
-        render_usage_modal(&mut buf, area, &mut state, None, false, &Theme::current());
+        render_usage_modal(&mut buf, area, &mut state, false, &Theme::current());
         let Some(hit) = state.copy_hits.first().cloned() else {
             panic!("expected a copy hit: {:?}", state.copy_hits);
         };
@@ -1369,7 +1186,7 @@ mod tests {
         let mut state = state_with_session();
         state.set_tab(UsageInfoTab::SessionInfo);
         state.session_fields = Some(vec![field("Model Hash", "fp-abc", true)]);
-        render_usage_modal(&mut buf, area, &mut state, None, false, &Theme::current());
+        render_usage_modal(&mut buf, area, &mut state, false, &Theme::current());
         let Some(hit) = state.copy_hits.first().cloned() else {
             panic!("expected a copy hit: {:?}", state.copy_hits);
         };
@@ -1402,7 +1219,7 @@ mod tests {
         let mut state = state_with_session();
         state.set_tab(UsageInfoTab::SessionInfo);
         state.session_fields = Some(vec![field("Session ID", "sid-123", false)]);
-        render_usage_modal(&mut buf, area, &mut state, None, false, &Theme::current());
+        render_usage_modal(&mut buf, area, &mut state, false, &Theme::current());
         let rect = state.content_rect;
         assert!(rect.width > 0 && rect.height > 0);
         assert_eq!(
@@ -1443,7 +1260,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         let mut state = state_with_session();
         let theme = Theme::current();
-        render_usage_modal(&mut buf, area, &mut state, None, false, &theme);
+        render_usage_modal(&mut buf, area, &mut state, false, &theme);
         let popup = state.window.popup_area.expect("popup rendered");
         assert_eq!(popup.height, 30);
         // Still vertically centered.

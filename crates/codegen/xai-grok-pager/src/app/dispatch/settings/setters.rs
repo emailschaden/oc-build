@@ -1718,8 +1718,7 @@ fn save_default_model_toast(value: &str) -> String {
     format!("\u{2713} Default model: {value}")
 }
 
-/// Outer dispatcher for `Action::SetDefaultModel`. Switches and persists and toasts.
-/// `PersistSetting` is emitted first for consistent rollback; `SwitchModel` second.
+/// Outer dispatcher for `Action::SetDefaultModel`. Switches and toasts (nothing is persisted).
 /// Idempotent: when the same model is already active, this is a no-op.
 pub(in crate::app::dispatch) fn set_default_model(
     app: &mut AppView,
@@ -1780,22 +1779,8 @@ pub(in crate::app::dispatch) fn set_default_model(
     );
     app.show_toast(&save_default_model_toast(&new_display));
 
-    // Persist the **model ID** (catalog key), not the display name.
-    // would silently fail to resolve on the next startup.
-    // slugs that must not become the global Build `default_model`.
+    // oc-build: opencode backend; opencode model ids are never saved to ~/.grok/config.toml.
     let mut effects: Vec<Effect> = Vec::new();
-    if !xai_grok_shell::agent::chat_modes::process_chat_mode_enabled() {
-        let new_id_str = new_id.0.to_string();
-        let prev_id_str = prev_id
-            .as_ref()
-            .map(|id| id.0.to_string())
-            .unwrap_or_default();
-        effects.push(Effect::PersistSetting {
-            key: "default_model",
-            value: crate::settings::SettingValue::String(new_id_str),
-            rollback_value: crate::settings::SettingValue::String(prev_id_str),
-        });
-    }
 
     // Best-effort session-level switch
     // The `Effect::SwitchModel` pipeline handles its own deferred switch when no session id exists yet (see line 583 of this file)
@@ -1823,7 +1808,7 @@ pub(in crate::app::dispatch) fn set_default_model(
 }
 
 /// Clear the default model override.
-/// Persists `[models].default = None`; does NOT mutate the active session's current model.
+/// Nothing is persisted; does NOT mutate the active session's current model.
 pub(in crate::app::dispatch) fn clear_default_model(app: &mut AppView) -> Vec<Effect> {
     // Active-agent snapshot: the previous model ID for the rollback payload
     // Use the model ID (catalog key), not the display name, so that rollback persists a value `resolve_default_model` can match
@@ -1853,11 +1838,7 @@ pub(in crate::app::dispatch) fn clear_default_model(app: &mut AppView) -> Vec<Ef
              persist proceeds to ensure disk state matches user intent)",
         );
         app.show_toast("\u{2713} Default model: cleared");
-        return vec![Effect::PersistSetting {
-            key: "default_model",
-            value: crate::settings::SettingValue::String(String::new()),
-            rollback_value: crate::settings::SettingValue::String(String::new()),
-        }];
+        return vec![];
     }
 
     tracing::info!(
@@ -1869,11 +1850,7 @@ pub(in crate::app::dispatch) fn clear_default_model(app: &mut AppView) -> Vec<Ef
     );
     refresh_open_settings_modals(app);
     app.show_toast("\u{2713} Default model: cleared");
-    vec![Effect::PersistSetting {
-        key: "default_model",
-        value: crate::settings::SettingValue::String(String::new()),
-        rollback_value: crate::settings::SettingValue::String(prev_id_str),
-    }]
+    vec![]
 }
 
 // Model-family settings: fork_secondary_model (and formerly web_search_model, session_summary_model, default_reasoning_effort)
@@ -1893,7 +1870,7 @@ fn save_fork_secondary_model_toast(value: &str) -> String {
     format!("\u{2713} Fork secondary model: {value}")
 }
 
-/// Outer dispatcher for `Action::SetForkSecondaryModel`: mirror, persist, and toast.
+/// Outer dispatcher for `Action::SetForkSecondaryModel`: mirror and toast (nothing is persisted).
 /// Idempotent: the same id is a no-op.
 pub(in crate::app::dispatch) fn set_fork_secondary_model(
     app: &mut AppView,
@@ -1950,11 +1927,8 @@ pub(in crate::app::dispatch) fn set_fork_secondary_model(
         "setting changed",
     );
     app.show_toast(&save_fork_secondary_model_toast(&new_display));
-    vec![Effect::PersistSetting {
-        key: "fork_secondary_model",
-        value: crate::settings::SettingValue::String(new_id_str),
-        rollback_value: crate::settings::SettingValue::String(prev_id_str),
-    }]
+    // oc-build: opencode backend; opencode model ids are never saved to ~/.grok/config.toml.
+    vec![]
 }
 
 /// Outer dispatcher for `Action::ClearForkSecondaryModel`.
@@ -1977,12 +1951,7 @@ pub(in crate::app::dispatch) fn clear_fork_secondary_model(app: &mut AppView) ->
     set_fork_secondary_model_inner(app, baseline);
     refresh_open_settings_modals(app);
     app.show_toast("\u{2713} Fork secondary model: cleared");
-    vec![Effect::PersistSetting {
-        key: "fork_secondary_model",
-        // Persist payload is the empty sentinel: the shell helper interprets empty as "restore the baseline default", the same contract as `default_model`
-        value: crate::settings::SettingValue::String(String::new()),
-        rollback_value: crate::settings::SettingValue::String(prev_id_str),
-    }]
+    vec![]
 }
 
 // The `web_search_model`, `session_summary_model`, and `default_reasoning_effort` setters were removed alongside their registry entries
@@ -2035,17 +2004,16 @@ pub(in crate::app::dispatch) fn set_max_thoughts_width(app: &mut AppView, new: i
 // The `auto_compact_threshold_percent` setter was removed alongside its registry entry
 // The mirror field stays for compat
 
-// show_tips and auto_update are SHELL-OWNED `Option<bool>` setters
+// show_tips is a SHELL-OWNED `Option<bool>` setter
 // Changes take effect on next session start (restart_required: true).
 // The first commit of the default value persists, so the resolver can tell user intent from a managed default
 
-/// Effective-default lookup for the `Option<bool>` AppView mirrors (`show_tips`, `auto_update`, ask_user_question timeout).
+/// Effective-default lookup for the `Option<bool>` AppView mirrors (`show_tips`, ask_user_question timeout).
 /// Matches the consumer's `.unwrap_or(...)` fallback.
 pub(super) fn pr13_effective_default(key: &str) -> Option<bool> {
     use xai_grok_tools::implementations::grok_build::ask_user_question;
     match key {
         "show_tips" => Some(true),
-        "auto_update" => Some(true),
         "toolset.ask_user_question.timeout_enabled" => {
             Some(ask_user_question::DEFAULT_ASK_USER_QUESTION_TIMEOUT_ENABLED)
         }
@@ -2077,32 +2045,6 @@ pub(in crate::app::dispatch) fn set_show_tips(app: &mut AppView, new: bool) -> V
     ));
     vec![Effect::PersistSetting {
         key: "show_tips",
-        value: crate::settings::SettingValue::Bool(new),
-        rollback_value: crate::settings::SettingValue::Bool(prev_effective),
-    }]
-}
-
-/// State-only mutation for `auto_update`.
-pub(super) fn set_auto_update_inner(app: &mut AppView, value: bool) {
-    app.auto_update = Some(value);
-}
-
-/// Outer dispatcher for `Action::SetAutoUpdate`.
-pub(in crate::app::dispatch) fn set_auto_update(app: &mut AppView, new: bool) -> Vec<Effect> {
-    let prev_state = app.auto_update;
-    let prev_effective = prev_state.unwrap_or(true);
-    if prev_effective == new && prev_state.is_some() {
-        return vec![];
-    }
-    set_auto_update_inner(app, new);
-    refresh_open_settings_modals(app);
-    tracing::info!(target: "settings", key = "auto_update", value = new, "setting changed");
-    app.show_toast(&format!(
-        "{} (restart to apply)",
-        save_success_toast("Auto-update", new),
-    ));
-    vec![Effect::PersistSetting {
-        key: "auto_update",
         value: crate::settings::SettingValue::Bool(new),
         rollback_value: crate::settings::SettingValue::Bool(prev_effective),
     }]

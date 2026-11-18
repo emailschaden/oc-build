@@ -164,45 +164,6 @@ fn toggle_vim_mode_works_on_dashboard_and_focuses_overview() {
     crate::appearance::cache::set_vim_mode(false);
 }
 #[test]
-fn plugin_cta_catalog_reload_empty_candidates_resets_matched_phase() {
-    use crate::app::agent_view::CtaPhase;
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    {
-        let cta = &mut app.agents.get_mut(&id).unwrap().plugin_cta;
-        cta.source_url_or_path = Some(xai_grok_plugin_marketplace::OFFICIAL_SOURCE_GIT_URL.into());
-        cta.candidates = vec![cta_entry("figma", "not_installed")];
-        cta.phase = CtaPhase::Matched {
-            plugin_relative_path: "plugins/figma".into(),
-            name: "figma".into(),
-        };
-        cta.hit_connect.rect = Some(ratatui::layout::Rect::new(0, 0, 9, 1));
-        cta.hit_dismiss.rect = Some(ratatui::layout::Rect::new(10, 0, 3, 1));
-    }
-    let response = xai_hooks_plugins_types::MarketplaceListResponse {
-        sources: vec![xai_hooks_plugins_types::MarketplaceScanResult {
-            source_name: xai_grok_plugin_marketplace::OFFICIAL_SOURCE_NAME.into(),
-            source_kind: "git".into(),
-            source_url_or_path: xai_grok_plugin_marketplace::OFFICIAL_SOURCE_GIT_URL.into(),
-            plugins: vec![cta_entry("figma", "installed")],
-            error: None,
-        }],
-    };
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::PluginCtaCatalogLoaded {
-            agent_id: id,
-            result: Ok(response),
-        }),
-        &mut app,
-    );
-    assert!(effects.is_empty());
-    let cta = &expect_agent(&app, id).plugin_cta;
-    assert!(cta.candidates.is_empty());
-    assert_eq!(cta.phase, CtaPhase::Hidden);
-    assert!(cta.hit_connect.rect.is_none());
-    assert!(cta.hit_dismiss.rect.is_none());
-}
-#[test]
 fn cancel_before_first_activity_resets_state_and_discards_orphan_response() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
@@ -267,7 +228,7 @@ fn set_default_model_allowed_when_agent_chat_kind() {
 }
 /// `/model <name>` dispatches `SetDefaultModel` which routes through both `PersistSetting` and `SwitchModel`.
 #[test]
-fn slash_model_valid_dispatches_set_default_model_with_switch_and_persist() {
+fn slash_model_valid_dispatches_set_default_model_with_switch() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     let model_id = acp::ModelId::new(std::sync::Arc::from("grok-4.5"));
@@ -282,26 +243,16 @@ fn slash_model_valid_dispatches_set_default_model_with_switch_and_persist() {
             acp::ModelInfo::new(model_id.clone(), "Grok 4.5".to_string()),
         );
     let effects = dispatch(Action::SendPrompt("/model Grok 4.5".into()), &mut app);
+    // oc-build: opencode backend; only the session switch, nothing is persisted.
     assert_eq!(
         effects.len(),
-        2,
-        "expected PersistSetting + SwitchModel effects, got {effects:?}",
+        1,
+        "expected SwitchModel only, got {effects:?}"
     );
     assert!(
-        matches!(
-            effects.first(),
-            Some(Effect::PersistSetting {
-                key: "default_model",
-                ..
-            })
-        ),
-        "first effect must be PersistSetting(default_model), got {:?}",
+        matches!(effects.first(), Some(Effect::SwitchModel { choice, .. }) if choice.model_id == model_id),
+        "effect must be SwitchModel(<resolved id>), got {:?}",
         effects.first(),
-    );
-    assert!(
-        matches!(effects.get(1), Some(Effect::SwitchModel { choice, .. }) if choice.model_id == model_id),
-        "second effect must be SwitchModel(<resolved id>), got {:?}",
-        effects.get(1),
     );
     assert!(expect_agent(&app, id).session.model_switch_pending);
 }
@@ -1302,7 +1253,7 @@ fn every_persisting_setting_has_rollback_arm() {
 /// `Action::ClearDefaultModel` persists `cfg.models.default = None` AND emits the "cleared" toast.
 /// It deliberately does NOT mutate `agent.session.models.current`.
 #[test]
-fn clear_default_model_persists_but_keeps_live_current() {
+fn clear_default_model_keeps_live_current() {
     use agent_client_protocol as acp;
     use std::sync::Arc;
     let mut app = test_app_with_agent();
@@ -1323,27 +1274,16 @@ fn clear_default_model_persists_but_keeps_live_current() {
         .models
         .set_current(id.clone(), None);
     let effects = dispatch(Action::ClearDefaultModel, &mut app);
-    assert_eq!(
-        effects.len(),
-        1,
-        "expected exactly one PersistSetting effect"
-    );
-    assert!(
-        matches!(effects.first(), Some(Effect::PersistSetting {
-                key: "default_model",
-                value: crate::settings::SettingValue::String(s),
-                .. }) if s.is_empty()),
-        "expected PersistSetting(default_model, ''), got {:?}",
-        effects.first(),
-    );
+    // oc-build: opencode backend; model ids are never saved to ~/.grok/config.toml.
+    assert!(effects.is_empty(), "expected no effects, got {effects:?}");
     assert_eq!(
         expect_agent(&app, agent_id).session.models.current,
         Some(id),
         "clear_default_model must NOT mutate live agent.session.models.current",
     );
 }
-/// `Action::SetDefaultModel(<known id>)` resolves the id against the live catalog, mutates current, and emits PersistSetting and SwitchModel effects.
-/// This is the dispatch-level analog of `slash_model_valid_dispatches_set_default_model_with_switch_and_persist`.
+/// `Action::SetDefaultModel(<known id>)` resolves the id against the live catalog, mutates current, and emits a SwitchModel effect.
+/// This is the dispatch-level analog of `slash_model_valid_dispatches_set_default_model_with_switch`.
 #[test]
 fn set_default_model_resolves_known_name() {
     use agent_client_protocol as acp;
@@ -1360,13 +1300,10 @@ fn set_default_model_resolves_known_name() {
         .available
         .insert(id.clone(), info);
     let effects = dispatch(Action::SetDefaultModel(id.clone()), &mut app);
-    assert_eq!(effects.len(), 2);
-    assert!(matches!(effects.first(), Some(Effect::PersistSetting {
-            key: "default_model",
-            value: crate::settings::SettingValue::String(s),
-            .. }) if s == "grok-4.5"));
+    // oc-build: opencode backend; only the session switch, nothing is persisted.
+    assert_eq!(effects.len(), 1);
     assert!(
-        matches!(effects.get(1), Some(Effect::SwitchModel { choice, .. }) if choice.model_id == id)
+        matches!(effects.first(), Some(Effect::SwitchModel { choice, .. }) if choice.model_id == id)
     );
     assert_eq!(
         expect_agent(&app, agent_id).session.models.current,
@@ -1741,9 +1678,6 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         }
         "show_tips" => {
             let _ = dispatch(Action::SetShowTips(false), app);
-        }
-        "auto_update" => {
-            let _ = dispatch(Action::SetAutoUpdate(false), app);
         }
         "vim_mode" => {
             let _ = dispatch(Action::SetVimMode(true), app);

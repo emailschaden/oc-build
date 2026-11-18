@@ -730,7 +730,7 @@ fn session_loaded_without_restore_resets_restore_degree() {
     );
 }
 #[test]
-fn session_loaded_with_flag_emits_five_fetches_and_clears_flag() {
+fn session_loaded_with_flag_emits_three_fetches_and_clears_flag() {
     use crate::views::extensions_modal::{ExtensionsModalState, ExtensionsTab};
     let mut app = test_app_with_agent();
     let id = AgentId(0);
@@ -738,7 +738,7 @@ fn session_loaded_with_flag_emits_five_fetches_and_clears_flag() {
         let a = app.agents.get_mut(&id).unwrap();
         a.session.session_id = None;
         a.pending_extensions_fetch = true;
-        a.extensions_modal = Some(ExtensionsModalState::new(ExtensionsTab::Hooks));
+        a.extensions_modal = Some(ExtensionsModalState::new(ExtensionsTab::Plugins));
     }
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionLoaded {
@@ -753,7 +753,7 @@ fn session_loaded_with_flag_emits_five_fetches_and_clears_flag() {
         }),
         &mut app,
     );
-    assert_eq!(count_extension_fetches(&effects), 5);
+    assert_eq!(count_extension_fetches(&effects), 3);
     assert!(
         effects
             .iter()
@@ -770,7 +770,7 @@ fn session_restored_does_not_consume_flag_and_defers_to_load() {
         let a = app.agents.get_mut(&id).unwrap();
         a.session.session_id = None;
         a.pending_extensions_fetch = true;
-        a.extensions_modal = Some(ExtensionsModalState::new(ExtensionsTab::Hooks));
+        a.extensions_modal = Some(ExtensionsModalState::new(ExtensionsTab::Plugins));
     }
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionRestored {
@@ -795,7 +795,7 @@ fn session_load_failed_clears_flag_no_fetches() {
     {
         let a = app.agents.get_mut(&id).unwrap();
         a.pending_extensions_fetch = true;
-        a.extensions_modal = Some(ExtensionsModalState::new(ExtensionsTab::Hooks));
+        a.extensions_modal = Some(ExtensionsModalState::new(ExtensionsTab::Plugins));
     }
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionLoadFailed {
@@ -913,24 +913,6 @@ fn session_restored_sticky_chat_sets_conversation_entry() {
         agent.rename_kind(),
         xai_grok_shell::session::unified_list::SessionKind::Chat
     );
-}
-/// Completing a mid-session login restores the agent view instead of running the startup load-session flow.
-#[test]
-fn auth_complete_restores_view_after_mid_session_login() {
-    let mut app = test_app_with_agent();
-    dispatch(Action::Login, &mut app);
-    let seq = authenticating_seq(&app);
-    assert_eq!(app.active_view, ActiveView::Welcome);
-    dispatch(
-        Action::TaskComplete(TaskResult::AuthComplete {
-            request_seq: seq,
-            meta: None,
-        }),
-        &mut app,
-    );
-    assert_eq!(app.active_view, ActiveView::Agent(AgentId(0)));
-    assert_eq!(app.auth_return_view, None);
-    assert!(matches!(app.auth_state, AuthState::Done));
 }
 #[test]
 fn session_loaded_drains_pending_first_prompt_to_front() {

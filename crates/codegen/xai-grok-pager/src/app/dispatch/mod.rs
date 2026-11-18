@@ -8,9 +8,8 @@
 //! - This makes dispatch fully testable without tokio or a terminal.
 //!
 //! Imports in this tree use at most one `super::` hop (absolute `crate::` paths otherwise); tests/ shares a fixture prelude via `use super::*;`.
-mod auth;
-mod billing;
 mod cta;
+mod auth;
 mod ctx;
 mod dashboard;
 mod dashboard_telemetry;
@@ -36,9 +35,6 @@ mod turn;
 mod voice;
 pub(crate) use auth::scrollback_has_recent_disk_full;
 pub(in crate::app) use auth::scrollback_has_recent_error_banner;
-pub(crate) use billing::{
-    CREDIT_LIMIT_RETRY_OPTION_ID, UPSELL_URL_PAYG, UPSELL_URL_UPGRADE, is_credit_limit_error,
-};
 #[cfg(test)]
 pub(crate) use ctx::{SwitchCause, switch_to_agent};
 pub(crate) use dashboard::{DashboardStopReadiness, dashboard_stop_readiness};
@@ -61,7 +57,6 @@ pub(crate) use session::lifecycle::{abandon_unused_home_session, maybe_create_ho
 pub(crate) use settings::ui::refresh_open_settings_modals;
 #[cfg(test)]
 pub(crate) use settings::ui::{ROLLBACK_NO_ARM_TOAST, build_pager_snapshot};
-pub(crate) use status::commit_minimal_update_notice;
 #[cfg(test)]
 pub(crate) use turn::{CANCEL_RESEND_GRACE, TURN_END_RECONCILE_GRACE};
 pub(crate) use turn::{reconcile_overdue_cancels, reconcile_overdue_turn_ends};

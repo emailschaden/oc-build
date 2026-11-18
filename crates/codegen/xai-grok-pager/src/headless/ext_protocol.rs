@@ -107,15 +107,6 @@ pub(crate) fn handle_ext_notification(
         "x.ai/task_backgrounded" => decode_task_backgrounded(method, params),
         "x.ai/task_completed" => decode_task_completed(method, params),
         "x.ai/monitor_event" => ExtEvent::MonitorEvent,
-        "x.ai/leader/version_mismatch" => {
-            match crate::acp::version_mismatch_banner(params) {
-                Some(banner) => tracing::warn!(%banner, "x.ai/leader/version_mismatch"),
-                None => {
-                    tracing::warn!("ignoring x.ai/leader/version_mismatch without usable versions")
-                }
-            }
-            ExtEvent::None
-        }
         _ => ExtEvent::None,
     }
 }

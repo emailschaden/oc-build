@@ -1,4 +1,4 @@
-//! Extensions modal popup (Hooks, Plugins, Marketplace, Skills, Workflows, MCP Servers).
+//! Extensions modal popup (Plugins, Skills, MCP Servers).
 //!
 //! A centered overlay using the shared [`ModalWindow`](super::modal_window) chrome, opened by the `/hooks` and `/plugins` slash commands.
 //! Blocks all input until closed with `Esc`.
@@ -22,8 +22,6 @@ use xai_grok_shell::extensions::skills::SkillsListResponse;
 use xai_grok_tools::implementations::skills::types::SkillInfo;
 
 mod skills_tab;
-mod workflows_picker_rows;
-use workflows_picker_rows::build_workflows_picker_rows;
 
 /// Check if a name fuzzy-matches the search query.
 /// Empty query matches everything.
@@ -48,24 +46,6 @@ fn fuzzy_matches(name: &str, query: &str) -> bool {
     current.is_none()
 }
 
-/// Check if a hook fuzzy-matches the search query across all its fields.
-pub fn fuzzy_matches_hook(hook: &xai_hooks_plugins_types::HookInfo, query: &str) -> bool {
-    if query.is_empty() {
-        return true;
-    }
-    fuzzy_matches(&hook.name, query)
-        || fuzzy_matches(&hook.event.to_string(), query)
-        || hook
-            .matcher
-            .as_ref()
-            .is_some_and(|m| fuzzy_matches(m, query))
-        || hook
-            .command
-            .as_ref()
-            .is_some_and(|c| fuzzy_matches(c, query))
-        || hook.url.as_ref().is_some_and(|u| fuzzy_matches(u, query))
-}
-
 /// Case-insensitive string order without intermediate allocations.
 /// Equal ignoring case falls back to the original byte order for stability.
 fn cmp_str_ci(a: &str, b: &str) -> std::cmp::Ordering {
@@ -81,107 +61,6 @@ fn cmp_str_ci(a: &str, b: &str) -> std::cmp::Ordering {
             _ => {}
         }
     }
-}
-
-fn hook_row_label(hook: &xai_hooks_plugins_types::HookInfo) -> String {
-    let matcher = hook
-        .matcher
-        .as_deref()
-        .map(|m| format!(" /{m}"))
-        .unwrap_or_default();
-    format!("on:{}{matcher}", hook.event)
-}
-
-/// Logical source kind for hook group rank (independent of display copy).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum HookSourceKind {
-    Project = 0,
-    Global = 1,
-    Claude = 2,
-    Plugin = 3,
-    Custom = 4,
-}
-
-/// Label plus kind for a hooks source directory.
-#[derive(Debug, Clone)]
-struct HookSourceMeta {
-    label: String,
-    kind: HookSourceKind,
-}
-
-impl HookSourceMeta {
-    fn is_custom(&self) -> bool {
-        self.kind == HookSourceKind::Custom
-    }
-}
-
-/// Sort key for hook source groups: kind rank, then A–Z label, then path.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct HookGroupSortKey<'a> {
-    kind: HookSourceKind,
-    label_lower: String,
-    source_dir: &'a str,
-}
-
-fn hook_group_sort_key<'a>(source_dir: &'a str, meta: &HookSourceMeta) -> HookGroupSortKey<'a> {
-    HookGroupSortKey {
-        kind: meta.kind,
-        label_lower: meta.label.to_lowercase(),
-        source_dir,
-    }
-}
-
-fn is_official_marketplace_source(source: &xai_hooks_plugins_types::MarketplaceScanResult) -> bool {
-    source.source_name == xai_grok_plugin_marketplace::OFFICIAL_SOURCE_NAME
-        || xai_grok_plugin_marketplace::is_official_source_url(&source.source_url_or_path)
-}
-
-/// One marketplace source in display order with plugins sorted A–Z.
-#[derive(Debug, Clone)]
-pub(crate) struct MarketplaceSourceView {
-    pub source_index: usize,
-    pub plugin_indices: Vec<usize>,
-}
-
-/// Official source first, then A–Z by `source_name`; plugins A–Z within each.
-pub(crate) fn ordered_marketplace_view(
-    sources: &[xai_hooks_plugins_types::MarketplaceScanResult],
-) -> Vec<MarketplaceSourceView> {
-    let mut source_order: Vec<usize> = (0..sources.len()).collect();
-    let source_keys: Vec<(bool, String)> = sources
-        .iter()
-        .map(|s| {
-            (
-                is_official_marketplace_source(s),
-                s.source_name.to_lowercase(),
-            )
-        })
-        .collect();
-    source_order.sort_by(|&a, &b| match (source_keys.get(a), source_keys.get(b)) {
-        (Some(ka), Some(kb)) => match (ka.0, kb.0) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => ka.1.cmp(&kb.1).then_with(|| a.cmp(&b)),
-        },
-        _ => a.cmp(&b),
-    });
-    source_order
-        .into_iter()
-        .filter_map(|si| {
-            let source = sources.get(si)?;
-            let names: Vec<String> = source
-                .plugins
-                .iter()
-                .map(|p| p.name.to_lowercase())
-                .collect();
-            let mut plugin_order: Vec<usize> = (0..source.plugins.len()).collect();
-            plugin_order.sort_by(|&a, &b| names.get(a).cmp(&names.get(b)).then_with(|| a.cmp(&b)));
-            Some(MarketplaceSourceView {
-                source_index: si,
-                plugin_indices: plugin_order,
-            })
-        })
-        .collect()
 }
 
 /// Group header for a skill scope/source.
@@ -413,115 +292,24 @@ pub fn plugin_group(plugin: &xai_hooks_plugins_types::PluginInfo) -> PluginGroup
     }
 }
 
-/// Group and order hooks the same way the renderer does.
-struct HookGroupView<'a> {
-    source_dir: &'a str,
-    label: String,
-    indices: Vec<usize>,
-}
-
-fn build_hook_groups<'a>(
-    hooks: &'a [xai_hooks_plugins_types::HookInfo],
-    filter: StatusFilter,
-    query: &str,
-) -> Vec<HookGroupView<'a>> {
-    let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
-    for (i, hook) in hooks.iter().enumerate() {
-        if !fuzzy_matches_hook(hook, query) {
-            continue;
-        }
-        if !filter.matches(!hook.disabled) {
-            continue;
-        }
-        if let Some(g) = groups.iter_mut().find(|g| g.0 == hook.source_dir) {
-            g.1.push(i);
-        } else {
-            groups.push((&hook.source_dir, vec![i]));
-        }
-    }
-    let mut metas: Vec<HookSourceMeta> = groups
-        .iter()
-        .map(|(dir, _)| classify_hook_source(dir))
-        .collect();
-    let group_keys: Vec<HookGroupSortKey<'_>> = groups
-        .iter()
-        .zip(metas.iter())
-        .map(|((dir, _), meta)| hook_group_sort_key(dir, meta))
-        .collect();
-    let mut group_order: Vec<usize> = (0..groups.len()).collect();
-    group_order.sort_by(|&a, &b| group_keys.get(a).cmp(&group_keys.get(b)));
-    let mut ordered: Vec<HookGroupView<'a>> = Vec::with_capacity(groups.len());
-    for gi in group_order {
-        let Some((source_dir, mut indices)) = groups.get_mut(gi).map(std::mem::take) else {
-            continue;
-        };
-        indices.sort_by_cached_key(|&i| {
-            (
-                hooks
-                    .get(i)
-                    .map(|h| hook_row_label(h).to_lowercase())
-                    .unwrap_or_default(),
-                i,
-            )
-        });
-        ordered.push(HookGroupView {
-            source_dir,
-            label: metas
-                .get_mut(gi)
-                .map(|m| std::mem::take(&mut m.label))
-                .unwrap_or_default(),
-            indices,
-        });
-    }
-    ordered
-}
-
-/// Which tab is active in the hooks/plugins modal.
+/// Which tab is active in the extensions modal.
+// oc-build: opencode backend; only the tabs opencode can back (no Hooks, Marketplace or Workflows).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtensionsTab {
-    Hooks,
     Plugins,
-    Marketplace,
     Skills,
-    Workflows,
     McpServers,
 }
 
 impl ExtensionsTab {
     /// All tabs in display order.
-    pub const ALL: &[Self] = &[
-        Self::Hooks,
-        Self::Plugins,
-        Self::Marketplace,
-        Self::Skills,
-        Self::Workflows,
-        Self::McpServers,
-    ];
-
-    // oc-build: opencode backend
-    /// Tabs offered in this process: [`Self::ALL`], or in opencode mode only those opencode can
-    /// back (no Hooks, Marketplace or Workflows).
-    pub fn shown() -> &'static [Self] {
-        const OPENCODE: &[ExtensionsTab] = &[
-            ExtensionsTab::Plugins,
-            ExtensionsTab::Skills,
-            ExtensionsTab::McpServers,
-        ];
-        if crate::acp::opencode_shim::is_active() {
-            OPENCODE
-        } else {
-            Self::ALL
-        }
-    }
+    pub const ALL: &[Self] = &[Self::Plugins, Self::Skills, Self::McpServers];
 
     /// Display label for the tab bar.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Hooks => "Hooks",
             Self::Plugins => "Plugins",
-            Self::Marketplace => "Marketplace",
             Self::Skills => "Skills",
-            Self::Workflows => "Workflows",
             Self::McpServers => "MCP Servers",
         }
     }
@@ -529,55 +317,28 @@ impl ExtensionsTab {
     /// Next tab (wraps around).
     pub fn next(self) -> Self {
         match self {
-            Self::Hooks => Self::Plugins,
-            Self::Plugins => Self::Marketplace,
-            Self::Marketplace => Self::Skills,
-            Self::Skills => Self::Workflows,
-            Self::Workflows => Self::McpServers,
-            Self::McpServers => Self::Hooks,
+            Self::Plugins => Self::Skills,
+            Self::Skills => Self::McpServers,
+            Self::McpServers => Self::Plugins,
         }
     }
     /// Previous tab (wraps around).
     pub fn prev(self) -> Self {
         match self {
-            Self::Hooks => Self::McpServers,
-            Self::Plugins => Self::Hooks,
-            Self::Marketplace => Self::Plugins,
-            Self::Skills => Self::Marketplace,
-            Self::Workflows => Self::Skills,
-            Self::McpServers => Self::Workflows,
+            Self::Plugins => Self::McpServers,
+            Self::Skills => Self::Plugins,
+            Self::McpServers => Self::Skills,
         }
     }
 
     pub fn telemetry_tab(self) -> xai_grok_telemetry::events::ExtensionsModalTab {
         use xai_grok_telemetry::events::ExtensionsModalTab;
         match self {
-            Self::Hooks => ExtensionsModalTab::Hooks,
             Self::Plugins => ExtensionsModalTab::Plugins,
-            Self::Marketplace => ExtensionsModalTab::Marketplace,
             Self::Skills => ExtensionsModalTab::Skills,
-            Self::Workflows => ExtensionsModalTab::Workflows,
             Self::McpServers => ExtensionsModalTab::McpServers,
         }
     }
-}
-
-/// Group toggle direction for a collapsed hooks group.
-/// Pinned (managed-policy) hooks always report enabled, so only unpinned hooks drive the direction.
-/// A group with no unpinned hooks reads enabled (everything in it always runs), never "off".
-pub(crate) fn hook_group_any_enabled<'a>(
-    hooks: impl Iterator<Item = &'a xai_hooks_plugins_types::HookInfo>,
-) -> bool {
-    let unpinned: Vec<_> = hooks.filter(|h| !h.pinned).collect();
-    unpinned.is_empty() || unpinned.iter().any(|h| !h.disabled)
-}
-
-/// Whether removing this hook's source would touch a managed-policy hook (`x` removes the whole `source_dir`, so the gate is source-level).
-pub(crate) fn hook_source_pinned(
-    hooks: &[xai_hooks_plugins_types::HookInfo],
-    source_dir: &str,
-) -> bool {
-    hooks.iter().any(|h| h.source_dir == source_dir && h.pinned)
 }
 
 /// Filter items by enabled/disabled status.
@@ -618,14 +379,8 @@ impl StatusFilter {
 /// What a button does when activated (clicked or keyboard shortcut).
 #[derive(Debug, Clone)]
 pub enum ButtonAction {
-    /// Execute a hooks action via ACP (no args needed).
-    HooksAction(xai_hooks_plugins_types::HooksAction),
     /// Execute a plugins action via ACP (no args needed).
     PluginsAction(xai_hooks_plugins_types::PluginsAction),
-    /// Remove the hook under the cursor (uses source_dir from selected hook).
-    RemoveSelectedHook,
-    /// Toggle enable/disable on the hook under the cursor.
-    ToggleSelectedHook,
     /// Toggle enable/disable on the plugin under the cursor.
     ToggleSelectedPlugin,
     /// Toggle enable/disable on the skill under the cursor.
@@ -651,17 +406,6 @@ pub enum ButtonAction {
     UpdateSelectedPlugin,
     /// Uninstall the selected plugin.
     UninstallSelectedPlugin,
-    /// Install the selected marketplace plugin.
-    InstallSelectedMarketplacePlugin,
-    /// Update the selected marketplace plugin.
-    UpdateSelectedMarketplacePlugin,
-    /// Uninstall the selected marketplace plugin.
-    UninstallSelectedMarketplacePlugin,
-    /// Execute a marketplace action via ACP.
-    MarketplaceAction(xai_hooks_plugins_types::MarketplaceAction),
-
-    /// Remove the marketplace source under the cursor (unconfigure it and uninstall all its plugins).
-    RemoveSelectedMarketplaceSource,
     ToggleExpand,
     /// Cycle the status filter: All, Enabled, Disabled, back to All.
     CycleFilter,
@@ -1041,12 +785,8 @@ pub enum McpSetupOutcome {
 /// Concrete action to run after the user presses `y` on a confirmation overlay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfirmationAction {
-    /// Replay a hooks action (e.g. remove a hook source directory).
-    Hooks(xai_hooks_plugins_types::HooksAction),
     /// Replay a plugins action (e.g. uninstall; may still be `confirmed: false` so multi-plugin repos can return a second server-owned prompt).
     Plugins(xai_hooks_plugins_types::PluginsAction),
-    /// Replay a marketplace action (uninstall plugin or remove source).
-    Marketplace(xai_hooks_plugins_types::MarketplaceAction),
     /// Delete a removable (local) MCP server by name.
     DeleteMcpServer { server_name: String },
 }
@@ -1125,7 +865,6 @@ pub enum ActionVerb {
     Install,
     Update,
     Uninstall,
-    RemoveSource,
     EnableDisable,
 }
 
@@ -1135,7 +874,6 @@ impl ActionVerb {
             Self::Install => "install",
             Self::Update => "update",
             Self::Uninstall => "uninstall",
-            Self::RemoveSource => "remove source",
             Self::EnableDisable => "enable/disable",
         }
     }
@@ -1146,12 +884,6 @@ impl ActionVerb {
 /// [`action_key_footer_desc`] / [`action_key_cheatsheet_desc`].
 pub fn extensions_action_keys(tab: ExtensionsTab) -> Vec<(char, &'static str)> {
     match tab {
-        ExtensionsTab::Hooks => vec![
-            ('r', "reload"),
-            ('a', "add"),
-            (' ', "toggle"),
-            ('x', "remove"),
-        ],
         ExtensionsTab::Plugins => vec![
             ('r', "reload"),
             ('u', ActionVerb::Update.label()),
@@ -1159,16 +891,7 @@ pub fn extensions_action_keys(tab: ExtensionsTab) -> Vec<(char, &'static str)> {
             (' ', "toggle"),
             ('x', ActionVerb::Uninstall.label()),
         ],
-        ExtensionsTab::Marketplace => vec![
-            ('i', ActionVerb::Install.label()),
-            ('r', "refresh"),
-            ('u', ActionVerb::Update.label()),
-            ('a', "add source"),
-            ('d', ActionVerb::Uninstall.label()),
-            ('x', ActionVerb::RemoveSource.label()),
-        ],
         ExtensionsTab::Skills => vec![(' ', "toggle"), ('f', "filter"), ('r', "reload")],
-        ExtensionsTab::Workflows => vec![('r', "reload")],
         ExtensionsTab::McpServers => MCP_SERVERS_ACTION_KEYS.to_vec(),
     }
 }
@@ -1209,138 +932,6 @@ fn action_key_footer_desc_for_mapping(
     } else {
         desc
     }
-}
-
-/// The Marketplace row under the cursor, as the footer sees it.
-enum MarketplaceRow<'a> {
-    Source,
-    Plugin(&'a xai_hooks_plugins_types::MarketplacePluginEntry),
-    /// Empty list, or a selection the entry maps cannot place: only `add source` applies.
-    Empty,
-}
-
-/// Resolve the selected Marketplace row once per frame from freshly built entry-mapping slices.
-/// `None` off the Marketplace tab, where the footer never suppresses.
-fn marketplace_selected_row<'a>(
-    state: &'a ExtensionsModalState,
-    entry_labels: &[String],
-    entry_data_indices: &[Option<usize>],
-    entry_group_keys: &[Option<String>],
-    selected: usize,
-) -> Option<MarketplaceRow<'a>> {
-    if !matches!(state.active_tab, ExtensionsTab::Marketplace) {
-        return None;
-    }
-    if entry_group_keys.get(selected).is_some_and(Option::is_some) {
-        return Some(MarketplaceRow::Source);
-    }
-    let TabDataState::Loaded(data) = &state.marketplace_data else {
-        return Some(MarketplaceRow::Empty);
-    };
-    let plugin = resolve_marketplace_selection_at(
-        &data.sources,
-        entry_labels,
-        entry_data_indices,
-        entry_group_keys,
-        selected,
-    )
-    .and_then(|(si, pi)| data.sources.get(si)?.plugins.get(pi?));
-    Some(plugin.map_or(MarketplaceRow::Empty, MarketplaceRow::Plugin))
-}
-
-/// Marketplace footer: source rows advertise source verbs, plugin rows advertise the plugin verbs
-/// their install status admits; an empty list keeps only `add source`.
-fn marketplace_key_suppressed(ch: char, row: &MarketplaceRow<'_>) -> bool {
-    let status = match row {
-        MarketplaceRow::Plugin(plugin) => Some(plugin.install_status.as_str()),
-        MarketplaceRow::Source | MarketplaceRow::Empty => None,
-    };
-    match ch {
-        'a' => matches!(row, MarketplaceRow::Plugin(_)),
-        'x' => !matches!(row, MarketplaceRow::Source),
-        'i' => status != Some("not_installed"),
-        'u' => status != Some("update_available"),
-        'd' => !matches!(status, Some("installed" | "update_available")),
-        _ => false,
-    }
-}
-
-/// Resolve a Marketplace picker entry to `(source_index, Option<plugin_index_within_source>)`.
-/// Source headers carry the source index as their group key; plugin entries carry it as their
-/// data index and are matched to a plugin by label (`entry_labels` holds `plugin.name` there).
-fn resolve_marketplace_selection_at(
-    sources: &[xai_hooks_plugins_types::MarketplaceScanResult],
-    entry_labels: &[String],
-    entry_data_indices: &[Option<usize>],
-    entry_group_keys: &[Option<String>],
-    selected: usize,
-) -> Option<(usize, Option<usize>)> {
-    if let Some(group_key) = entry_group_keys.get(selected).and_then(|k| k.as_ref()) {
-        let source_idx = group_key.parse::<usize>().ok()?;
-        sources.get(source_idx)?;
-        return Some((source_idx, None));
-    }
-    let source_idx = data_index_at(entry_data_indices, selected)?;
-    let source = sources.get(source_idx)?;
-    let label = entry_labels.get(selected)?;
-    let plugin_idx = source.plugins.iter().position(|p| p.name == *label)?;
-    Some((source_idx, Some(plugin_idx)))
-}
-
-/// Whether removal can succeed for the Hooks-tab selection (`HookInfo::removable`): only user-registered directories without a managed-policy member are.
-/// The `hook_source_pinned` check backstops older shells whose `removable` reflects registration alone; a current shell already reports `removable: false` on every member of a pinned source, so the check is redundant there.
-/// Headers resolve via group key.
-fn selected_hook_source_removable_at(
-    state: &ExtensionsModalState,
-    entry_data_indices: &[Option<usize>],
-    entry_group_keys: &[Option<String>],
-    selected: usize,
-) -> bool {
-    if !matches!(state.active_tab, ExtensionsTab::Hooks) {
-        // Other tabs manage their own action sets; never suppress here.
-        return true;
-    }
-    let TabDataState::Loaded(ref data) = state.hooks_data else {
-        return true;
-    };
-    if let Some(source_dir) = entry_group_keys.get(selected).and_then(|k| k.as_ref()) {
-        return data
-            .hooks
-            .iter()
-            .any(|h| &h.source_dir == source_dir && h.removable)
-            && !hook_source_pinned(&data.hooks, source_dir);
-    }
-    let Some(idx) = data_index_at(entry_data_indices, selected) else {
-        return true;
-    };
-    data.hooks
-        .get(idx)
-        .is_none_or(|h| h.removable && !hook_source_pinned(&data.hooks, &h.source_dir))
-}
-
-/// Hooks-tab selections the dispatcher would refuse to toggle: a pinned hook row, or a group header whose group has no unpinned members.
-/// Headers resolve via group key (they carry no data index).
-fn selected_hook_policy_enforced_at(
-    state: &ExtensionsModalState,
-    entry_data_indices: &[Option<usize>],
-    entry_group_keys: &[Option<String>],
-    selected: usize,
-) -> bool {
-    if !matches!(state.active_tab, ExtensionsTab::Hooks) {
-        return false;
-    }
-    let TabDataState::Loaded(ref data) = state.hooks_data else {
-        return false;
-    };
-    if let Some(source_dir) = entry_group_keys.get(selected).and_then(|k| k.as_ref()) {
-        // Headers: policy-locked only when every member is pinned.
-        let mut members = data.hooks.iter().filter(|h| &h.source_dir == source_dir);
-        return members.all(|h| h.pinned);
-    }
-    let Some(idx) = data_index_at(entry_data_indices, selected) else {
-        return false;
-    };
-    data.hooks.get(idx).is_some_and(|h| h.pinned)
 }
 
 /// MCP-tab selection on a policy-blocked server row: Space would only round-trip to the shell for
@@ -1411,24 +1002,6 @@ fn selected_item_enabled_at(
                 _ => None,
             }
         }
-        ExtensionsTab::Hooks => {
-            let idx = data_index_at(entry_data_indices, selected)?;
-            match &state.hooks_data {
-                TabDataState::Loaded(data) => {
-                    let hook = data.hooks.get(idx)?;
-                    if state.hooks_collapsed_groups.contains(&hook.source_dir) {
-                        Some(hook_group_any_enabled(
-                            data.hooks
-                                .iter()
-                                .filter(|h| h.source_dir == hook.source_dir),
-                        ))
-                    } else {
-                        Some(!hook.disabled)
-                    }
-                }
-                _ => None,
-            }
-        }
         ExtensionsTab::Skills => {
             let idx = data_index_at(entry_data_indices, selected)?;
             match &state.skills_data {
@@ -1451,8 +1024,6 @@ fn selected_item_enabled_at(
             }
             _ => None,
         },
-        ExtensionsTab::Marketplace => None,
-        ExtensionsTab::Workflows => None,
     }
 }
 
@@ -1490,14 +1061,13 @@ pub fn action_telemetry_label(tab: ExtensionsTab, ch: char) -> Option<String> {
 
 /// Resolve a key press to a button action based on the active tab.
 pub fn resolve_key(tab: ExtensionsTab, ch: char) -> Option<ButtonAction> {
-    use xai_hooks_plugins_types::{HooksAction, MarketplaceAction, PluginsAction};
+    use xai_hooks_plugins_types::PluginsAction;
 
     match (tab, ch) {
         // Plugins tab
         (ExtensionsTab::Plugins, 'r') => Some(ButtonAction::PluginsAction(PluginsAction::Reload)),
         // Update (fetch latest from source) the selected installed plugin.
         (ExtensionsTab::Plugins, 'u') => Some(ButtonAction::UpdateSelectedPlugin),
-        (ExtensionsTab::Marketplace, 'u') => Some(ButtonAction::UpdateSelectedMarketplacePlugin),
         (ExtensionsTab::Plugins, 'a') => Some(ButtonAction::StartInput {
             command_prefix: "plugins_install".into(),
             fields: vec![FieldSpec {
@@ -1509,42 +1079,9 @@ pub fn resolve_key(tab: ExtensionsTab, ch: char) -> Option<ButtonAction> {
         // Toggle enable/disable on the selected plugin.
         (ExtensionsTab::Plugins, ' ') => Some(ButtonAction::ToggleSelectedPlugin),
         (ExtensionsTab::Plugins, 'x') => Some(ButtonAction::UninstallSelectedPlugin),
-        // Hooks tab
-        (ExtensionsTab::Hooks, 'r') => Some(ButtonAction::HooksAction(HooksAction::Reload)),
-        (ExtensionsTab::Hooks, 'a') => Some(ButtonAction::StartInput {
-            command_prefix: "hooks_add".into(),
-            fields: vec![FieldSpec {
-                label: "Path".into(),
-                required: true,
-                placeholder: None,
-            }],
-        }),
-        // Remove acts on the selected hook, resolved at dispatch time
-        (ExtensionsTab::Hooks, 'x') => Some(ButtonAction::RemoveSelectedHook),
-        // Toggle enable/disable on the selected hook.
-        (ExtensionsTab::Hooks, ' ') => Some(ButtonAction::ToggleSelectedHook),
-        // Marketplace tab
-        (ExtensionsTab::Marketplace, 'i') => Some(ButtonAction::InstallSelectedMarketplacePlugin),
-        (ExtensionsTab::Marketplace, 'r') => Some(ButtonAction::MarketplaceAction(
-            MarketplaceAction::Refresh {
-                source_url_or_path: None,
-            },
-        )),
-        (ExtensionsTab::Marketplace, 'd') => Some(ButtonAction::UninstallSelectedMarketplacePlugin),
-        (ExtensionsTab::Marketplace, 'a') => Some(ButtonAction::StartInput {
-            command_prefix: "marketplace_add_source".into(),
-            fields: vec![FieldSpec {
-                label: "Source".into(),
-                required: true,
-                placeholder: Some("owner/repo, git URL, or local path".into()),
-            }],
-        }),
-        (ExtensionsTab::Marketplace, 'x') => Some(ButtonAction::RemoveSelectedMarketplaceSource),
         (ExtensionsTab::Skills, ' ') => Some(ButtonAction::ToggleSelectedSkill),
         (ExtensionsTab::Skills, 'r') => Some(ButtonAction::ReloadSkills),
         (ExtensionsTab::Skills, 'f') => Some(ButtonAction::CycleFilter),
-        // Shares ReloadSkills: its router arm refetches skills and workflows.
-        (ExtensionsTab::Workflows, 'r') => Some(ButtonAction::ReloadSkills),
         (ExtensionsTab::McpServers, 'a') => Some(ButtonAction::StartInput {
             command_prefix: "mcp_add".into(),
             // URL is required, Name is optional (auto-derived from URL), so URL goes first to match the natural typing order
@@ -1566,7 +1103,6 @@ pub fn resolve_key(tab: ExtensionsTab, ch: char) -> Option<ButtonAction> {
         (ExtensionsTab::McpServers, MCP_SERVERS_REFRESH_KEY) => Some(ButtonAction::RefreshMcpList),
         (ExtensionsTab::McpServers, ' ') => Some(ButtonAction::ToggleSelectedMcpServer),
         (ExtensionsTab::McpServers, 'i') => Some(ButtonAction::McpAuthTrigger),
-        (ExtensionsTab::Hooks, 'f') => Some(ButtonAction::CycleFilter),
         (ExtensionsTab::Plugins, 'f') => Some(ButtonAction::CycleFilter),
         (ExtensionsTab::McpServers, 'f') => Some(ButtonAction::CycleFilter),
         _ => None,
@@ -1707,7 +1243,7 @@ pub fn build_action_from_input(
     command_prefix: &str,
     field_texts: &[String],
 ) -> Option<ButtonAction> {
-    use xai_hooks_plugins_types::{HooksAction, PluginsAction};
+    use xai_hooks_plugins_types::PluginsAction;
 
     let first = field_texts.first().map(|s| s.trim()).unwrap_or("");
 
@@ -1719,17 +1255,6 @@ pub fn build_action_from_input(
             plugin_id: first.to_string(),
             confirmed: false,
         })),
-        "hooks_add" => Some(ButtonAction::HooksAction(HooksAction::Add {
-            path: first.to_string(),
-        })),
-        "hooks_remove" => Some(ButtonAction::HooksAction(HooksAction::Remove {
-            path: first.to_string(),
-        })),
-        "marketplace_add_source" => Some(ButtonAction::MarketplaceAction(
-            xai_hooks_plugins_types::MarketplaceAction::AddSource {
-                url: first.to_string(),
-            },
-        )),
         "mcp_add" => {
             // Field order: [URL / Command, Name]. URL is required.
             let url_or_cmd = first.to_string();
@@ -1831,15 +1356,6 @@ pub enum TabDataState<T> {
     Error(String),
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct WorkflowInfo {
-    pub name: String,
-    pub description: String,
-    pub when_to_use: Option<String>,
-    pub source: String,
-    pub path: Option<String>,
-}
-
 /// State for the hooks/plugins modal popup.
 pub struct ExtensionsModalState {
     /// Shared modal window chrome state (close button, tabs, footer shortcuts, popup area).
@@ -1853,8 +1369,6 @@ pub struct ExtensionsModalState {
     /// Wait overlay after opening grok.com/connectors. Cleared on MCP list refresh.
     pub managed_connectors_wait:
         Option<crate::views::managed_connectors_wait::ManagedConnectorsWaitState>,
-    /// Hooks list data (fetched from shell).
-    pub hooks_data: TabDataState<xai_hooks_plugins_types::HooksListResponse>,
     /// Plugins list data (fetched from shell).
     pub plugins_data: TabDataState<xai_hooks_plugins_types::PluginsListResponse>,
     /// Cached button hit areas from last render (for mouse click).
@@ -1876,31 +1390,15 @@ pub struct ExtensionsModalState {
     /// Last dispatched plugins action (for confirmation replay).
     pub last_plugins_action: Option<xai_hooks_plugins_types::PluginsAction>,
     /// Selected item index per tab (for j/k navigation).
-    /// Maps visible row offset (relative to content top) to hook index.
-    /// Rebuilt every render; used to resolve a mouse click to a hook selection.
-    pub hooks_visible_map: Vec<Option<usize>>,
-    pub hooks_selected: usize,
     pub plugins_selected: usize,
     /// Scroll offset per tab.
-    pub hooks_scroll: usize,
     pub plugins_scroll: usize,
-    /// Marketplace tab state.
-    pub marketplace_data: TabDataState<xai_hooks_plugins_types::MarketplaceListResponse>,
-    /// A marketplace list fetch is in flight.
-    /// Overlapping list calls serialize on the shell's per-source cache lock and each re-scans every git source.
-    /// Duplicates therefore multiply the slowest source's latency.
-    pub marketplace_fetch_inflight: bool,
-    /// A refetch arrived while one was in flight; it runs when the current fetch lands so post-action results stay fresh.
-    pub marketplace_refetch_queued: bool,
-    pub marketplace_selected: usize,
-    pub marketplace_scroll: usize,
     /// Skills tab state.
     pub skills_data: TabDataState<SkillsListResponse>,
     /// The skills fetch whose answer the tab shows; see [`Self::next_skills_fetch`].
     pub skills_fetch: u64,
     pub skills_selected: usize,
     pub skills_scroll: usize,
-    pub workflows_data: TabDataState<Vec<WorkflowInfo>>,
     /// MCP servers tab state.
     pub mcps_data: TabDataState<Vec<crate::views::mcps_modal::McpServerInfo>>,
     /// Last selection that triggered auto-scroll.
@@ -1915,15 +1413,10 @@ pub struct ExtensionsModalState {
     pub mcps_section_collapse_initialized: bool,
     /// Maps visible row offset to skill index (for mouse click).
     pub skills_visible_map: Vec<Option<usize>>,
-    pub hooks_collapsed_groups: std::collections::HashSet<String>,
-    /// See [`Self::seed_hook_groups_once`].
-    pub hooks_groups_seeded: bool,
     /// Collapsed plugin source groups (by [`PluginGroup`] key).
     pub plugins_collapsed_groups: std::collections::HashSet<String>,
     /// See [`Self::seed_plugin_groups_once`].
     pub plugins_groups_seeded: bool,
-    /// Collapsed marketplace sources (by source index). Default collapsed.
-    pub marketplace_collapsed_sources: std::collections::HashSet<usize>,
     /// Collapsed skill source groups (by [`SkillGroup::label`]).
     pub skills_collapsed_groups: std::collections::HashSet<String>,
     /// See [`Self::seed_skills_groups_once`].
@@ -1934,8 +1427,6 @@ pub struct ExtensionsModalState {
     pub plugins_filter: StatusFilter,
     /// Status filter for the MCP servers tab.
     pub mcps_filter: StatusFilter,
-    /// Status filter for the hooks tab.
-    pub hooks_filter: StatusFilter,
     /// Status filter for the skills tab.
     pub skills_filter: StatusFilter,
     /// Unified picker state for tabs managed by `render_picker_content`.
@@ -1958,25 +1449,17 @@ pub struct ExtensionsModalState {
 
 impl Default for ExtensionsModalState {
     fn default() -> Self {
-        Self::new(ExtensionsTab::Hooks)
+        Self::new(ExtensionsTab::Plugins)
     }
 }
 
 impl ExtensionsModalState {
     pub fn new(tab: ExtensionsTab) -> Self {
-        // oc-build: opencode backend; a hidden tab opens the first shown one.
-        let shown = ExtensionsTab::shown();
-        let tab = if shown.contains(&tab) {
-            tab
-        } else {
-            shown.first().copied().unwrap_or(tab)
-        };
         Self {
-            window: ModalWindowState::with_tabs(shown.len()),
+            window: ModalWindowState::with_tabs(ExtensionsTab::ALL.len()),
             active_tab: tab,
             session_team_id: None,
             managed_connectors_wait: None,
-            hooks_data: TabDataState::Loading,
             plugins_data: TabDataState::Loading,
             button_areas: Vec::new(),
             input: None,
@@ -1986,21 +1469,12 @@ impl ExtensionsModalState {
             pending_entry_index: None,
             result_notice: None,
             last_plugins_action: None,
-            hooks_visible_map: Vec::new(),
-            hooks_selected: 0,
             plugins_selected: 0,
-            hooks_scroll: 0,
             plugins_scroll: 0,
-            marketplace_data: TabDataState::Loading,
-            marketplace_fetch_inflight: false,
-            marketplace_refetch_queued: false,
-            marketplace_selected: 0,
-            marketplace_scroll: 0,
             skills_data: TabDataState::Loading,
             skills_fetch: 0,
             skills_selected: 0,
             skills_scroll: 0,
-            workflows_data: TabDataState::Loading,
             mcps_data: TabDataState::Loading,
             mcps_scroll_pinned_selection: None,
             mcps_scroll: 0,
@@ -2013,14 +1487,10 @@ impl ExtensionsModalState {
             skills_expanded: std::collections::HashSet::new(),
             skills_collapsed_groups: std::collections::HashSet::new(),
             skills_groups_seeded: false,
-            hooks_collapsed_groups: std::collections::HashSet::new(),
-            hooks_groups_seeded: false,
             plugins_collapsed_groups: std::collections::HashSet::new(),
             plugins_groups_seeded: false,
-            marketplace_collapsed_sources: std::collections::HashSet::new(),
             plugins_filter: StatusFilter::default(),
             mcps_filter: StatusFilter::default(),
-            hooks_filter: StatusFilter::default(),
             skills_filter: StatusFilter::default(),
             // PickerState mode is vestigial; ModalWindow handles framing
             picker_state: picker::PickerState::default(),
@@ -2092,11 +1562,8 @@ impl ExtensionsModalState {
 
     pub fn active_tab_is_loading(&self) -> bool {
         match self.active_tab {
-            ExtensionsTab::Hooks => matches!(self.hooks_data, TabDataState::Loading),
             ExtensionsTab::Plugins => matches!(self.plugins_data, TabDataState::Loading),
-            ExtensionsTab::Marketplace => matches!(self.marketplace_data, TabDataState::Loading),
             ExtensionsTab::Skills => matches!(self.skills_data, TabDataState::Loading),
-            ExtensionsTab::Workflows => matches!(self.workflows_data, TabDataState::Loading),
             ExtensionsTab::McpServers => matches!(self.mcps_data, TabDataState::Loading),
         }
     }
@@ -2141,17 +1608,6 @@ impl ExtensionsModalState {
         self.switch_tab(tab);
     }
 
-    /// Seed the all-collapsed default for hook source groups once, on the first non-empty delivery.
-    /// Called from both hook-data delivery channels (list fetch and the `HooksChanged` push).
-    pub fn seed_hook_groups_once(&mut self, hooks: &[xai_hooks_plugins_types::HookInfo]) {
-        seed_groups_once(
-            &mut self.hooks_groups_seeded,
-            &mut self.hooks_collapsed_groups,
-            hooks,
-            |h| h.source_dir.clone(),
-        );
-    }
-
     /// Seed the all-collapsed default for plugin source groups once, on the first non-empty delivery.
     /// Called from both plugin-data delivery channels (list fetch and the `PluginsChanged` push).
     pub fn seed_plugin_groups_once(&mut self, plugins: &[xai_hooks_plugins_types::PluginInfo]) {
@@ -2179,38 +1635,10 @@ impl ExtensionsModalState {
         let searching = !self.picker_state.query().is_empty();
 
         match self.active_tab {
-            // During active search we force all hook groups open so matches inside previously-collapsed groups are visible
-            ExtensionsTab::Hooks => searching || !self.hooks_collapsed_groups.contains(group_key),
             ExtensionsTab::Plugins => {
                 searching || !self.plugins_collapsed_groups.contains(group_key)
             }
             ExtensionsTab::Skills => searching || !self.skills_collapsed_groups.contains(group_key),
-            // Workflows tab is a flat list without collapsible groups.
-            ExtensionsTab::Workflows => false,
-            ExtensionsTab::Marketplace => {
-                let source_has_error = group_key
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|si| {
-                        if let TabDataState::Loaded(ref data) = self.marketplace_data {
-                            data.sources.get(si).and_then(|s| s.error.as_ref())
-                        } else {
-                            None
-                        }
-                    })
-                    .is_some();
-                if source_has_error {
-                    // Error sources use the shared picker_state.expanded (already handled by the general search-expand logic)
-                    self.picker_state.expanded.contains(&sel)
-                } else {
-                    // Normal marketplace sources: force open while searching.
-                    searching
-                        || group_key
-                            .parse::<usize>()
-                            .ok()
-                            .is_none_or(|si| !self.marketplace_collapsed_sources.contains(&si))
-                }
-            }
             ExtensionsTab::McpServers => {
                 if group_key.starts_with("mcp-section:") {
                     searching || !self.mcps_collapsed_sections.contains(group_key)
@@ -2280,21 +1708,6 @@ impl ExtensionsModalState {
     /// Caller must be on the McpServers tab; the helper relies on no other tab using `"mcp-tools:"` as a group-key prefix.
     pub fn selected_mcp_tool(&self) -> Option<(usize, usize)> {
         selected_mcp_tool_at(
-            &self.entry_data_indices,
-            &self.entry_group_keys,
-            self.picker_state.selected,
-        )
-    }
-
-    /// For the Marketplace tab, resolve the currently selected picker entry to the source and (optionally) the plugin within that source.
-    /// Returns `(source_index, Option<plugin_index_within_source>)`. Uses the published entry maps (input handling, unit tests).
-    pub fn resolve_marketplace_selection(
-        &self,
-        sources: &[xai_hooks_plugins_types::MarketplaceScanResult],
-    ) -> Option<(usize, Option<usize>)> {
-        resolve_marketplace_selection_at(
-            sources,
-            &self.entry_labels_cache,
             &self.entry_data_indices,
             &self.entry_group_keys,
             self.picker_state.selected,
@@ -2487,106 +1900,6 @@ pub(crate) fn mcp_section_children_hidden(
     !searching && collapsed_sections.contains(section_key)
 }
 
-/// Derive a display label and whether the source is a custom (removable) path.
-///
-/// Returns `(label, is_custom)` where `is_custom` means the source was added via hooks-paths and can be removed.
-pub fn derive_source_label(source_dir: &str) -> (String, bool) {
-    let meta = classify_hook_source(source_dir);
-    let is_custom = meta.is_custom();
-    (meta.label, is_custom)
-}
-
-/// Classify a hooks `source_dir` into a display label and stable kind rank.
-fn classify_hook_source(source_dir: &str) -> HookSourceMeta {
-    let grok = xai_grok_config::grok_home();
-    let source_path = std::path::Path::new(source_dir);
-    // Plugin / installed-plugin dirs, under the user grok home (GROK_HOME-aware) or a project-scoped `{cwd}/.grok/<subdir>/`
-    // Returns the first path component after the subdir (the plugin's install directory name)
-    let plugin_name = |subdir: &str| -> Option<String> {
-        let first_comp = |p: &std::path::Path| {
-            p.components()
-                .next()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .filter(|s| !s.is_empty())
-        };
-        // User grok home (GROK_HOME-aware).
-        if let Ok(rest) = source_path.strip_prefix(grok.join(subdir))
-            && let Some(name) = first_comp(rest)
-        {
-            return Some(name);
-        }
-        // Project-scoped `.grok/<subdir>/<name>` anywhere in the path.
-        // Component-based so it works regardless of path separator.
-        let comps: Vec<_> = source_path
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect();
-        comps.windows(3).find_map(|w| {
-            let [a, b, c] = w else {
-                return None;
-            };
-            (a == ".grok" && b == subdir && !c.is_empty()).then(|| c.clone())
-        })
-    };
-    if let Some(name) = plugin_name("plugins").or_else(|| plugin_name("installed-plugins")) {
-        return HookSourceMeta {
-            label: format!("Plugin: {name}"),
-            kind: HookSourceKind::Plugin,
-        };
-    }
-    // Global hooks under $GROK_HOME/hooks
-    let global_hooks = grok.join("hooks");
-    let global_str = global_hooks.display().to_string();
-    if source_dir == global_str || source_dir.starts_with(&format!("{global_str}/")) {
-        return HookSourceMeta {
-            label: "Global hooks".into(),
-            kind: HookSourceKind::Global,
-        };
-    }
-    // Settings under .claude/
-    if source_dir.contains("/.claude/") {
-        return HookSourceMeta {
-            label: "Claude settings".into(),
-            kind: HookSourceKind::Claude,
-        };
-    }
-    // Project hooks
-    if source_dir.ends_with("/.grok/hooks") || source_dir.contains("/.grok/hooks/") {
-        return HookSourceMeta {
-            label: "Project hooks".into(),
-            kind: HookSourceKind::Project,
-        };
-    }
-    // Custom directory (removable)
-    let display = {
-        if let Ok(rest) = source_path.strip_prefix(&grok) {
-            let prefix = crate::util::display_grok_home_prefix();
-            let rest_str = rest.to_string_lossy();
-            let rest_trimmed = rest_str.strip_prefix('/').unwrap_or(&rest_str);
-            format!("Custom: {prefix}/{rest_trimmed}")
-        } else if let Some(home) = xai_dirs::home_dir() {
-            // Path::strip_prefix, not a string prefix: USERPROFILE `C:\Users\foo` must not collapse `C:\Users\foobar`
-            if !home.as_os_str().is_empty()
-                && let Ok(rest) = source_path.strip_prefix(&home)
-            {
-                if rest.as_os_str().is_empty() {
-                    "Custom: ~".into()
-                } else {
-                    format!("Custom: ~/{}", rest.display())
-                }
-            } else {
-                format!("Custom: {source_dir}")
-            }
-        } else {
-            format!("Custom: {source_dir}")
-        }
-    };
-    HookSourceMeta {
-        label: display,
-        kind: HookSourceKind::Custom,
-    }
-}
-
 /// One skill row after the filter and the group-then-A–Z sort.
 #[derive(Debug, Clone)]
 struct SkillMatch {
@@ -2775,17 +2088,7 @@ pub(crate) fn render_components_fields(
     fields
 }
 
-/// Collapsed-row summary from catalog components; `None` without catalog data.
-pub(crate) fn marketplace_components_summary(
-    plugin: &xai_hooks_plugins_types::MarketplacePluginEntry,
-) -> Option<String> {
-    plugin
-        .components
-        .as_ref()
-        .and_then(|components| components.summary_line())
-}
-
-/// Render the hooks/plugins modal popup as a centered overlay.
+/// Render the extensions modal popup as a centered overlay.
 const SPINNER_DIVISOR: u64 = 4;
 
 pub fn render_extensions_modal(
@@ -2818,8 +2121,8 @@ pub fn render_extensions_modal(
 
     // Tab labels and active index.
     // oc-build: opencode backend
-    let labels: Vec<&str> = ExtensionsTab::shown().iter().map(|t| t.label()).collect();
-    let active_idx = ExtensionsTab::shown()
+    let labels: Vec<&str> = ExtensionsTab::ALL.iter().map(|t| t.label()).collect();
+    let active_idx = ExtensionsTab::ALL
         .iter()
         .position(|t| *t == state.active_tab)
         .unwrap_or(0);
@@ -2827,19 +2130,11 @@ pub fn render_extensions_modal(
     state.window.tabs_focused = state.picker_state.tabs_focused;
 
     // Determine filter for current tab.
-    let has_filter = matches!(
-        state.active_tab,
-        ExtensionsTab::Hooks
-            | ExtensionsTab::Plugins
-            | ExtensionsTab::McpServers
-            | ExtensionsTab::Skills
-    );
+    let has_filter = true;
     let filter = match state.active_tab {
-        ExtensionsTab::Hooks => state.hooks_filter,
         ExtensionsTab::Plugins => state.plugins_filter,
         ExtensionsTab::McpServers => state.mcps_filter,
         ExtensionsTab::Skills => state.skills_filter,
-        _ => StatusFilter::All,
     };
 
     let loading = state.active_tab_is_loading();
@@ -2992,26 +2287,6 @@ pub fn render_extensions_modal(
                     entry_badge_color.push(None);
                 }
             }
-            ExtensionsTab::Workflows => {
-                // The builder owns all data states (loaded/empty/error).
-                for row in
-                    build_workflows_picker_rows(&state.workflows_data, state.picker_state.query())
-                {
-                    entry_labels.push(row.label);
-                    entry_right_labels.push(row.right_label);
-                    entry_desc_lines.push(row.desc_lines);
-                    entry_summary_lines.push(vec![]);
-                    entry_fields.push(row.fields);
-                    entry_is_header.push(false);
-                    entry_dimmed.push(row.dimmed);
-                    entry_indent.push(0);
-                    // Browse-only rows: no data indices, no group keys.
-                    entry_data_indices.push(None);
-                    entry_group_keys.push(None);
-                    entry_badge_text.push(String::new());
-                    entry_badge_color.push(None);
-                }
-            }
             ExtensionsTab::Plugins => {
                 if let TabDataState::Loaded(ref response) = state.plugins_data {
                     let mut groups = GroupedPlugins::new();
@@ -3102,228 +2377,6 @@ pub fn render_extensions_modal(
                         }
                     }
                 } else if let TabDataState::Error(ref msg) = state.plugins_data {
-                    entry_labels.push(format!("Error: {}", msg));
-                    entry_right_labels.push(String::new());
-                    entry_desc_lines.push(vec![]);
-                    entry_summary_lines.push(vec![]);
-                    entry_fields.push(vec![]);
-                    entry_is_header.push(false);
-                    entry_dimmed.push(false);
-                    entry_indent.push(0);
-                    entry_data_indices.push(None);
-                    entry_group_keys.push(None);
-                    entry_badge_text.push(String::new());
-                    entry_badge_color.push(None);
-                }
-            }
-            ExtensionsTab::Hooks => {
-                if let TabDataState::Loaded(ref data) = state.hooks_data {
-                    let groups = build_hook_groups(
-                        &data.hooks,
-                        state.hooks_filter,
-                        state.picker_state.query(),
-                    );
-                    for group in &groups {
-                        let source_dir = group.source_dir;
-                        let label = &group.label;
-                        let indices = &group.indices;
-                        // While searching we ignore previous collapse state so every hook inside the group can be seen and matched
-                        let searching = !state.picker_state.query().is_empty();
-                        let collapsed =
-                            !searching && state.hooks_collapsed_groups.contains(source_dir);
-                        let count = indices.len();
-                        let noun = if count == 1 { "hook" } else { "hooks" };
-                        entry_labels.push(format!("{label} ({count} {noun})"));
-                        entry_right_labels.push(String::new());
-                        entry_desc_lines.push(vec![]);
-                        entry_summary_lines.push(vec![]);
-                        entry_fields.push(vec![]);
-                        entry_is_header.push(false); // group header, but selectable
-                        entry_dimmed.push(false); // headers
-                        entry_indent.push(0);
-                        entry_data_indices.push(None);
-                        entry_group_keys.push(Some(source_dir.to_string()));
-                        entry_badge_text.push(String::new());
-                        entry_badge_color.push(None);
-                        if collapsed {
-                            continue;
-                        }
-                        for &hi in indices {
-                            let Some(hook) = data.hooks.get(hi) else {
-                                continue;
-                            };
-                            entry_labels.push(hook_row_label(hook));
-                            let cmd = hook
-                                .command
-                                .as_deref()
-                                .unwrap_or(hook.url.as_deref().unwrap_or("(no command)"));
-                            entry_right_labels.push(String::new());
-                            entry_desc_lines.push(vec![format!("\u{2192} {}", cmd)]);
-                            entry_summary_lines.push(vec![]);
-                            entry_fields.push(vec![]);
-                            entry_is_header.push(false);
-                            entry_dimmed.push(hook.disabled);
-                            entry_indent.push(1);
-                            entry_data_indices.push(Some(hi));
-                            entry_group_keys.push(None);
-                            // Pinned (managed-policy) hooks show their state up front, so a refused Disable isn't the first signal
-                            // A pinned hook never shows [disabled]
-                            entry_badge_text.push(if hook.pinned {
-                                "[policy]".into()
-                            } else if hook.disabled {
-                                "[disabled]".into()
-                            } else {
-                                String::new()
-                            });
-                            entry_badge_color.push(if hook.pinned {
-                                Some(theme.warning)
-                            } else if hook.disabled {
-                                Some(theme.accent_error)
-                            } else {
-                                None
-                            });
-                        }
-                    }
-                } else if let TabDataState::Error(ref msg) = state.hooks_data {
-                    entry_labels.push(format!("Error: {}", msg));
-                    entry_right_labels.push(String::new());
-                    entry_desc_lines.push(vec![]);
-                    entry_summary_lines.push(vec![]);
-                    entry_fields.push(vec![]);
-                    entry_is_header.push(false);
-                    entry_dimmed.push(false);
-                    entry_indent.push(0);
-                    entry_data_indices.push(None);
-                    entry_group_keys.push(None);
-                    entry_badge_text.push(String::new());
-                    entry_badge_color.push(None);
-                }
-            }
-            ExtensionsTab::Marketplace => {
-                if let TabDataState::Loaded(ref data) = state.marketplace_data {
-                    for view in ordered_marketplace_view(&data.sources) {
-                        let si = view.source_index;
-                        let plugin_order = &view.plugin_indices;
-                        let Some(source) = data.sources.get(si) else {
-                            continue;
-                        };
-                        // Force all marketplace sources open while searching so their plugins are considered for matching and displayed
-                        let searching = !state.picker_state.query().is_empty();
-                        let collapsed =
-                            !searching && state.marketplace_collapsed_sources.contains(&si);
-                        entry_labels.push(format!(
-                            "{} ({})",
-                            source.source_name,
-                            plugin_count_label(source.plugins.len())
-                        ));
-                        entry_right_labels.push(String::new());
-                        entry_desc_lines.push(vec![]);
-                        entry_summary_lines.push(vec![]);
-                        if let Some(ref err) = source.error {
-                            entry_fields.push(vec![("error".to_string(), err.clone())]);
-                        } else {
-                            entry_fields.push(vec![]);
-                        }
-                        entry_is_header.push(false); // source header, but selectable
-                        entry_dimmed.push(source.error.is_some());
-                        entry_indent.push(0);
-                        entry_data_indices.push(None);
-                        entry_group_keys.push(Some(si.to_string()));
-                        if source.error.is_some() {
-                            entry_badge_text.push("[error]".into());
-                            entry_badge_color.push(Some(theme.accent_error));
-                        } else {
-                            entry_badge_text.push(String::new());
-                            entry_badge_color.push(None);
-                        }
-                        if collapsed {
-                            continue;
-                        }
-                        for &pi in plugin_order {
-                            let Some(plugin) = source.plugins.get(pi) else {
-                                continue;
-                            };
-                            if !fuzzy_matches(&plugin.name, state.picker_state.query()) {
-                                continue;
-                            }
-                            let status_label = match plugin.install_status.as_str() {
-                                "installed" => "[installed]",
-                                "update_available" => "[update available]",
-                                _ => "",
-                            };
-                            entry_labels.push(plugin.name.clone());
-                            let right = match (plugin.version.as_deref(), plugin.author.as_deref())
-                            {
-                                (Some(v), Some(a)) => format!("v{v} by {a}"),
-                                (Some(v), None) => format!("v{v}"),
-                                (None, Some(a)) => format!("by {a}"),
-                                (None, None) => String::new(),
-                            };
-                            entry_right_labels.push(right);
-                            let desc = plugin.description.as_deref().unwrap_or("");
-                            if desc.is_empty() {
-                                entry_desc_lines.push(vec![]);
-                            } else {
-                                entry_desc_lines.push(vec![desc.to_string()]);
-                            }
-                            match marketplace_components_summary(plugin) {
-                                Some(summary) => entry_summary_lines.push(vec![summary]),
-                                None => entry_summary_lines.push(vec![]),
-                            }
-                            // Fields for expanded view.
-                            let mut fields = Vec::new();
-                            if let Some(ref version) = plugin.version {
-                                fields.push(("version".to_string(), version.clone()));
-                            }
-                            if let Some(ref author) = plugin.author {
-                                fields.push(("author".to_string(), author.clone()));
-                            }
-                            if let Some(ref category) = plugin.category {
-                                fields.push(("category".to_string(), category.clone()));
-                            }
-                            if !plugin.tags.is_empty() {
-                                fields.push(("tags".to_string(), plugin.tags.join(", ")));
-                            }
-                            match &plugin.components {
-                                Some(components) if !components.is_empty() => {
-                                    fields.extend(render_components_fields(components));
-                                }
-                                Some(_) => {
-                                    fields.push((
-                                        "provides".to_string(),
-                                        NO_DETECTABLE_COMPONENTS.to_string(),
-                                    ));
-                                }
-                                None => {
-                                    if plugin.remote_url.is_some() {
-                                        fields.push((
-                                            "provides".to_string(),
-                                            "contents shown after install".to_string(),
-                                        ));
-                                    }
-                                }
-                            }
-                            if plugin.install_status != "not_installed" {
-                                fields.push(("status".to_string(), plugin.install_status.clone()));
-                                if let Some(ref iv) = plugin.installed_version {
-                                    fields.push(("installed".to_string(), iv.clone()));
-                                }
-                            }
-                            entry_fields.push(fields);
-                            entry_is_header.push(false);
-                            entry_dimmed.push(false); // marketplace items aren't disabled
-                            entry_indent.push(1);
-                            entry_data_indices.push(Some(si));
-                            entry_group_keys.push(None);
-                            entry_badge_text.push(status_label.to_string());
-                            entry_badge_color.push(match plugin.install_status.as_str() {
-                                "installed" => Some(theme.accent_success),
-                                "update_available" => Some(theme.warning),
-                                _ => None,
-                            });
-                        }
-                    }
-                } else if let TabDataState::Error(ref msg) = state.marketplace_data {
                     entry_labels.push(format!("Error: {}", msg));
                     entry_right_labels.push(String::new());
                     entry_desc_lines.push(vec![]);
@@ -3556,13 +2609,6 @@ pub fn render_extensions_modal(
     // Build per-tab action keys for the footer shortcuts.
     // Space enable/disable uses the freshly built entry-mapping locals (not `state.entry_*`, which are published once after paint below)
     let action_keys = extensions_action_keys(state.active_tab);
-    let marketplace_row = marketplace_selected_row(
-        state,
-        &entry_labels,
-        &entry_data_indices,
-        &entry_group_keys,
-        selected,
-    );
 
     // Build owned labels for dynamic action-key shortcuts so we can borrow from them without leaking memory
     // Each entry is `(original_index, label)` so the shortcut `id` stays aligned with `action_keys` even when some keys have no display string
@@ -3575,25 +2621,8 @@ pub fn render_extensions_modal(
                 return None;
             }
             // Don't advertise actions the selection will refuse; the keys still answer with the refusal if pressed
-            let suppressed = match ch {
-                ' ' => {
-                    selected_hook_policy_enforced_at(
-                        state,
-                        &entry_data_indices,
-                        &entry_group_keys,
-                        selected,
-                    ) || selected_mcp_policy_blocked_at(state, &entry_data_indices, selected)
-                }
-                'x' => !selected_hook_source_removable_at(
-                    state,
-                    &entry_data_indices,
-                    &entry_group_keys,
-                    selected,
-                ),
-                _ => false,
-            } || marketplace_row
-                .as_ref()
-                .is_some_and(|row| marketplace_key_suppressed(ch, row));
+            let suppressed =
+                ch == ' ' && selected_mcp_policy_blocked_at(state, &entry_data_indices, selected);
             if suppressed {
                 return None;
             }
@@ -4325,47 +3354,6 @@ mod tests {
     use crossterm::event::KeyModifiers;
 
     #[test]
-    fn derive_source_label_detects_project_scoped_plugins() {
-        // Regression: project-scoped `{cwd}/.grok/plugins/<name>/` must label as a (non-removable) plugin, not a removable "Custom" source
-        // The user grok-home branch is GROK_HOME-aware; this covers the project fallback
-        let (label, is_custom) = derive_source_label("/repo/work/.grok/plugins/my-plugin/hooks");
-        assert_eq!(label, "Plugin: my-plugin");
-        assert!(!is_custom);
-
-        let (label, is_custom) =
-            derive_source_label("/repo/work/.grok/installed-plugins/vendor-abc123/skills");
-        assert_eq!(label, "Plugin: vendor-abc123");
-        assert!(!is_custom);
-    }
-
-    /// String-prefix `strip_prefix($HOME)` would collapse a neighbor profile (`$HOMEbar`) into `Custom: ~bar`.
-    /// Path-component matching must leave it intact while still collapsing a real child of `$HOME`.
-    #[test]
-    fn derive_source_label_does_not_eat_neighbor_profile() {
-        let Some(home) = xai_dirs::home_dir() else {
-            return;
-        };
-        if home.as_os_str().is_empty() {
-            return;
-        }
-        let neighbor = home.as_os_str().to_string_lossy().into_owned() + "bar";
-        let (label, is_custom) = derive_source_label(&neighbor);
-        assert_eq!(label, format!("Custom: {neighbor}"));
-        assert!(is_custom);
-
-        let child = home.join("hooks-extra");
-        let (label, is_custom) = derive_source_label(&child.to_string_lossy());
-        assert_eq!(
-            label,
-            format!(
-                "Custom: ~/{}",
-                std::path::Path::new("hooks-extra").display()
-            )
-        );
-        assert!(is_custom);
-    }
-
-    #[test]
     fn build_entry_non_selectable_leaves_mcp_section_headers_selectable() {
         let mask = build_entry_non_selectable(
             &[false, false, true],
@@ -4416,15 +3404,6 @@ mod tests {
     fn action_keys_resolve_and_have_pinned_telemetry_labels() {
         let expected: &[(ExtensionsTab, &[(char, &str)])] = &[
             (
-                ExtensionsTab::Hooks,
-                &[
-                    ('r', "reload"),
-                    ('a', "add"),
-                    (' ', "toggle"),
-                    ('x', "remove"),
-                ],
-            ),
-            (
                 ExtensionsTab::Plugins,
                 &[
                     ('r', "reload"),
@@ -4435,21 +3414,9 @@ mod tests {
                 ],
             ),
             (
-                ExtensionsTab::Marketplace,
-                &[
-                    ('i', "install"),
-                    ('r', "refresh"),
-                    ('u', "update"),
-                    ('a', "add_source"),
-                    ('d', "uninstall"),
-                    ('x', "remove_source"),
-                ],
-            ),
-            (
                 ExtensionsTab::Skills,
                 &[(' ', "toggle"), ('f', "filter"), ('r', "reload")],
             ),
-            (ExtensionsTab::Workflows, &[('r', "reload")]),
             (
                 ExtensionsTab::McpServers,
                 &[
@@ -5131,22 +4098,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn hooks_collapsed_groups_ignored_during_search() {
-        let mut collapsed = std::collections::HashSet::new();
-        collapsed.insert("global/hooks".to_string());
-
-        // When query is empty, collapsed groups stay collapsed.
-        let query = "";
-        let is_collapsed_no_query = collapsed.contains("global/hooks") && query.is_empty();
-        assert!(is_collapsed_no_query);
-
-        // When query is non-empty, collapsed groups are forced open.
-        let query = "safety";
-        let is_collapsed_with_query = collapsed.contains("global/hooks") && query.is_empty();
-        assert!(!is_collapsed_with_query);
-    }
-
     fn make_plugin_skill(
         name: &str,
         desc: &str,
@@ -5248,126 +4199,6 @@ mod tests {
     }
 
     #[test]
-    fn workflows_tab_renders_catalog_flat() {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Workflows);
-        state.workflows_data = TabDataState::Loaded(vec![WorkflowInfo {
-            name: "fix-ci".to_string(),
-            description: "Fix failing CI on the current PR".to_string(),
-            when_to_use: Some("when CI is red".to_string()),
-            source: "builtin".to_string(),
-            path: None,
-        }]);
-        let area = Rect::new(0, 0, 100, 40);
-        let mut buf = Buffer::empty(area);
-        render_extensions_modal(&mut buf, area, &mut state, None, false, 0);
-
-        assert_eq!(
-            buffer_count(&buf, "fix-ci"),
-            1,
-            "the workflow name must render as a flat row"
-        );
-        assert_eq!(
-            buffer_count(&buf, "(builtin)"),
-            1,
-            "the workflow source must render as the right label"
-        );
-        assert!(
-            !state
-                .entry_labels_cache
-                .iter()
-                .any(|l| l.starts_with("Workflows (")),
-            "the flat catalog must not render a group header"
-        );
-        assert!(
-            state.entry_data_indices.iter().all(|d| d.is_none()),
-            "workflow rows are browse-only"
-        );
-        assert!(
-            state.entry_group_keys.iter().all(|k| k.is_none()),
-            "workflow rows are not collapsible groups"
-        );
-    }
-
-    #[test]
-    fn workflows_tab_shows_all_entries_without_unusable_name_badge() {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Workflows);
-        state.workflows_data = TabDataState::Loaded(vec![
-            WorkflowInfo {
-                name: "valid-workflow".into(),
-                description: "Valid".into(),
-                when_to_use: None,
-                source: "project".into(),
-                path: None,
-            },
-            WorkflowInfo {
-                name: "Not Launchable".into(),
-                description: "Invalid".into(),
-                when_to_use: None,
-                source: "project".into(),
-                path: None,
-            },
-        ]);
-        let area = Rect::new(0, 0, 100, 40);
-        let mut buf = Buffer::empty(area);
-        render_extensions_modal(&mut buf, area, &mut state, None, false, 0);
-        assert_eq!(buffer_count(&buf, "valid-workflow"), 1);
-        assert_eq!(
-            buffer_count(&buf, "Not Launchable"),
-            1,
-            "odd-named catalog entries still render"
-        );
-        assert_eq!(
-            buffer_count(&buf, "[no slash command]"),
-            0,
-            "no unusable-name badge"
-        );
-    }
-
-    #[test]
-    fn workflows_tab_empty_shows_placeholder() {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Workflows);
-        state.workflows_data = TabDataState::Loaded(vec![]);
-        let area = Rect::new(0, 0, 100, 40);
-        let mut buf = Buffer::empty(area);
-        render_extensions_modal(&mut buf, area, &mut state, None, false, 0);
-        assert_eq!(
-            state.entry_labels_cache,
-            [workflows_picker_rows::WORKFLOWS_EMPTY_PLACEHOLDER]
-        );
-        assert_eq!(
-            buffer_count(&buf, "No workflows available"),
-            1,
-            "empty catalog renders the dimmed placeholder row"
-        );
-    }
-
-    #[test]
-    fn workflows_tab_error_renders_dimmed_row() {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Workflows);
-        state.workflows_data = TabDataState::Error("boom".into());
-        let area = Rect::new(0, 0, 100, 40);
-        let mut buf = Buffer::empty(area);
-        render_extensions_modal(&mut buf, area, &mut state, None, false, 0);
-        assert_eq!(buffer_count(&buf, "Error: boom"), 1);
-    }
-
-    #[test]
-    fn workflows_tab_loading_shows_spinner_not_placeholder() {
-        // `ExtensionsModalState::new` starts `workflows_data` at Loading.
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Workflows);
-        let area = Rect::new(0, 0, 100, 40);
-        let mut buf = Buffer::empty(area);
-        render_extensions_modal(&mut buf, area, &mut state, None, false, 0);
-        assert!(state.entry_labels_cache.is_empty(), "no rows while loading");
-        assert_eq!(
-            buffer_count(&buf, "Loading"),
-            1,
-            "loading spinner shown instead of the empty placeholder"
-        );
-        assert_eq!(buffer_count(&buf, "No workflows available"), 0);
-    }
-
-    #[test]
     fn mcps_tab_loading_spinner_advances_with_tick() {
         let frames = crate::glyphs::dot_spinner_frames();
         let frame0 = frames.first().copied().unwrap_or("");
@@ -5399,15 +4230,6 @@ mod tests {
             0,
             "tick 8 must not show {msg0:?}"
         );
-    }
-
-    #[test]
-    fn workflows_reload_key_resolves_reload_skills() {
-        // resolve_key's match is non-exhaustive; pin the Workflows arm.
-        assert!(matches!(
-            resolve_key(ExtensionsTab::Workflows, 'r'),
-            Some(ButtonAction::ReloadSkills)
-        ));
     }
 
     fn make_plugin(name: &str) -> xai_hooks_plugins_types::PluginInfo {
@@ -5474,141 +4296,6 @@ mod tests {
         assert_eq!(action_key_cheatsheet_desc('a', "install"), "install");
     }
 
-    /// The remove gate is source-level: a pinned hook blocks its whole source, and only its own source.
-    #[test]
-    fn hook_source_pinned_is_source_level() {
-        let mut pinned = make_hook("policy/a", "/etc/grok", false);
-        pinned.pinned = true;
-        let sibling = make_hook("user/b", "/etc/grok", false);
-        let elsewhere = make_hook("user/c", "/home/u/.grok", false);
-        let hooks = vec![pinned, sibling, elsewhere];
-
-        assert!(hook_source_pinned(&hooks, "/etc/grok"));
-        assert!(!hook_source_pinned(&hooks, "/home/u/.grok"));
-        assert!(!hook_source_pinned(&hooks, "/nonexistent"));
-    }
-
-    /// The Space hint is suppressed for policy-enforced selections; mixed groups and unpinned rows keep it.
-    #[test]
-    fn policy_enforced_selection_suppresses_space_hint() {
-        let mut pinned = make_hook("policy/a", "/etc/grok", false);
-        pinned.pinned = true;
-        let mut user = make_hook("user/b", "/home/u/.grok", false);
-        user.removable = true;
-
-        // Entry maps as the picker builds them (headers carry a group key, no data index):
-        //   0: header /etc/grok, 1: pinned row, 2: header user, 3: user row
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Hooks);
-        state.hooks_data = TabDataState::Loaded(xai_hooks_plugins_types::HooksListResponse {
-            hooks: vec![pinned, user],
-            project_trusted: true,
-            load_errors: Vec::new(),
-        });
-        let data_indices = vec![None, Some(0), None, Some(1)];
-        let group_keys = vec![
-            Some("/etc/grok".to_string()),
-            None,
-            Some("/home/u/.grok".to_string()),
-            None,
-        ];
-
-        let enforced =
-            |sel| selected_hook_policy_enforced_at(&state, &data_indices, &group_keys, sel);
-        let removable =
-            |sel| selected_hook_source_removable_at(&state, &data_indices, &group_keys, sel);
-        // Policy group header and the pinned row: Space and x suppressed.
-        assert!(enforced(0));
-        assert!(enforced(1));
-        assert!(!removable(0));
-        assert!(!removable(1));
-        // Registered-dir header and row: both hints stay.
-        assert!(!enforced(2));
-        assert!(!enforced(3));
-        assert!(removable(2));
-        assert!(removable(3));
-
-        // Mixed group header: unpinned members keep it toggleable.
-        let mut mixed_pinned = make_hook("policy/c", "/mixed", false);
-        mixed_pinned.pinned = true;
-        let mixed_user = make_hook("user/d", "/mixed", false);
-        let mixed_state = {
-            let mut s = ExtensionsModalState::new(ExtensionsTab::Hooks);
-            s.hooks_data = TabDataState::Loaded(xai_hooks_plugins_types::HooksListResponse {
-                hooks: vec![mixed_pinned, mixed_user],
-                project_trusted: true,
-                load_errors: Vec::new(),
-            });
-            s
-        };
-        let mixed_indices = vec![None, Some(0), Some(1)];
-        let mixed_keys = vec![Some("/mixed".to_string()), None, None];
-        assert!(!selected_hook_policy_enforced_at(
-            &mixed_state,
-            &mixed_indices,
-            &mixed_keys,
-            0
-        ));
-        // ...but a non-registered source is never removable.
-        for sel in 0..3 {
-            assert!(!selected_hook_source_removable_at(
-                &mixed_state,
-                &mixed_indices,
-                &mixed_keys,
-                sel
-            ));
-        }
-    }
-
-    /// The x hint must mirror the remove handler: a managed-policy member makes the whole source
-    /// unremovable even when the shell reports the directory as user-registered (`removable: true` —
-    /// older shells set it from registration alone).
-    #[test]
-    fn remove_hint_suppressed_for_registered_but_pinned_source() {
-        let mut pinned = make_hook("policy/a", "/reg/policy", false);
-        pinned.pinned = true;
-        pinned.removable = true;
-        let mut sibling = make_hook("user/b", "/reg/policy", false);
-        sibling.removable = true;
-
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Hooks);
-        state.hooks_data = TabDataState::Loaded(xai_hooks_plugins_types::HooksListResponse {
-            hooks: vec![pinned, sibling],
-            project_trusted: true,
-            load_errors: Vec::new(),
-        });
-        // 0: header, 1: pinned row, 2: unpinned sibling row.
-        let data_indices = vec![None, Some(0), Some(1)];
-        let group_keys = vec![Some("/reg/policy".to_string()), None, None];
-        for sel in 0..3 {
-            assert!(
-                !selected_hook_source_removable_at(&state, &data_indices, &group_keys, sel),
-                "selection {sel} must not offer x remove for a pinned source"
-            );
-        }
-    }
-
-    /// Regression: refetches must not re-collapse expanded groups.
-    #[test]
-    fn hook_groups_seed_only_once() {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Hooks);
-        let hooks = vec![
-            make_hook("a", "/src1", false),
-            make_hook("b", "/src2", false),
-        ];
-        // An empty first delivery must not finish seeding: sources arriving
-        // later would open expanded instead of getting the collapsed default.
-        state.seed_hook_groups_once(&[]);
-        state.seed_hook_groups_once(&hooks);
-        assert!(state.hooks_collapsed_groups.contains("/src1"));
-        assert!(state.hooks_collapsed_groups.contains("/src2"));
-
-        // User expands /src1; the refetch delivery must preserve that.
-        state.hooks_collapsed_groups.remove("/src1");
-        state.seed_hook_groups_once(&hooks);
-        assert!(!state.hooks_collapsed_groups.contains("/src1"));
-        assert!(state.hooks_collapsed_groups.contains("/src2"));
-    }
-
     /// The plugin and skill seeds share the hooks seed's empty-first-delivery
     /// rule (an empty list leaves seeding open for the next delivery).
     #[test]
@@ -5664,10 +4351,8 @@ mod tests {
     #[test]
     fn tab_all_hints_derives_from_action_keys_with_space_enable_disable() {
         for tab in [
-            ExtensionsTab::Hooks,
             ExtensionsTab::Plugins,
             ExtensionsTab::Skills,
-            ExtensionsTab::Workflows,
             ExtensionsTab::McpServers,
         ] {
             let keys = extensions_action_keys(tab);
@@ -5709,27 +4394,21 @@ mod tests {
 
     #[test]
     fn tab_next_wraps_around() {
-        assert_eq!(ExtensionsTab::Hooks.next(), ExtensionsTab::Plugins);
-        assert_eq!(ExtensionsTab::Plugins.next(), ExtensionsTab::Marketplace);
-        assert_eq!(ExtensionsTab::Marketplace.next(), ExtensionsTab::Skills);
-        assert_eq!(ExtensionsTab::Skills.next(), ExtensionsTab::Workflows);
-        assert_eq!(ExtensionsTab::Workflows.next(), ExtensionsTab::McpServers);
-        assert_eq!(ExtensionsTab::McpServers.next(), ExtensionsTab::Hooks);
+        assert_eq!(ExtensionsTab::Plugins.next(), ExtensionsTab::Skills);
+        assert_eq!(ExtensionsTab::Skills.next(), ExtensionsTab::McpServers);
+        assert_eq!(ExtensionsTab::McpServers.next(), ExtensionsTab::Plugins);
     }
 
     #[test]
     fn tab_prev_wraps_around() {
-        assert_eq!(ExtensionsTab::Hooks.prev(), ExtensionsTab::McpServers);
-        assert_eq!(ExtensionsTab::McpServers.prev(), ExtensionsTab::Workflows);
-        assert_eq!(ExtensionsTab::Workflows.prev(), ExtensionsTab::Skills);
-        assert_eq!(ExtensionsTab::Skills.prev(), ExtensionsTab::Marketplace);
-        assert_eq!(ExtensionsTab::Marketplace.prev(), ExtensionsTab::Plugins);
-        assert_eq!(ExtensionsTab::Plugins.prev(), ExtensionsTab::Hooks);
+        assert_eq!(ExtensionsTab::Plugins.prev(), ExtensionsTab::McpServers);
+        assert_eq!(ExtensionsTab::McpServers.prev(), ExtensionsTab::Skills);
+        assert_eq!(ExtensionsTab::Skills.prev(), ExtensionsTab::Plugins);
     }
 
     #[test]
-    fn tab_all_contains_six_tabs() {
-        assert_eq!(ExtensionsTab::ALL.len(), 6);
+    fn tab_all_contains_three_tabs() {
+        assert_eq!(ExtensionsTab::ALL.len(), 3);
     }
 
     #[test]
@@ -6296,337 +4975,11 @@ mod tests {
         );
     }
 
-    fn make_hook(
-        name: &str,
-        source_dir: &str,
-        disabled: bool,
-    ) -> xai_hooks_plugins_types::HookInfo {
-        xai_hooks_plugins_types::HookInfo {
-            name: name.to_string(),
-            event: xai_hooks_plugins_types::HookEvent::PreToolUse,
-            handler_type: xai_hooks_plugins_types::HookHandlerType::Command,
-            matcher: None,
-            command: Some("/bin/true".to_string()),
-            url: None,
-            timeout_ms: 10_000,
-            source_dir: source_dir.to_string(),
-            disabled,
-            pinned: false,
-            removable: false,
-        }
-    }
-
-    /// Group direction: pinned hooks never drive it; a mixed group follows its unpinned hooks.
-    /// An all-pinned group reads enabled (everything in it always runs).
-    #[test]
-    fn hook_group_direction_ignores_pinned_hooks() {
-        let mut pinned = make_hook("policy", "/etc/grok", false);
-        pinned.pinned = true;
-
-        // Mixed group, all unpinned disabled: direction is "enable" even though the pinned hook always reports enabled
-        let disabled_user = make_hook("user", "/etc/grok", true);
-        assert!(!hook_group_any_enabled(
-            [&pinned, &disabled_user].into_iter()
-        ));
-
-        // Mixed group with an enabled unpinned hook: "disable".
-        let enabled_user = make_hook("user2", "/etc/grok", false);
-        assert!(hook_group_any_enabled([&pinned, &enabled_user].into_iter()));
-
-        // All-pinned group: reads enabled, never "off".
-        assert!(hook_group_any_enabled([&pinned].into_iter()));
-    }
-
-    #[test]
-    fn build_hook_groups_respects_filter() {
-        let hooks = vec![
-            make_hook("a", "/src", false),   // enabled
-            make_hook("b", "/src", true),    // disabled
-            make_hook("c", "/other", false), // enabled
-        ];
-        let groups = build_hook_groups(&hooks, StatusFilter::Enabled, "");
-        // Two custom groups, ordered A–Z by display label: /other before /src.
-        let [other, src] = groups.as_slice() else {
-            panic!("expected two hook groups");
-        };
-        assert_eq!(other.source_dir, "/other");
-        assert_eq!(other.indices, vec![2]);
-        assert_eq!(src.source_dir, "/src");
-        assert_eq!(src.indices, vec![0]);
-
-        let groups_disabled = build_hook_groups(&hooks, StatusFilter::Disabled, "");
-        // One group: /src with [1].
-        let [disabled] = groups_disabled.as_slice() else {
-            panic!("expected one disabled hook group");
-        };
-        assert_eq!(disabled.indices, vec![1]);
-    }
-
     #[test]
     fn modal_state_filters_default_to_all() {
-        let state = ExtensionsModalState::new(ExtensionsTab::Hooks);
-        assert_eq!(state.hooks_filter, StatusFilter::All);
+        let state = ExtensionsModalState::new(ExtensionsTab::Plugins);
         assert_eq!(state.plugins_filter, StatusFilter::All);
         assert_eq!(state.mcps_filter, StatusFilter::All);
-    }
-
-    /// Build a realistic marketplace source modelled on obra/superpowers.
-    fn superpowers_source() -> xai_hooks_plugins_types::MarketplaceScanResult {
-        xai_hooks_plugins_types::MarketplaceScanResult {
-            source_name: "superpowers".into(),
-            source_kind: "git".into(),
-            source_url_or_path: "https://github.com/obra/superpowers".into(),
-            plugins: vec![
-                TestPlugin {
-                    name: "superpowers",
-                    description: Some(
-                        "An agentic skills framework & software development methodology",
-                    ),
-                    skill_count: 14,
-                    has_hooks: true,
-                    has_agents: true,
-                    ..Default::default()
-                }
-                .build(),
-                TestPlugin {
-                    name: "brainstorming",
-                    description: Some("Socratic design refinement before writing code"),
-                    install_status: "installed",
-                    ..Default::default()
-                }
-                .build(),
-                TestPlugin {
-                    name: "test-driven-development",
-                    description: Some(
-                        "RED-GREEN-REFACTOR cycle with testing anti-patterns reference",
-                    ),
-                    ..Default::default()
-                }
-                .build(),
-                TestPlugin {
-                    name: "systematic-debugging",
-                    description: Some("4-phase root cause analysis process"),
-                    install_status: "update_available",
-                    ..Default::default()
-                }
-                .build(),
-                TestPlugin {
-                    name: "subagent-driven-development",
-                    description: Some("Fast iteration with two-stage review"),
-                    has_agents: true,
-                    ..Default::default()
-                }
-                .build(),
-            ],
-            error: None,
-        }
-    }
-
-    /// Test helper: marketplace plugin descriptor with sensible defaults.
-    struct TestPlugin {
-        name: &'static str,
-        version: Option<&'static str>,
-        description: Option<&'static str>,
-        author: Option<&'static str>,
-        skill_count: usize,
-        has_hooks: bool,
-        has_agents: bool,
-        has_mcp: bool,
-        install_status: &'static str,
-        components: Option<xai_hooks_plugins_types::PluginComponents>,
-    }
-
-    impl Default for TestPlugin {
-        fn default() -> Self {
-            Self {
-                name: "",
-                version: Some("5.1.0"),
-                description: None,
-                author: Some("obra"),
-                skill_count: 1,
-                has_hooks: false,
-                has_agents: false,
-                has_mcp: false,
-                install_status: "not_installed",
-                components: None,
-            }
-        }
-    }
-
-    impl TestPlugin {
-        fn build(self) -> xai_hooks_plugins_types::MarketplacePluginEntry {
-            let installed_version = if self.install_status == "installed"
-                || self.install_status == "update_available"
-            {
-                self.version.map(String::from)
-            } else {
-                None
-            };
-            xai_hooks_plugins_types::MarketplacePluginEntry {
-                name: self.name.to_string(),
-                version: self.version.map(String::from),
-                description: self.description.map(String::from),
-                category: None,
-                author: self.author.map(String::from),
-                tags: vec![],
-                keywords: vec![],
-                domains: vec![],
-                homepage: None,
-                relative_path: format!("plugins/{}", self.name),
-                skill_count: self.skill_count,
-                has_hooks: self.has_hooks,
-                has_agents: self.has_agents,
-                has_mcp: self.has_mcp,
-                install_status: self.install_status.to_string(),
-                installed_version,
-                components: self.components,
-                remote_url: Some("https://github.com/obra/superpowers".into()),
-                remote_ref: Some("main".into()),
-                remote_sha: None,
-                remote_subdir: None,
-            }
-        }
-    }
-
-    #[test]
-    fn resolve_selection_on_source_header() {
-        let sources = vec![superpowers_source()];
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Marketplace);
-        state.entry_data_indices = vec![None, Some(0), Some(0), Some(0), Some(0), Some(0)];
-        state.entry_group_keys = vec![Some("0".into()), None, None, None, None, None];
-        state.entry_labels_cache = vec![
-            "superpowers (5 plugins)".into(),
-            "superpowers".into(),
-            "brainstorming".into(),
-            "test-driven-development".into(),
-            "systematic-debugging".into(),
-            "subagent-driven-development".into(),
-        ];
-        state.picker_state.selected = 0; // source header
-        let result = state.resolve_marketplace_selection(&sources);
-        assert_eq!(result, Some((0, None)));
-    }
-
-    #[test]
-    fn resolve_selection_on_plugin_entry() {
-        let sources = vec![superpowers_source()];
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Marketplace);
-        state.entry_data_indices = vec![None, Some(0), Some(0), Some(0), Some(0), Some(0)];
-        state.entry_group_keys = vec![Some("0".into()), None, None, None, None, None];
-        state.entry_labels_cache = vec![
-            "superpowers (5 plugins)".into(),
-            "superpowers".into(),
-            "brainstorming".into(),
-            "test-driven-development".into(),
-            "systematic-debugging".into(),
-            "subagent-driven-development".into(),
-        ];
-        // Select "brainstorming" (picker index 2).
-        state.picker_state.selected = 2;
-        let result = state.resolve_marketplace_selection(&sources);
-        assert_eq!(result, Some((0, Some(1)))); // source 0, plugin index 1
-
-        // Select "systematic-debugging" (picker index 4).
-        state.picker_state.selected = 4;
-        let result = state.resolve_marketplace_selection(&sources);
-        assert_eq!(result, Some((0, Some(3)))); // source 0, plugin index 3
-    }
-
-    #[test]
-    fn marketplace_add_source_builds_action() {
-        let texts = vec!["https://github.com/obra/superpowers".into()];
-        let action = build_action_from_input("marketplace_add_source", &texts);
-        match action {
-            Some(ButtonAction::MarketplaceAction(
-                xai_hooks_plugins_types::MarketplaceAction::AddSource { url },
-            )) => {
-                assert_eq!(url, "https://github.com/obra/superpowers");
-            }
-            other => panic!("expected MarketplaceAction::AddSource, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn marketplace_add_source_trims_whitespace() {
-        let texts = vec!["  https://github.com/obra/superpowers  ".into()];
-        let action = build_action_from_input("marketplace_add_source", &texts);
-        match action {
-            Some(ButtonAction::MarketplaceAction(
-                xai_hooks_plugins_types::MarketplaceAction::AddSource { url },
-            )) => {
-                assert_eq!(url, "https://github.com/obra/superpowers");
-            }
-            other => panic!("expected MarketplaceAction::AddSource, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn marketplace_key_i_dispatches_install() {
-        let action = resolve_key(ExtensionsTab::Marketplace, 'i');
-        assert!(matches!(
-            action,
-            Some(ButtonAction::InstallSelectedMarketplacePlugin)
-        ));
-    }
-
-    #[test]
-    fn marketplace_key_d_dispatches_uninstall() {
-        let action = resolve_key(ExtensionsTab::Marketplace, 'd');
-        assert!(matches!(
-            action,
-            Some(ButtonAction::UninstallSelectedMarketplacePlugin)
-        ));
-    }
-
-    #[test]
-    fn marketplace_key_r_dispatches_refresh() {
-        let action = resolve_key(ExtensionsTab::Marketplace, 'r');
-        assert!(matches!(
-            action,
-            Some(ButtonAction::MarketplaceAction(
-                xai_hooks_plugins_types::MarketplaceAction::Refresh {
-                    source_url_or_path: None
-                }
-            ))
-        ));
-    }
-
-    #[test]
-    fn marketplace_key_a_dispatches_add_source_input() {
-        let action = resolve_key(ExtensionsTab::Marketplace, 'a');
-        match action {
-            Some(ButtonAction::StartInput {
-                command_prefix,
-                fields,
-            }) => {
-                assert_eq!(command_prefix, "marketplace_add_source");
-                assert_eq!(fields.len(), 1);
-                let Some(field) = fields.first() else {
-                    panic!("expected a field: {fields:?}");
-                };
-                assert_eq!(field.label, "Source");
-                assert!(field.required);
-            }
-            other => panic!("expected StartInput for marketplace_add_source, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn marketplace_key_x_dispatches_remove_source() {
-        let action = resolve_key(ExtensionsTab::Marketplace, 'x');
-        assert!(matches!(
-            action,
-            Some(ButtonAction::RemoveSelectedMarketplaceSource)
-        ));
-    }
-
-    #[test]
-    fn marketplace_key_u_dispatches_update() {
-        let action = resolve_key(ExtensionsTab::Marketplace, 'u');
-        assert!(matches!(
-            action,
-            Some(ButtonAction::UpdateSelectedMarketplacePlugin)
-        ));
     }
 
     #[test]
@@ -6664,129 +5017,6 @@ mod tests {
         assert!(!state.tick_result_notice(), "no notice -> no redraw");
     }
 
-    #[test]
-    fn marketplace_action_keys_match_resolve_key() {
-        for &(ch, label) in &extensions_action_keys(ExtensionsTab::Marketplace) {
-            let action = resolve_key(ExtensionsTab::Marketplace, ch);
-            assert!(
-                action.is_some(),
-                "Marketplace action key ('{ch}', \"{label}\") has no resolve_key arm"
-            );
-        }
-    }
-
-    #[test]
-    fn marketplace_fuzzy_matches_superpowers_plugins() {
-        let source = superpowers_source();
-        // "tdd" fuzzy-matches "test-driven-development" (t...d...d).
-        assert!(source.plugins.iter().any(|p| fuzzy_matches(&p.name, "tdd")));
-        // "brain" substring-matches "brainstorming".
-        assert!(
-            source
-                .plugins
-                .iter()
-                .any(|p| fuzzy_matches(&p.name, "brain"))
-        );
-        // "xyz" matches nothing.
-        assert!(!source.plugins.iter().any(|p| fuzzy_matches(&p.name, "xyz")));
-    }
-
-    #[test]
-    fn marketplace_fuzzy_matches_across_multiple_plugins() {
-        let source = superpowers_source();
-        // "sub" matches "subagent-driven-development" and "superpowers" (s...u...b in both)
-        let matches: Vec<&str> = source
-            .plugins
-            .iter()
-            .filter(|p| fuzzy_matches(&p.name, "sub"))
-            .map(|p| p.name.as_str())
-            .collect();
-        assert!(matches.contains(&"subagent-driven-development"));
-    }
-
-    #[test]
-    fn marketplace_modal_state_with_loaded_data() {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Marketplace);
-        state.marketplace_data =
-            TabDataState::Loaded(xai_hooks_plugins_types::MarketplaceListResponse {
-                sources: vec![superpowers_source()],
-            });
-        assert!(matches!(state.marketplace_data, TabDataState::Loaded(_)));
-        assert_eq!(state.marketplace_selected, 0);
-        assert_eq!(state.marketplace_scroll, 0);
-    }
-
-    #[test]
-    fn marketplace_collapsed_sources_start_empty() {
-        let state = ExtensionsModalState::new(ExtensionsTab::Marketplace);
-        assert!(state.marketplace_collapsed_sources.is_empty());
-    }
-
-    #[test]
-    fn marketplace_is_group_expanded_default_open() {
-        let state = ExtensionsModalState::new(ExtensionsTab::Marketplace);
-        // Source "0" is not in collapsed set, so it's expanded.
-        assert!(state.is_group_expanded(0, "0"));
-    }
-
-    #[test]
-    fn marketplace_is_group_expanded_collapsed_source() {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Marketplace);
-        state.marketplace_collapsed_sources.insert(0);
-        // Source "0" is now collapsed.
-        assert!(!state.is_group_expanded(0, "0"));
-    }
-
-    #[test]
-    fn marketplace_is_group_expanded_forced_open_during_search() {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Marketplace);
-        state.marketplace_collapsed_sources.insert(0);
-        state.picker_state.set_query("debug");
-        // During search, collapsed sources are forced open.
-        assert!(state.is_group_expanded(0, "0"));
-    }
-
-    /// The footer advertises only what the selected Marketplace row can do: source verbs on a
-    /// source header, install-status-matched plugin verbs on a plugin row, never the other set.
-    #[test]
-    fn marketplace_footer_follows_selected_row_kind() {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Marketplace);
-        state.marketplace_data =
-            TabDataState::Loaded(xai_hooks_plugins_types::MarketplaceListResponse {
-                sources: vec![superpowers_source()],
-            });
-        let footer = |state: &mut ExtensionsModalState, row: usize| -> Vec<&'static str> {
-            state.picker_state.selected = row;
-            let buf = render_marketplace_into_buffer(state, 120, 30);
-            // Key-prefixed footer form, so row badges like "[installed]" do not match.
-            [
-                "i install",
-                "u update",
-                "d uninstall",
-                "a add source",
-                "x remove source",
-                "r refresh",
-            ]
-            .into_iter()
-            .filter(|label| buffer_count(&buf, label) > 0)
-            .collect()
-        };
-        // Row 0: the source header.
-        assert_eq!(
-            footer(&mut state, 0),
-            vec!["a add source", "x remove source", "r refresh"]
-        );
-        // Plugin rows are alphabetical. Row 1: "brainstorming", installed.
-        assert_eq!(footer(&mut state, 1), vec!["d uninstall", "r refresh"]);
-        // Row 2: "subagent-driven-development", not installed.
-        assert_eq!(footer(&mut state, 2), vec!["i install", "r refresh"]);
-        // Row 4: "systematic-debugging", update available.
-        assert_eq!(
-            footer(&mut state, 4),
-            vec!["u update", "d uninstall", "r refresh"]
-        );
-    }
-
     /// A row-scoped key on a collapsed header: no child row is visible, so the hint asks for the
     /// expand first instead of pointing at rows the list does not show.
     #[test]
@@ -6812,21 +5042,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn marketplace_error_source_renders_header_with_error_badge() {
-        let error_source = xai_hooks_plugins_types::MarketplaceScanResult {
-            source_name: "broken-source".into(),
-            source_kind: "git".into(),
-            source_url_or_path: "https://github.com/bad/repo".into(),
-            plugins: vec![],
-            error: Some("failed to clone: repository not found".into()),
-        };
-        let mut state = marketplace_modal_state(error_source);
-        let buf = render_marketplace_into_buffer(&mut state, 100, 40);
-        assert!(buffer_count(&buf, "broken-source") >= 1);
-        assert!(buffer_count(&buf, "[error]") >= 1);
-    }
-
     fn component(name: &str, desc: Option<&str>) -> xai_hooks_plugins_types::ComponentItem {
         xai_hooks_plugins_types::ComponentItem::new(name, desc.map(str::to_string))
     }
@@ -6841,68 +5056,6 @@ mod tests {
             hooks: vec![component("PreToolUse", Some("Bash"))],
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn marketplace_summary_uses_catalog_components_when_present() {
-        let plugin = TestPlugin {
-            name: "superpowers",
-            components: Some(sample_components()),
-            ..Default::default()
-        }
-        .build();
-        assert_eq!(
-            marketplace_components_summary(&plugin).as_deref(),
-            Some("2 skills \u{b7} 1 command \u{b7} 1 hook")
-        );
-    }
-
-    #[test]
-    fn marketplace_summary_empty_components_is_none() {
-        let plugin = TestPlugin {
-            name: "empty",
-            components: Some(xai_hooks_plugins_types::PluginComponents::default()),
-            ..Default::default()
-        }
-        .build();
-        assert_eq!(marketplace_components_summary(&plugin), None);
-    }
-
-    #[test]
-    fn marketplace_summary_ignores_legacy_fields() {
-        let plugin = TestPlugin {
-            name: "legacy",
-            skill_count: 3,
-            has_hooks: true,
-            has_mcp: true,
-            ..Default::default()
-        }
-        .build();
-        assert_eq!(marketplace_components_summary(&plugin), None);
-    }
-
-    #[test]
-    fn marketplace_summary_url_entry_without_data_is_none() {
-        let plugin = TestPlugin {
-            name: "remote",
-            skill_count: 0,
-            ..Default::default()
-        }
-        .build();
-        assert!(plugin.remote_url.is_some());
-        assert_eq!(marketplace_components_summary(&plugin), None);
-    }
-
-    #[test]
-    fn marketplace_summary_local_entry_without_data_shows_nothing() {
-        let mut plugin = TestPlugin {
-            name: "bare",
-            skill_count: 0,
-            ..Default::default()
-        }
-        .build();
-        plugin.remote_url = None;
-        assert_eq!(marketplace_components_summary(&plugin), None);
     }
 
     #[test]
@@ -6986,95 +5139,6 @@ mod tests {
             count += row.matches(needle).count();
         }
         count
-    }
-
-    fn marketplace_modal_state(
-        source: xai_hooks_plugins_types::MarketplaceScanResult,
-    ) -> ExtensionsModalState {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Marketplace);
-        state.marketplace_data =
-            TabDataState::Loaded(xai_hooks_plugins_types::MarketplaceListResponse {
-                sources: vec![source],
-            });
-        state
-    }
-
-    #[test]
-    fn marketplace_collapsed_row_shows_component_summary() {
-        let mut source = superpowers_source();
-        if let Some(plugin) = source.plugins.get_mut(0) {
-            plugin.components = Some(sample_components());
-        }
-        let mut state = marketplace_modal_state(source);
-        let buf = render_marketplace_into_buffer(&mut state, 100, 40);
-        assert!(
-            state.picker_state.expanded.is_empty(),
-            "rows must be collapsed by default for this test to pin anything"
-        );
-        assert_eq!(
-            buffer_count(&buf, "2 skills \u{b7} 1 command \u{b7} 1 hook"),
-            1,
-            "collapsed marketplace row must show the catalog component summary"
-        );
-    }
-
-    #[test]
-    fn marketplace_legacy_fields_never_render() {
-        let mut source = superpowers_source();
-        source.plugins.truncate(1);
-        let mut state = marketplace_modal_state(source);
-        let legacy_needle = "14 skills";
-
-        let collapsed_buf = render_marketplace_into_buffer(&mut state, 100, 40);
-        assert_eq!(
-            buffer_count(&collapsed_buf, legacy_needle),
-            0,
-            "legacy scan counts must not render on collapsed rows"
-        );
-
-        state.picker_state.expanded.insert(1);
-        let expanded_buf = render_marketplace_into_buffer(&mut state, 100, 40);
-        assert_eq!(
-            buffer_count(&expanded_buf, legacy_needle),
-            0,
-            "legacy scan counts must not render in the expanded view"
-        );
-        assert_eq!(
-            buffer_count(&expanded_buf, "contents shown after install"),
-            1,
-            "catalog-less URL entry shows the install hint in the provides field"
-        );
-    }
-
-    #[test]
-    fn marketplace_catalog_summary_not_duplicated_when_expanded() {
-        let mut source = superpowers_source();
-        source.plugins.truncate(1);
-        if let Some(plugin) = source.plugins.get_mut(0) {
-            plugin.components = Some(sample_components());
-        }
-        let mut state = marketplace_modal_state(source);
-        let summary = "2 skills \u{b7} 1 command \u{b7} 1 hook";
-
-        let collapsed_buf = render_marketplace_into_buffer(&mut state, 100, 40);
-        assert_eq!(
-            buffer_count(&collapsed_buf, summary),
-            1,
-            "collapsed row shows the catalog summary once"
-        );
-
-        state.picker_state.expanded.insert(1);
-        let expanded_buf = render_marketplace_into_buffer(&mut state, 100, 40);
-        assert_eq!(
-            buffer_count(&expanded_buf, summary),
-            0,
-            "expanded view replaces the summary with the enumeration"
-        );
-        assert_eq!(
-            buffer_count(&expanded_buf, "brainstorming, test-driven-development"),
-            1,
-            "expanded view enumerates component names once"
-        );
     }
 
     fn plugins_modal_state(
@@ -7404,55 +5468,6 @@ mod tests {
         assert_eq!(buffer_count(&buf, "User (Claude) (1 plugin)"), 1);
         assert_eq!(buffer_count(&buf, "off-tool"), 1);
         assert_eq!(buffer_count(&buf, "[disabled]"), 1);
-    }
-
-    #[test]
-    fn marketplace_placeholders_render_only_when_expanded() {
-        let mut source = superpowers_source();
-        source.plugins.truncate(2);
-        if let Some(plugin) = source.plugins.get_mut(0) {
-            plugin.components = Some(xai_hooks_plugins_types::PluginComponents::default());
-        }
-        if let Some(plugin) = source.plugins.get_mut(1) {
-            plugin.components = None;
-            plugin.skill_count = 0;
-            plugin.has_hooks = false;
-            plugin.has_agents = false;
-            plugin.has_mcp = false;
-        }
-        assert!(
-            source
-                .plugins
-                .get(1)
-                .is_some_and(|p| p.remote_url.is_some())
-        );
-        let mut state = marketplace_modal_state(source);
-
-        let collapsed_buf = render_marketplace_into_buffer(&mut state, 100, 40);
-        assert_eq!(
-            buffer_count(&collapsed_buf, "no detectable components"),
-            0,
-            "collapsed row must not show the empty-catalog placeholder"
-        );
-        assert_eq!(
-            buffer_count(&collapsed_buf, "contents shown after install"),
-            0,
-            "collapsed row must not show the install hint placeholder"
-        );
-
-        state.picker_state.expanded.insert(1);
-        state.picker_state.expanded.insert(2);
-        let expanded_buf = render_marketplace_into_buffer(&mut state, 100, 40);
-        assert_eq!(
-            buffer_count(&expanded_buf, "no detectable components"),
-            1,
-            "expanded view shows the empty-catalog placeholder exactly once"
-        );
-        assert_eq!(
-            buffer_count(&expanded_buf, "contents shown after install"),
-            1,
-            "expanded view shows the install hint placeholder exactly once"
-        );
     }
 
     #[test]
@@ -7799,33 +5814,6 @@ mod tests {
     }
 
     #[test]
-    fn skills_tab_renders_no_workflows_rows() {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Skills);
-        state.skills_data = TabDataState::Loaded(vec![make_skill("alpha", "a")].into());
-        state.workflows_data = TabDataState::Loaded(vec![WorkflowInfo {
-            name: "fix-ci".into(),
-            description: "Fix CI".into(),
-            when_to_use: None,
-            source: "builtin".into(),
-            path: None,
-        }]);
-        let area = Rect::new(0, 0, 100, 40);
-        let mut buf = Buffer::empty(area);
-        render_extensions_modal(&mut buf, area, &mut state, None, false, 0);
-        assert!(
-            !state
-                .entry_labels_cache
-                .iter()
-                .any(|l| l.starts_with("Workflows (")),
-            "the Skills tab must not render a Workflows group header"
-        );
-        assert!(
-            !state.entry_labels_cache.iter().any(|l| l == "fix-ci"),
-            "workflow rows must not render on the Skills tab"
-        );
-    }
-
-    #[test]
     fn seed_skills_groups_collapses_source_groups() {
         let mut state = ExtensionsModalState::new(ExtensionsTab::Skills);
         let skills = vec![make_skill("alpha", "a")];
@@ -7859,59 +5847,6 @@ mod tests {
             state.entry_data_indices,
             vec![None, Some(1), Some(2), Some(0)]
         );
-    }
-
-    #[test]
-    fn ordered_marketplace_view_pins_official_then_az() {
-        let mp = |name: &str, url: &str, err: Option<&str>, plugins: &[&'static str]| {
-            xai_hooks_plugins_types::MarketplaceScanResult {
-                source_name: name.into(),
-                source_kind: "git".into(),
-                source_url_or_path: url.into(),
-                plugins: plugins
-                    .iter()
-                    .copied()
-                    .map(|n| {
-                        TestPlugin {
-                            name: n,
-                            install_status: "installed",
-                            ..Default::default()
-                        }
-                        .build()
-                    })
-                    .collect(),
-                error: err.map(str::to_string),
-            }
-        };
-        let sources = vec![
-            mp("zeta-mp", "https://example.com/zeta", Some("boom"), &[]),
-            mp(
-                "xAI Official",
-                xai_grok_plugin_marketplace::OFFICIAL_SOURCE_GIT_URL,
-                None,
-                &["zeta", "alpha"],
-            ),
-            mp("alpha-mp", "https://example.com/alpha", None, &[]),
-        ];
-        let view = ordered_marketplace_view(&sources);
-        let names: Vec<_> = view
-            .iter()
-            .filter_map(|v| sources.get(v.source_index).map(|s| s.source_name.as_str()))
-            .collect();
-        assert_eq!(names, ["xAI Official", "alpha-mp", "zeta-mp"]);
-        let plugin_names: Vec<_> = view
-            .first()
-            .into_iter()
-            .flat_map(|v| {
-                v.plugin_indices.iter().filter_map(|&pi| {
-                    sources
-                        .get(v.source_index)
-                        .and_then(|s| s.plugins.get(pi))
-                        .map(|p| p.name.as_str())
-                })
-            })
-            .collect();
-        assert_eq!(plugin_names, ["alpha", "zeta"]);
     }
 
     #[test]
@@ -7998,74 +5933,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn workflows_sort_az_by_name() {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Workflows);
-        state.workflows_data = TabDataState::Loaded(vec![
-            WorkflowInfo {
-                name: "zeta-wf".into(),
-                description: "Z".into(),
-                when_to_use: None,
-                source: "builtin".into(),
-                path: None,
-            },
-            WorkflowInfo {
-                name: "alpha-wf".into(),
-                description: "A".into(),
-                when_to_use: None,
-                source: "builtin".into(),
-                path: None,
-            },
-        ]);
-        let area = Rect::new(0, 0, 100, 40);
-        let mut buf = Buffer::empty(area);
-        render_extensions_modal(&mut buf, area, &mut state, None, false, 0);
-        assert_eq!(state.entry_labels_cache, ["alpha-wf", "zeta-wf"]);
-    }
-
-    #[test]
-    fn hooks_group_and_row_order() {
-        let mut h_stop = make_hook("stop-hook", "/tmp/hooks-src", false);
-        h_stop.event = xai_hooks_plugins_types::HookEvent::Stop;
-        let mut h_pre = make_hook("pre-hook", "/tmp/hooks-src", false);
-        h_pre.event = xai_hooks_plugins_types::HookEvent::PreToolUse;
-        h_pre.matcher = Some("Bash".into());
-        let mut h_notify = make_hook("notify-hook", "/tmp/hooks-src", false);
-        h_notify.event = xai_hooks_plugins_types::HookEvent::Notification;
-
-        let hooks = vec![
-            make_hook("c", "/zzz/custom", false),
-            h_stop,
-            make_hook("a", "/repo/.grok/hooks", false),
-            h_pre,
-            h_notify,
-            make_hook("b", "/aaa/custom", false),
-        ];
-        let groups = build_hook_groups(&hooks, StatusFilter::All, "");
-        // Project first, then Custom groups A–Z by path (incl. /tmp/hooks-src).
-        let dirs: Vec<_> = groups.iter().map(|g| g.source_dir).collect();
-        assert_eq!(
-            dirs,
-            [
-                "/repo/.grok/hooks",
-                "/aaa/custom",
-                "/tmp/hooks-src",
-                "/zzz/custom"
-            ]
-        );
-
-        let custom_group = groups
-            .iter()
-            .find(|g| g.source_dir == "/tmp/hooks-src")
-            .expect("custom source");
-        let labels: Vec<_> = custom_group
-            .indices
-            .iter()
-            .filter_map(|&i| hooks.get(i).map(hook_row_label))
-            .collect();
-        assert_eq!(
-            labels,
-            ["on:Notification", "on:Pre-Tool Use /Bash", "on:Stop"]
-        );
-    }
 }

@@ -1,9 +1,4 @@
 //! Top-level action router: maps actions and action results to handlers.
-use super::auth::{
-    dispatch_cancel_login, dispatch_login, dispatch_logout, dispatch_submit_auth_code,
-    dispatch_switch_account,
-};
-use super::billing::dispatch_open_supergrok_url;
 use super::ctx::{
     active_agent_session_id, get_active_agent_mut, navigate_clearing_selection, open_url_or_show,
     sync_sleep_inhibitor, with_active_agent, with_scrollback,
@@ -78,7 +73,7 @@ use super::settings::setters::{
     clear_default_model, clear_fork_secondary_model, clear_subagent_model_inheritance,
     preview_auto_dark_theme, preview_auto_light_theme, preview_theme,
     set_ask_user_question_timeout_enabled, set_auto_dark_theme, set_auto_light_theme,
-    set_auto_update, set_collapsed_edit_blocks, set_combine_queued_prompts, set_compact_mode,
+    set_collapsed_edit_blocks, set_combine_queued_prompts, set_compact_mode,
     set_confirm_before_rewind, set_contextual_hint_export_copy, set_contextual_hint_image_input,
     set_contextual_hint_plan_mode, set_contextual_hint_send_now, set_contextual_hint_small_screen,
     set_contextual_hint_ssh_wrap, set_contextual_hint_undo, set_contextual_hint_word_select,
@@ -98,10 +93,10 @@ use super::settings::ui::{
     dispatch_toggle_vim_mode,
 };
 use super::status::{
-    dispatch_copy_session_id, dispatch_manage_billing, dispatch_open_gboom, dispatch_open_tutorial,
+    dispatch_copy_session_id, dispatch_open_gboom, dispatch_open_tutorial,
     dispatch_privacy_banner_opt_in, dispatch_privacy_banner_opt_out, dispatch_share_session,
     dispatch_show_context_info, dispatch_show_queue, dispatch_show_release_notes,
-    dispatch_show_session_info, dispatch_show_tasks, dispatch_show_usage, set_coding_data_sharing,
+    dispatch_show_session_info, dispatch_show_tasks, set_coding_data_sharing,
 };
 use super::task_result::{dispatch_task_result, unregister_all_active_sessions};
 use super::transcript::{
@@ -122,23 +117,6 @@ use crate::app::consent::ConsentState;
 use crate::scrollback::types::DisplayMode;
 use crate::views::session_picker::CONTENT_EXPAND_OFFSET;
 use xai_grok_telemetry::session_ctx::log_event;
-pub(super) fn dispatch_copy_auth_url(
-    app: &mut AppView,
-    copy: impl FnOnce(&str) -> crate::clipboard::ClipboardDelivery,
-) -> Vec<Effect> {
-    let AuthState::Authenticating {
-        auth_url: Some(url),
-        ..
-    } = &app.auth_state
-    else {
-        return vec![];
-    };
-    app.auth_clipboard_delivery = Some(copy(url));
-    app.auth_clipboard_feedback_generation = app.auth_clipboard_feedback_generation.wrapping_add(1);
-    vec![Effect::ScheduleClearAuthCopyFeedback {
-        generation: app.auth_clipboard_feedback_generation,
-    }]
-}
 /// Dispatch an action: mutate state, return effects to execute.
 /// The returned `Vec<Effect>` may be empty (pure state mutation) or contain async work that the event loop should spawn.
 /// Do not extract a returning arm into a handler: as a delegation its `return`s become plain arm values and start flowing through the tail.
@@ -781,21 +759,12 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
                 return vec![];
             };
             modal.skills_data = crate::views::extensions_modal::TabDataState::Loading;
-            modal.workflows_data = crate::views::extensions_modal::TabDataState::Loading;
-            vec![
-                Effect::FetchSkillsList {
-                    agent_id: id,
-                    session_id: session_id.clone(),
-                    // `r` on the Workflows tab reloads the skills too, from the cache
-                    refresh: modal.active_tab
-                        == crate::views::extensions_modal::ExtensionsTab::Skills,
-                    fetch: modal.next_skills_fetch(),
-                },
-                Effect::FetchWorkflowsList {
-                    agent_id: id,
-                    session_id,
-                },
-            ]
+            vec![Effect::FetchSkillsList {
+                agent_id: id,
+                session_id,
+                refresh: modal.active_tab == crate::views::extensions_modal::ExtensionsTab::Skills,
+                fetch: modal.next_skills_fetch(),
+            }]
         }
         Action::RefreshMcpList => {
             let ActiveView::Agent(id) = app.active_view else {
@@ -817,22 +786,6 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
                 cache: false,
             }]
         }
-        Action::ExecuteHooksAction(action) => {
-            let ActiveView::Agent(id) = app.active_view else {
-                return vec![];
-            };
-            let Some(agent) = app.agents.get(&id) else {
-                return vec![];
-            };
-            let Some(session_id) = agent.session.session_id.clone() else {
-                return vec![];
-            };
-            vec![Effect::HooksAction {
-                agent_id: id,
-                session_id,
-                action,
-            }]
-        }
         Action::ExecutePluginsAction(action) => {
             let ActiveView::Agent(id) = app.active_view else {
                 return vec![];
@@ -844,22 +797,6 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
                 return vec![];
             };
             vec![Effect::PluginsAction {
-                agent_id: id,
-                session_id,
-                action,
-            }]
-        }
-        Action::ExecuteMarketplaceAction(action) => {
-            let ActiveView::Agent(id) = app.active_view else {
-                return vec![];
-            };
-            let Some(agent) = app.agents.get(&id) else {
-                return vec![];
-            };
-            let Some(session_id) = agent.session.session_id.clone() else {
-                return vec![];
-            };
-            vec![Effect::MarketplaceAction {
                 agent_id: id,
                 session_id,
                 action,
@@ -995,11 +932,7 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
                     model_id, effort, ..
                 } = choice;
                 let prev_model = agent.session.models.current.clone();
-                let prev_effort = agent.session.models.reasoning_effort;
                 agent.session.models.set_current(model_id.clone(), effort);
-                let resolved_effort = agent.session.models.reasoning_effort;
-                let unchanged =
-                    prev_model.as_ref() == Some(&model_id) && prev_effort == resolved_effort;
                 let rollback_prev = agent
                     .session
                     .deferred_model_switch
@@ -1012,14 +945,8 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
                         effort,
                         prev_model_id: rollback_prev,
                     });
-                return if unchanged {
-                    vec![]
-                } else {
-                    vec![Effect::PersistPreferredModel {
-                        model_id,
-                        reasoning_effort: resolved_effort,
-                    }]
-                };
+                // oc-build: opencode backend; the pick is not saved to ~/.grok/config.toml.
+                return vec![];
             };
             agent.session.model_switch_pending = true;
             vec![Effect::SwitchModel {
@@ -1082,7 +1009,6 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::KillSubagent(subagent_id) => dispatch_kill_subagent(app, subagent_id),
         Action::CancelScheduledTask(task_id) => dispatch_cancel_scheduled_task(app, task_id),
         Action::DemoteToBackground => dispatch_demote_to_background(app),
-        Action::RequestBundleStatus => vec![Effect::FetchBundleStatus],
         Action::CycleMode => dispatch_cycle_mode(app),
         Action::ShareSession => dispatch_share_session(app),
         Action::ShowSessionInfo => dispatch_show_session_info(app),
@@ -1093,8 +1019,6 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::RenameSession { title } => dispatch_rename_session(app, title),
         Action::ResetSessionTitleToAuto => dispatch_reset_session_title(app),
         Action::ShowContextInfo => dispatch_show_context_info(app),
-        Action::ShowUsage => dispatch_show_usage(app),
-        Action::ManageBilling => dispatch_manage_billing(app),
         Action::ShowQueue => dispatch_show_queue(app),
         Action::ShowTasks => dispatch_show_tasks(app),
         Action::ShowPlan => dispatch_show_plan(app),
@@ -1194,7 +1118,6 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::ClearForkSecondaryModel => clear_fork_secondary_model(app),
         Action::SetMaxThoughtsWidth(v) => set_max_thoughts_width(app, v),
         Action::SetShowTips(v) => set_show_tips(app, v),
-        Action::SetAutoUpdate(v) => set_auto_update(app, v),
         Action::SetDisplayRefreshAutoCadence(v) => set_display_refresh_auto_cadence(app, v),
         Action::PreviewTheme(v) => preview_theme(app, v),
         Action::PreviewAutoDarkTheme(v) => preview_auto_dark_theme(app, v),
@@ -1211,11 +1134,6 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::PermissionSelect(option_id) => dispatch_permission_select(app, option_id),
         Action::PermissionFollowup(text) => dispatch_permission_followup(app, text),
         Action::PermissionCancel => dispatch_permission_cancel(app),
-        Action::Logout => dispatch_logout(app),
-        Action::SwitchAccount => dispatch_switch_account(app),
-        Action::CheckSubscription => vec![Effect::CheckSubscription { verify: None }],
-        Action::OpenSupergrokUrl => dispatch_open_supergrok_url(app),
-        Action::RetryCreditLimitPrompt => super::billing::dispatch_retry_credit_limit_prompt(app),
         Action::OpenUrl(url) => {
             if url.starts_with("file://") {
                 let opened = url::Url::parse(&url)
@@ -1267,20 +1185,6 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         }
         Action::OpenPrevLink => {
             with_active_agent(app, |agent| agent.cycle_highlighted_link(false));
-            vec![]
-        }
-        Action::Login => dispatch_login(app),
-        Action::CancelLogin => dispatch_cancel_login(app),
-        Action::SubmitAuthCode(code) => dispatch_submit_auth_code(app, code),
-        Action::CopyAuthUrl => {
-            dispatch_copy_auth_url(app, crate::clipboard::SystemClipboard::try_set)
-        }
-        Action::ShowRawAuthUrl => {
-            app.auth_show_raw_url = true;
-            vec![]
-        }
-        Action::HideRawAuthUrl => {
-            app.auth_show_raw_url = false;
             vec![]
         }
         Action::TrustFolder => dispatch_trust_folder(app),
@@ -1734,21 +1638,11 @@ pub(super) fn dispatch_action_result(
                             session_id,
                             action: xai_hooks_plugins_types::PluginsAction::Reload,
                         });
-                    } else if let Some(modal) = agent.extensions_modal.as_mut() {
-                        effects.push(Effect::FetchHooksList {
-                            agent_id,
-                            session_id: session_id.clone(),
-                        });
+                    } else if agent.extensions_modal.is_some() {
                         effects.push(Effect::FetchPluginsList {
                             agent_id,
                             session_id: session_id.clone(),
                         });
-                        crate::app::dispatch::transcript::push_marketplace_fetch(
-                            modal,
-                            &mut effects,
-                            agent_id,
-                            session_id.clone(),
-                        );
                         effects.push(Effect::FetchMcpsList {
                             agent_id,
                             session_id,

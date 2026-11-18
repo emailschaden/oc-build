@@ -133,7 +133,7 @@ opencode endpoints are under `/api/*` in `/workspace/research/oc2-openapi.json`.
 | Server commands as `/name` (opencode `init`, `review`, `goal`) | `AvailableCommandsUpdate`, `x.ai/commands/list` (`Effect::RefreshAvailableCommands`); unknown `/x` is `PassThrough`, i.e. sent as a prompt | `GET /api/command` → `AvailableCommandsUpdate`. The shim routes a prompt starting with `/name` to `POST /api/session/{id}/command {"name","text"}` | mappable |
 | Skills as `/skill` commands | `AvailableCommandsUpdate` entries with `_meta` skill scope/path; pager reads SKILL.md (`CommandResult::InjectSkill`) | `GET /api/skill`; activation through prompt `skills:[…]` attachment or `POST /api/experimental/session/{id}/skill` | mappable |
 | `/skills` view (list/toggle) | `x.ai/skills/list`, `x.ai/skills/config` toggle, `x.ai/skills/refresh-baseline` | `GET /api/skill`, `skill.updated` (no enable/disable endpoint) | mappable (read-only) |
-| `/workflows`, `/workflow`, workflow runs | `x.ai/workflows/list`, `WorkflowUpdated` | none | hidden in opencode mode (feat/oc-hide-xai-only) |
+| `/workflows`, `/workflow`, workflow runs | `x.ai/workflows/list`, `WorkflowUpdated` | none | removed (feat/oc-remove-xai) |
 | `/goal`, `/deep-research` (shell builtins) | shell `AvailableCommandsUpdate` | opencode `goal` command via `POST …/command`; no deep-research | partial |
 | `/loop [interval] <prompt>` (scheduler) | requires tool `scheduler_create`; `ScheduledTask*` updates, `x.ai/scheduler/delete` | `automation_*` tools; `POST/GET/DELETE /api/experimental/schedule`, `…/pause`, `…/resume` | mappable (experimental API) |
 | `/btw` side question | `x.ai/btw` | `POST /api/session/{id}/generate` (generate text from the session context without changing the transcript) | mappable |
@@ -229,8 +229,8 @@ opencode endpoints are under `/api/*` in `/workspace/research/oc2-openapi.json`.
 | MCP resources | n/a | `GET /api/mcp/resource` | n/a |
 | Plugins list | `x.ai/plugins/list`, `PluginsChanged` | `GET /api/plugin`, `plugin.updated` | mappable |
 | Plugin actions (enable/disable/reload/update) | `x.ai/plugins/action`, `x.ai/plugins/reload`, `x.ai/plugins/notify-updates` | `POST /api/plugin/check`, `POST /api/plugin/update`, `POST /api/location/reload`; no enable/disable | partial |
-| Marketplace (`/marketplace`, plugin CTA) | `x.ai/marketplace/list`, `x.ai/marketplace/action` | none | hidden in opencode mode (feat/oc-hide-xai-only) |
-| Hooks (`/hooks`, hook annotations) | `x.ai/hooks/list`, `x.ai/hooks/action`, `HookExecution`/`HookAnnotation`/`HooksChanged` | none (opencode extends behaviour through plugins) | hidden in opencode mode (feat/oc-hide-xai-only) |
+| Marketplace (`/marketplace`, plugin CTA) | `x.ai/marketplace/list`, `x.ai/marketplace/action` | none | removed (feat/oc-remove-xai) |
+| Hooks (`/hooks`, hook annotations) | `x.ai/hooks/list`, `x.ai/hooks/action`, `HookExecution`/`HookAnnotation`/`HooksChanged` | none (opencode extends behaviour through plugins) | removed (feat/oc-remove-xai) |
 | Project rules / AGENTS.md | shell-side discovery | opencode reads instructions itself; `GET /api/experimental/session/{id}/instructions/entries` | works (server-side) |
 
 ### Memory
@@ -245,13 +245,13 @@ opencode endpoints are under `/api/*` in `/workspace/research/oc2-openapi.json`.
 
 | Feature | TUI backend call | opencode v2 equivalent | Status |
 |---|---|---|---|
-| `/login`, `/logout`, account switch | `x.ai/auth/{get_url,submit_code,cancel,logout,info}`, `x.ai/getApiKey`/`setApiKey` | provider credentials: `GET/POST/PATCH/DELETE /api/credential`, `…/activate`; `POST /api/pair` | hidden in opencode mode (feat/oc-hide-xai-only) |
+| `/login`, `/logout`, account switch | `x.ai/auth/{get_url,submit_code,cancel,logout,info}`, `x.ai/getApiKey`/`setApiKey` | provider credentials: `GET/POST/PATCH/DELETE /api/credential`, `…/activate`; `POST /api/pair` | removed (feat/oc-remove-xai) |
 | Subscription / paywall / team capability | `x.ai/auth/check_subscription`, `x.ai/auth/hydrate_team_capability` | none | no equivalent; checks skipped in opencode mode (feat/oc-hide-xai-only) |
-| `/usage` billing, credit bar, auto top-up | `x.ai/billing`, `x.ai/auto-topup-rule`, `x.ai/limit` | `GET /api/experimental/usage/limits` (provider limits, not billing) | hidden in opencode mode (feat/oc-hide-xai-only); background billing fetches skipped |
+| `/usage` billing, credit bar, auto top-up | `x.ai/billing`, `x.ai/auto-topup-rule`, `x.ai/limit` | `GET /api/experimental/usage/limits` (provider limits, not billing) | removed (feat/oc-remove-xai) |
 | Token / cost usage of this session | `x.ai/session/usage`, `UsageUpdate` | `session.usage.updated` | mappable (see context bar) |
 | `/privacy` data retention | `x.ai/privacy/setCodingDataRetention` | none | hidden in opencode mode (feat/oc-hide-xai-only) |
 | Consent / folder trust | `x.ai/consent/record`, `x.ai/folderTrust` | none | no equivalent; consent upload skipped in opencode mode (feat/oc-hide-xai-only) |
-| `/feedback` + drafts + trace upload | `x.ai/feedback`, `x.ai/feedback/drafts/*`, `x.ai/feedback/upload-trace`, `x.ai/feedback/dismiss` | none | hidden in opencode mode (feat/oc-hide-xai-only) |
+| `/feedback` + drafts + trace upload | `x.ai/feedback`, `x.ai/feedback/drafts/*`, `x.ai/feedback/upload-trace`, `x.ai/feedback/dismiss` | none | removed (feat/oc-remove-xai) |
 | Rollout survey | `x.ai/rollout/survey` | none | no equivalent |
 | Announcements, release notes | `x.ai/announcements/update`; release notes are local/bundled | none | no equivalent / local |
 | Remote settings / feature gates | `x.ai/settings/update`; the startup remote config fetch is gone (feat/oc-only-backend) | `GET /api/config`, `PATCH /api/experimental/config`, `config.updated` | no equivalent (gates use local defaults) |
@@ -314,6 +314,13 @@ set. That hides everything in the left column at once, so you don't need per-com
 commands typed in full (`get_for_dispatch` path).
 
 ## Proposed PR plan
+
+> **Status (stage b, feat/oc-remove-xai):** xAI-only code paths are deleted, not just gated:
+> auth/login screens, billing and credit limits, tier gating, remote settings, feedback, bundle
+> status, consent upstream, prompt suggestions, marketplace update checks, the leader/cluster
+> leftovers, the `auto_update` setting, the update-channel label, and the Hooks/Marketplace/
+> Workflows extension tabs. Still only hidden (code left in place): Auto mode (gate off),
+> `/context-window`, `/privacy` and voice.
 
 Each PR stays inside `opencode_shim.rs` and `oc-opencode-client` (new endpoints, events and
 types) where possible. Pager changes are limited to small `// oc-build:` gates. Sizes: S < 200
