@@ -385,11 +385,7 @@ pub(super) fn extensions_modal_tab_fetches(
     agent_id: AgentId,
     session_id: acp::SessionId,
 ) -> Vec<Effect> {
-    let mut effects = vec![
-        Effect::FetchHooksList {
-            agent_id,
-            session_id: session_id.clone(),
-        },
+    vec![
         Effect::FetchPluginsList {
             agent_id,
             session_id: session_id.clone(),
@@ -405,44 +401,15 @@ pub(super) fn extensions_modal_tab_fetches(
             refresh: false,
             fetch: modal.next_skills_fetch(),
         },
-        Effect::FetchWorkflowsList {
-            agent_id,
-            session_id: session_id.clone(),
-        },
-    ];
-    push_marketplace_fetch(modal, &mut effects, agent_id, session_id);
-    effects
-}
-
-/// Push a marketplace list fetch, coalescing overlapping requests.
-/// While one is in flight, further requests fold into a single queued refetch that fires when the current response lands.
-/// The other tab fetches are cheap local reads and don't need this.
-pub(super) fn push_marketplace_fetch(
-    modal: &mut crate::views::extensions_modal::ExtensionsModalState,
-    effects: &mut Vec<Effect>,
-    agent_id: AgentId,
-    session_id: acp::SessionId,
-) {
-    if modal.marketplace_fetch_inflight {
-        modal.marketplace_refetch_queued = true;
-        return;
-    }
-    modal.marketplace_fetch_inflight = true;
-    effects.push(Effect::FetchMarketplaceList {
-        agent_id,
-        session_id,
-    });
+    ]
 }
 
 /// Slash-command name for an extensions modal tab, used by the toast shown when the modal is opened off the agent view.
 fn extensions_tab_slash_name(tab: crate::views::extensions_modal::ExtensionsTab) -> &'static str {
     use crate::views::extensions_modal::ExtensionsTab;
     match tab {
-        ExtensionsTab::Hooks => "hooks",
         ExtensionsTab::Plugins => "plugins",
-        ExtensionsTab::Marketplace => "marketplace",
         ExtensionsTab::Skills => "skills",
-        ExtensionsTab::Workflows => "workflows",
         ExtensionsTab::McpServers => "mcps",
     }
 }
@@ -666,27 +633,6 @@ pub(super) fn dispatch_dump_input_log(app: &mut AppView) -> Vec<Effect> {
 
 // TaskResult handlers.
 
-pub(super) fn handle_hooks_list_loaded(
-    app: &mut AppView,
-    agent_id: AgentId,
-    result: Result<xai_hooks_plugins_types::HooksListResponse, String>,
-) -> Vec<Effect> {
-    use crate::views::extensions_modal::TabDataState;
-    if let Some(agent) = app.agents.get_mut(&agent_id)
-        && let Some(ref mut modal) = agent.extensions_modal
-    {
-        modal.hooks_data = match result {
-            Ok(response) => {
-                // Seed once: re-collapsing on every refetch folded the user's expanded groups
-                modal.seed_hook_groups_once(&response.hooks);
-                TabDataState::Loaded(response)
-            }
-            Err(e) => TabDataState::Error(e),
-        };
-    }
-    vec![]
-}
-
 pub(super) fn handle_plugins_list_loaded(
     app: &mut AppView,
     agent_id: AgentId,
@@ -767,43 +713,6 @@ pub(super) fn handle_marketplace_updates_available(
             )));
     }
     vec![]
-}
-
-pub(super) fn handle_marketplace_list_loaded(
-    app: &mut AppView,
-    agent_id: AgentId,
-    result: Result<xai_hooks_plugins_types::MarketplaceListResponse, String>,
-) -> Vec<Effect> {
-    use crate::views::extensions_modal::TabDataState;
-    let mut effects = Vec::new();
-    if let Some(agent) = app.agents.get_mut(&agent_id) {
-        let session_id = agent.session.session_id.clone();
-        let Some(ref mut modal) = agent.extensions_modal else {
-            return effects;
-        };
-        modal.marketplace_fetch_inflight = false;
-        if std::mem::take(&mut modal.marketplace_refetch_queued)
-            && let Some(session_id) = session_id
-        {
-            push_marketplace_fetch(modal, &mut effects, agent_id, session_id);
-        }
-        modal.marketplace_data = match result {
-            Ok(mut response) => {
-                response.sanitize();
-                // Only default to collapsed on first load (when state is Loading).
-                // On reloads (after install/uninstall/refresh), preserve the user's expand/collapse choices
-                let is_first_load = matches!(modal.marketplace_data, TabDataState::Loading);
-                if is_first_load {
-                    modal.marketplace_collapsed_sources = (0..response.sources.len()).collect();
-                }
-                TabDataState::Loaded(response)
-            }
-            Err(e) => TabDataState::Error(e),
-        };
-        modal.pending_action = None;
-        modal.pending_entry_index = None;
-    }
-    effects
 }
 
 pub(super) fn handle_skills_toggle_done(

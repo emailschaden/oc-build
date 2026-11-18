@@ -730,7 +730,7 @@ fn session_loaded_without_restore_resets_restore_degree() {
     );
 }
 #[test]
-fn session_loaded_with_flag_emits_five_fetches_and_clears_flag() {
+fn session_loaded_with_flag_emits_three_fetches_and_clears_flag() {
     use crate::views::extensions_modal::{ExtensionsModalState, ExtensionsTab};
     let mut app = test_app_with_agent();
     let id = AgentId(0);
@@ -738,7 +738,7 @@ fn session_loaded_with_flag_emits_five_fetches_and_clears_flag() {
         let a = app.agents.get_mut(&id).unwrap();
         a.session.session_id = None;
         a.pending_extensions_fetch = true;
-        a.extensions_modal = Some(ExtensionsModalState::new(ExtensionsTab::Hooks));
+        a.extensions_modal = Some(ExtensionsModalState::new(ExtensionsTab::Plugins));
     }
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionLoaded {
@@ -753,7 +753,7 @@ fn session_loaded_with_flag_emits_five_fetches_and_clears_flag() {
         }),
         &mut app,
     );
-    assert_eq!(count_extension_fetches(&effects), 5);
+    assert_eq!(count_extension_fetches(&effects), 3);
     assert!(
         effects
             .iter()
@@ -770,7 +770,7 @@ fn session_restored_does_not_consume_flag_and_defers_to_load() {
         let a = app.agents.get_mut(&id).unwrap();
         a.session.session_id = None;
         a.pending_extensions_fetch = true;
-        a.extensions_modal = Some(ExtensionsModalState::new(ExtensionsTab::Hooks));
+        a.extensions_modal = Some(ExtensionsModalState::new(ExtensionsTab::Plugins));
     }
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionRestored {
@@ -795,7 +795,7 @@ fn session_load_failed_clears_flag_no_fetches() {
     {
         let a = app.agents.get_mut(&id).unwrap();
         a.pending_extensions_fetch = true;
-        a.extensions_modal = Some(ExtensionsModalState::new(ExtensionsTab::Hooks));
+        a.extensions_modal = Some(ExtensionsModalState::new(ExtensionsTab::Plugins));
     }
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionLoadFailed {

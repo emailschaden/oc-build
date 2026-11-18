@@ -201,7 +201,6 @@ fn handle_inner(msg: AcpClientMessage, app: &mut AppView) -> bool {
                         }
                     }
                     let mut plan_mode_modal_refresh_needed = false;
-                    let mut workflows_modal_refresh = false;
                     let mutated = if dedup_drop {
                         tracing::debug!(
                             session_id = notif.request.session_id.0.as_ref(),
@@ -356,15 +355,11 @@ fn handle_inner(msg: AcpClientMessage, app: &mut AppView) -> bool {
                             note_first_turn_activity(agent);
                         }
                         if let Some(commands) = agent.session.tracker.take_pending_acp_commands() {
-                            let workflows_changed = workflow_commands(&commands)
-                                != workflow_commands(&agent.session.available_commands);
                             agent.session.replace_available_commands(
                                 commands,
                                 CommandCatalogSource::SessionUpdate,
                             );
                             refresh_workflow_run_capabilities(agent);
-                            workflows_modal_refresh =
-                                workflows_changed && agent.extensions_modal.is_some();
                         }
                         if let Some(tools) = agent.session.tracker.take_pending_acp_tools() {
                             agent.session.available_tools = Some(tools.into_iter().collect());
@@ -390,9 +385,6 @@ fn handle_inner(msg: AcpClientMessage, app: &mut AppView) -> bool {
                     };
                     if plan_mode_modal_refresh_needed {
                         crate::app::dispatch::refresh_open_settings_modals(app);
-                    }
-                    if workflows_modal_refresh {
-                        queue_open_workflows_modal_refresh(app, id);
                     }
                     if mutated
                         && !meta.is_replay
@@ -543,23 +535,6 @@ pub(super) fn note_first_turn_activity(agent: &mut AgentView) {
         );
     }
 }
-fn workflow_commands(
-    commands: &[acp::AvailableCommand],
-) -> Vec<(&str, &str, Option<&str>, Option<&str>)> {
-    commands
-        .iter()
-        .filter_map(|command| {
-            let meta = command.meta.as_ref()?;
-            let source = meta.get("workflowSource")?.as_str();
-            Some((
-                command.name.as_str(),
-                command.description.as_str(),
-                source,
-                meta.get("workflowPath").and_then(serde_json::Value::as_str),
-            ))
-        })
-        .collect()
-}
 pub(super) fn is_builtin_workflow_handle(
     commands: &[acp::AvailableCommand],
     display_name: &str,
@@ -591,30 +566,6 @@ pub(crate) fn refresh_workflow_run_capabilities(agent: &mut AgentView) {
     for run in &mut agent.workflow_runs {
         run.management_available = management_available;
         run.builtin = is_builtin_workflow_handle(&agent.session.available_commands, &run.name);
-    }
-}
-fn queue_open_workflows_modal_refresh(app: &mut AppView, agent_id: AgentId) {
-    let Some(session_id) = app
-        .agents
-        .get(&agent_id)
-        .and_then(|agent| agent.session.session_id.clone())
-    else {
-        return;
-    };
-    let already_pending = app.pending_effects.iter().any(|effect| {
-        matches!(
-            effect,
-            Effect::FetchWorkflowsList {
-                agent_id: pending_id,
-                ..
-            } if *pending_id == agent_id
-        )
-    });
-    if !already_pending {
-        app.pending_effects.push(Effect::FetchWorkflowsList {
-            agent_id,
-            session_id,
-        });
     }
 }
 fn handle_ext_notification(notif: &acp::ExtNotification, app: &mut AppView) -> bool {

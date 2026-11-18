@@ -37,9 +37,7 @@ fn count_extension_fetches(effects: &[Effect]) -> usize {
         .filter(|e| {
             matches!(
                 e,
-                Effect::FetchHooksList { .. }
-                    | Effect::FetchPluginsList { .. }
-                    | Effect::FetchMarketplaceList { .. }
+                Effect::FetchPluginsList { .. }
                     | Effect::FetchMcpsList { .. }
                     | Effect::FetchSkillsList { .. }
             )

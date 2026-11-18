@@ -941,25 +941,8 @@ pub(super) fn handle_session_notification_with_origin(
             }
             redraw
         }
-        XaiSessionUpdate::HooksChanged {
-            hooks,
-            project_trusted,
-            load_errors,
-        } => {
-            if let Some(ref mut modal) = agent.extensions_modal {
-                use crate::views::extensions_modal::TabDataState;
-                modal.seed_hook_groups_once(&hooks);
-                modal.hooks_data =
-                    TabDataState::Loaded(xai_hooks_plugins_types::HooksListResponse {
-                        hooks,
-                        project_trusted,
-                        load_errors,
-                    });
-                true
-            } else {
-                false
-            }
-        }
+        // oc-build: opencode backend; the Extensions modal has no Hooks tab.
+        XaiSessionUpdate::HooksChanged { .. } => false,
         XaiSessionUpdate::PluginsChanged { plugins } => {
             if let Some(ref mut modal) = agent.extensions_modal {
                 use crate::views::extensions_modal::TabDataState;

@@ -9,7 +9,7 @@ fn open_extensions_modal_no_session_sets_flag_no_fetches() {
     app.agents.get_mut(&id).unwrap().session.session_id = None;
     let effects = dispatch(
         Action::OpenExtensionsModal {
-            tab: ExtensionsTab::Hooks,
+            tab: ExtensionsTab::Plugins,
             trigger: xai_grok_telemetry::events::ExtensionsModalTrigger::SlashCommand,
         },
         &mut app,
@@ -34,12 +34,12 @@ fn open_extensions_modal_with_session_emits_fetches_no_flag() {
     let id = AgentId(0);
     let effects = dispatch(
         Action::OpenExtensionsModal {
-            tab: ExtensionsTab::Hooks,
+            tab: ExtensionsTab::Plugins,
             trigger: xai_grok_telemetry::events::ExtensionsModalTrigger::SlashCommand,
         },
         &mut app,
     );
-    assert_eq!(count_extension_fetches(&effects), 5);
+    assert_eq!(count_extension_fetches(&effects), 3);
     assert!(
         app.agents
             .get(&id)
@@ -54,12 +54,12 @@ fn open_extensions_modal_with_session_resets_stale_flag() {
     app.agents.get_mut(&id).unwrap().pending_extensions_fetch = true;
     let effects = dispatch(
         Action::OpenExtensionsModal {
-            tab: ExtensionsTab::Hooks,
+            tab: ExtensionsTab::Plugins,
             trigger: xai_grok_telemetry::events::ExtensionsModalTrigger::SlashCommand,
         },
         &mut app,
     );
-    assert_eq!(count_extension_fetches(&effects), 5);
+    assert_eq!(count_extension_fetches(&effects), 3);
     assert!(
         app.agents
             .get(&id)
@@ -67,13 +67,12 @@ fn open_extensions_modal_with_session_resets_stale_flag() {
     );
 }
 #[test]
-fn reload_skills_marks_both_lists_loading_and_refetches() {
+fn reload_skills_marks_skills_loading_and_refetches() {
     use crate::views::extensions_modal::{ExtensionsModalState, ExtensionsTab, TabDataState};
     let mut app = test_app_with_agent();
     let id = AgentId(0);
-    let mut modal = ExtensionsModalState::new(ExtensionsTab::Workflows);
+    let mut modal = ExtensionsModalState::new(ExtensionsTab::Skills);
     modal.skills_data = TabDataState::Loaded(Default::default());
-    modal.workflows_data = TabDataState::Loaded(vec![]);
     app.agents.get_mut(&id).unwrap().extensions_modal = Some(modal);
     let effects = dispatch(Action::ReloadSkills, &mut app);
     let Some(modal) = app
@@ -84,18 +83,11 @@ fn reload_skills_marks_both_lists_loading_and_refetches() {
         panic!("expected extensions modal on {id:?}");
     };
     assert!(matches!(modal.skills_data, TabDataState::Loading));
-    assert!(matches!(modal.workflows_data, TabDataState::Loading));
     assert!(
         effects
             .iter()
             .any(|e| matches!(e, Effect::FetchSkillsList { .. })),
         "reload must refetch skills, got {effects:?}"
-    );
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::FetchWorkflowsList { .. })),
-        "reload must refetch workflows, got {effects:?}"
     );
 }
 fn skills_refresh(effects: &[Effect]) -> Vec<bool> {
@@ -125,16 +117,16 @@ fn only_reloading_the_skills_tab_rescans_skills() {
         .get_mut(&id)
         .and_then(|agent| agent.extensions_modal.as_mut())
     {
-        modal.active_tab = ExtensionsTab::Workflows;
+        modal.active_tab = ExtensionsTab::Plugins;
     }
-    let on_workflows = dispatch(Action::ReloadSkills, &mut app);
+    let on_plugins = dispatch(Action::ReloadSkills, &mut app);
     assert_eq!(
         vec![false],
         skills_refresh(&opened),
         "opening reads the cache"
     );
     assert_eq!(vec![true], skills_refresh(&on_skills));
-    assert_eq!(vec![false], skills_refresh(&on_workflows));
+    assert_eq!(vec![false], skills_refresh(&on_plugins));
 }
 #[test]
 fn reload_skills_without_session_keeps_loaded_state() {
@@ -142,9 +134,8 @@ fn reload_skills_without_session_keeps_loaded_state() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     app.agents.get_mut(&id).unwrap().session.session_id = None;
-    let mut modal = ExtensionsModalState::new(ExtensionsTab::Workflows);
+    let mut modal = ExtensionsModalState::new(ExtensionsTab::Skills);
     modal.skills_data = TabDataState::Loaded(Default::default());
-    modal.workflows_data = TabDataState::Loaded(vec![]);
     app.agents.get_mut(&id).unwrap().extensions_modal = Some(modal);
     let effects = dispatch(Action::ReloadSkills, &mut app);
     assert!(effects.is_empty(), "got {effects:?}");
@@ -156,7 +147,6 @@ fn reload_skills_without_session_keeps_loaded_state() {
         panic!("expected extensions modal on {id:?}");
     };
     assert!(matches!(modal.skills_data, TabDataState::Loaded(_)));
-    assert!(matches!(modal.workflows_data, TabDataState::Loaded(_)));
 }
 #[test]
 fn session_created_with_flag_but_modal_closed_clears_flag_no_fetches() {
@@ -336,12 +326,6 @@ fn close_does_not_disturb_unrelated_forked_from_pointers() {
         "unrelated forked_from must NOT be cleared"
     );
 }
-fn count_marketplace_fetches(effects: &[Effect]) -> usize {
-    effects
-        .iter()
-        .filter(|e| matches!(e, Effect::FetchMarketplaceList { .. }))
-        .count()
-}
 fn success_outcome() -> xai_hooks_plugins_types::ActionOutcome {
     xai_hooks_plugins_types::ActionOutcome {
         status: xai_hooks_plugins_types::OutcomeStatus::Success,
@@ -352,76 +336,4 @@ fn success_outcome() -> xai_hooks_plugins_types::ActionOutcome {
 }
 fn empty_marketplace_response() -> xai_hooks_plugins_types::MarketplaceListResponse {
     xai_hooks_plugins_types::MarketplaceListResponse { sources: vec![] }
-}
-#[test]
-fn marketplace_fetch_coalesces_while_inflight() {
-    use crate::views::extensions_modal::ExtensionsTab;
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    let effects = dispatch(
-        Action::OpenExtensionsModal {
-            tab: ExtensionsTab::Marketplace,
-            trigger: xai_grok_telemetry::events::ExtensionsModalTrigger::SlashCommand,
-        },
-        &mut app,
-    );
-    assert_eq!(count_marketplace_fetches(&effects), 1);
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::PluginsActionResult {
-            agent_id: id,
-            result: Ok(success_outcome()),
-        }),
-        &mut app,
-    );
-    assert_eq!(count_marketplace_fetches(&effects), 0);
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::FetchHooksList { .. })),
-        "non-marketplace refetches still fire"
-    );
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::MarketplaceListLoaded {
-            agent_id: id,
-            result: Ok(empty_marketplace_response()),
-        }),
-        &mut app,
-    );
-    assert_eq!(count_marketplace_fetches(&effects), 1);
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::MarketplaceListLoaded {
-            agent_id: id,
-            result: Ok(empty_marketplace_response()),
-        }),
-        &mut app,
-    );
-    assert_eq!(count_marketplace_fetches(&effects), 0);
-}
-#[test]
-fn marketplace_fetch_fires_immediately_when_idle() {
-    use crate::views::extensions_modal::ExtensionsTab;
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    dispatch(
-        Action::OpenExtensionsModal {
-            tab: ExtensionsTab::Marketplace,
-            trigger: xai_grok_telemetry::events::ExtensionsModalTrigger::SlashCommand,
-        },
-        &mut app,
-    );
-    dispatch(
-        Action::TaskComplete(TaskResult::MarketplaceListLoaded {
-            agent_id: id,
-            result: Ok(empty_marketplace_response()),
-        }),
-        &mut app,
-    );
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::PluginsActionResult {
-            agent_id: id,
-            result: Ok(success_outcome()),
-        }),
-        &mut app,
-    );
-    assert_eq!(count_marketplace_fetches(&effects), 1);
 }

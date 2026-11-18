@@ -1195,14 +1195,6 @@ pub(crate) async fn persist_setting(
                 .await
                 .map_err(|e| e.to_string())
         }
-        "auto_update" => {
-            let SettingValue::Bool(b) = value else {
-                return Err(kind_mismatch("auto_update", "Bool", &value));
-            };
-            xai_grok_shell::util::config::set_auto_update(b)
-                .await
-                .map_err(|e| e.to_string())
-        }
         other => Err(format!("unknown setting key for persist: `{other}`")),
     }
 }

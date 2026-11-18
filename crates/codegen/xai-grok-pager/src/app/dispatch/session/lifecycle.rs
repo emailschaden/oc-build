@@ -1413,12 +1413,6 @@ pub(in crate::app::dispatch) fn handle_session_created(
             agent_id,
             session_id: session_id_clone.clone(),
         });
-        if app.plugin_cta_enabled {
-            effects.push(Effect::FetchPluginCtaCatalog {
-                agent_id,
-                session_id: session_id_clone.clone(),
-            });
-        }
         if let Some(switch) = deferred {
             effects.push(Effect::SwitchModel {
                 agent_id,
@@ -1542,12 +1536,6 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
             agent_id,
             session_id: session_id_clone.clone(),
         });
-        if app.plugin_cta_enabled {
-            effects.push(Effect::FetchPluginCtaCatalog {
-                agent_id,
-                session_id: session_id_clone.clone(),
-            });
-        }
         if let Some(switch) = deferred {
             effects.push(Effect::SwitchModel {
                 agent_id,

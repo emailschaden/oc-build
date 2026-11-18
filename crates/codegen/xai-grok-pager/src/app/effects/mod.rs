@@ -2162,13 +2162,8 @@ pub(crate) fn execute(
                     }
                 });
         }
-        // oc-build: opencode backend; these only reach xAI-only `x.ai/*` methods (hidden
-        // Extensions tabs, plugin CTA catalog, bash-mode shell suggestions).
-        Effect::FetchHooksList { .. }
-        | Effect::FetchMarketplaceList { .. }
-        | Effect::FetchPluginCtaCatalog { .. }
-        | Effect::FetchWorkflowsList { .. }
-        | Effect::FetchShellSuggestions { .. } => {}
+        // oc-build: opencode backend; bash-mode shell suggestions reach an xAI-only `x.ai/*` method.
+        Effect::FetchShellSuggestions { .. } => {}
         Effect::FetchMcpsList { agent_id, session_id, cache } => {
             let tx = acp_tx.clone();
             tasks
@@ -2508,48 +2503,6 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::HooksAction { agent_id, session_id, action } => {
-            let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    let req_body = xai_hooks_plugins_types::HooksActionRequest {
-                        session_id: session_id.0.to_string(),
-                        action,
-                    };
-                    let req = acp::ExtRequest::new(
-                        "x.ai/hooks/action",
-                        serde_json::value::to_raw_value(&req_body)
-                            .expect("serialize hooks/action params")
-                            .into(),
-                    );
-                    let result = match acp_send(req, &tx).await {
-                        Ok(resp) => {
-                            let wrapper: serde_json::Value = serde_json::from_str(
-                                    resp.0.get(),
-                                )
-                                .unwrap_or_default();
-                            let inner = wrapper.get("result").unwrap_or(&wrapper);
-                            serde_json::from_value::<
-                                xai_hooks_plugins_types::ActionOutcome,
-                            >(inner.clone())
-                                .map_err(|_| "couldn't complete hooks action".to_string())
-                        }
-                        Err(e) => {
-                            Err(
-                                sanitize_user_error(
-                                    &format!(
-                        "couldn't complete hooks action: {e}"
-                    ),
-                                ),
-                            )
-                        }
-                    };
-                    TaskResult::HooksActionResult {
-                        agent_id,
-                        result,
-                    }
-                });
-        }
         Effect::PluginsAction { agent_id, session_id, action } => {
             let tx = acp_tx.clone();
             tasks
@@ -2675,51 +2628,6 @@ pub(crate) fn execute(
                         }
                     };
                     TaskResult::SkillsToggleDone {
-                        agent_id,
-                        result,
-                    }
-                });
-        }
-        Effect::MarketplaceAction { agent_id, session_id, action } => {
-            let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    let req_body = xai_hooks_plugins_types::MarketplaceActionRequest {
-                        session_id: session_id.0.to_string(),
-                        action,
-                    };
-                    let req = acp::ExtRequest::new(
-                        "x.ai/marketplace/action",
-                        serde_json::value::to_raw_value(&req_body)
-                            .expect("serialize marketplace/action params")
-                            .into(),
-                    );
-                    let result = match acp_send(req, &tx).await {
-                        Ok(resp) => {
-                            let wrapper: serde_json::Value = serde_json::from_str(
-                                    resp.0.get(),
-                                )
-                                .unwrap_or_default();
-                            let inner = wrapper.get("result").unwrap_or(&wrapper);
-                            serde_json::from_value::<
-                                xai_hooks_plugins_types::ActionOutcome,
-                            >(inner.clone())
-                                .map_err(|e| {
-                                    tracing::debug!("failed to parse marketplace action response: {e}");
-                                    "couldn't complete marketplace action".to_string()
-                                })
-                        }
-                        Err(e) => {
-                            Err(
-                                sanitize_user_error(
-                                    &format!(
-                        "couldn't complete marketplace action: {e}"
-                    ),
-                                ),
-                            )
-                        }
-                    };
-                    TaskResult::MarketplaceActionResult {
                         agent_id,
                         result,
                     }
@@ -4488,7 +4396,8 @@ fn session_info_fields(
     }
     push(
         "Shell version",
-        xai_grok_version::display_version(xai_grok_update::channel_label()),
+        // oc-build: opencode backend; plain version string (no update channel).
+        xai_grok_version::VERSION.to_string(),
         false,
     );
     push("Session ID", info.session_id.to_string(), false);

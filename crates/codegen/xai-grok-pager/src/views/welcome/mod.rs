@@ -495,9 +495,9 @@ impl WelcomeLayout {
 
 /// Controls what the version badge renders.
 pub(super) enum VersionBadgeMode<'a> {
-    /// Full badge: team | tier | api_key | **Grok Build** VERSION+channel (right-aligned).
+    /// Full badge: team | tier | api_key | **Grok Build** VERSION (right-aligned).
     Full { subscription_tier: Option<&'a str> },
-    /// Hero footer: team | api_key | channel (right-aligned, gray).
+    /// Hero footer: team | api_key (right-aligned, gray).
     HeroFooter,
     /// Hero inline: **Grok Build**  VERSION (left-aligned).
     HeroInline,
@@ -552,7 +552,7 @@ pub(super) fn render_version_badge(
         spans.push(sep);
     }
 
-    let channel = xai_grok_update::channel_label();
+    // oc-build: opencode backend; plain version string (no update channel).
     match &mode {
         VersionBadgeMode::Full { .. } => {
             spans.push(Span::styled(
@@ -562,18 +562,11 @@ pub(super) fn render_version_badge(
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled(
-                format!("{}{}", xai_grok_version::VERSION, channel),
+                xai_grok_version::VERSION,
                 Style::default().fg(theme.gray),
             ));
         }
-        VersionBadgeMode::HeroFooter => {
-            if !channel.is_empty() {
-                spans.push(Span::styled(
-                    channel.trim(),
-                    Style::default().fg(theme.gray),
-                ));
-            }
-        }
+        VersionBadgeMode::HeroFooter => {}
         VersionBadgeMode::HeroInline => {
             spans.push(Span::styled(
                 "Grok Build  ",
@@ -588,7 +581,7 @@ pub(super) fn render_version_badge(
         }
     }
 
-    // Only alpha and beta builds print a channel, so on stable the spans can end on a separator.
+    // The spans can end on a separator.
     if spans.last().is_some_and(|s| s.content == SEP) {
         spans.pop();
     }
@@ -2711,8 +2704,8 @@ mod tests {
             .to_string()
     }
 
-    /// The badge carries the product name, the version, and the channel, and never a release label.
-    /// The hero footer prints a channel only on alpha and beta builds, so on stable it must not end on a separator.
+    /// The badge carries the product name and the version, and never a release label.
+    /// The hero footer must not end on a separator.
     #[test]
     fn version_badge_carries_no_release_label() {
         let full = badge_text(

@@ -150,7 +150,6 @@ fn send_prompt_without_session_queues_but_no_effect() {
 #[test]
 fn session_created_sets_session_id() {
     let mut app = test_app_with_agent();
-    app.plugin_cta_enabled = true;
     let id = AgentId(0);
     app.agents.get_mut(&id).unwrap().session.session_id = None;
     let effects = dispatch(
@@ -162,7 +161,7 @@ fn session_created_sets_session_id() {
         }),
         &mut app,
     );
-    assert_eq!(effects.len(), 5);
+    assert_eq!(effects.len(), 4);
     assert!(matches!(
         effects.first(),
         Some(Effect::FetchPromptHistory { session_id, .. }) if session_id == "new-session-123"
@@ -177,10 +176,6 @@ fn session_created_sets_session_id() {
     ));
     assert!(matches!(
         effects.get(3),
-        Some(Effect::FetchPluginCtaCatalog { .. })
-    ));
-    assert!(matches!(
-        effects.get(4),
         Some(Effect::RegisterActiveSession { .. })
     ));
     assert_eq!(
@@ -190,32 +185,6 @@ fn session_created_sets_session_id() {
             .as_ref()
             .map(|s| s.0.as_ref()),
         Some("new-session-123")
-    );
-}
-#[test]
-fn session_created_omits_cta_catalog_when_disabled() {
-    let mut app = test_app_with_agent();
-    assert!(!app.plugin_cta_enabled);
-    let id = AgentId(0);
-    app.agents.get_mut(&id).unwrap().session.session_id = None;
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::SessionCreated {
-            agent_id: id,
-            session_id: "new-session-123".into(),
-            models: None,
-            modes: None,
-        }),
-        &mut app,
-    );
-    assert!(
-        !effects
-            .iter()
-            .any(|e| matches!(e, Effect::FetchPluginCtaCatalog { .. }))
-    );
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::RefreshAvailableCommands { .. }))
     );
 }
 /// All System-block texts in an agent's scrollback, in order.
@@ -659,7 +628,7 @@ fn session_created_drains_queued_prompts() {
     assert_eq!(expect_agent(&app, id).session.queue_len(), 0);
 }
 #[test]
-fn session_created_with_flag_emits_five_fetches_and_clears_flag() {
+fn session_created_with_flag_emits_three_fetches_and_clears_flag() {
     use crate::views::extensions_modal::{ExtensionsModalState, ExtensionsTab};
     let mut app = test_app_with_agent();
     let id = AgentId(0);
@@ -667,7 +636,7 @@ fn session_created_with_flag_emits_five_fetches_and_clears_flag() {
         let a = app.agents.get_mut(&id).unwrap();
         a.session.session_id = None;
         a.pending_extensions_fetch = true;
-        a.extensions_modal = Some(ExtensionsModalState::new(ExtensionsTab::Hooks));
+        a.extensions_modal = Some(ExtensionsModalState::new(ExtensionsTab::Plugins));
     }
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionCreated {
@@ -678,7 +647,7 @@ fn session_created_with_flag_emits_five_fetches_and_clears_flag() {
         }),
         &mut app,
     );
-    assert_eq!(count_extension_fetches(&effects), 5);
+    assert_eq!(count_extension_fetches(&effects), 3);
     assert!(
         effects
             .iter()

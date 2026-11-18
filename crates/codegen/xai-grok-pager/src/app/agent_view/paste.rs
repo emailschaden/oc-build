@@ -1540,7 +1540,7 @@ pub(super) mod paste_key_tests {
         assert_refused(&mut agent, &mut counts, "gboom");
         agent.gboom = None;
         agent.extensions_modal = Some(crate::views::extensions_modal::ExtensionsModalState::new(
-            crate::views::extensions_modal::ExtensionsTab::Hooks,
+            crate::views::extensions_modal::ExtensionsTab::Plugins,
         ));
         assert_refused(&mut agent, &mut counts, "extensions modal");
         agent.extensions_modal = None;

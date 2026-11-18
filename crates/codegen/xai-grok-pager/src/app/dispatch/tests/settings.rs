@@ -164,45 +164,6 @@ fn toggle_vim_mode_works_on_dashboard_and_focuses_overview() {
     crate::appearance::cache::set_vim_mode(false);
 }
 #[test]
-fn plugin_cta_catalog_reload_empty_candidates_resets_matched_phase() {
-    use crate::app::agent_view::CtaPhase;
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    {
-        let cta = &mut app.agents.get_mut(&id).unwrap().plugin_cta;
-        cta.source_url_or_path = Some(xai_grok_plugin_marketplace::OFFICIAL_SOURCE_GIT_URL.into());
-        cta.candidates = vec![cta_entry("figma", "not_installed")];
-        cta.phase = CtaPhase::Matched {
-            plugin_relative_path: "plugins/figma".into(),
-            name: "figma".into(),
-        };
-        cta.hit_connect.rect = Some(ratatui::layout::Rect::new(0, 0, 9, 1));
-        cta.hit_dismiss.rect = Some(ratatui::layout::Rect::new(10, 0, 3, 1));
-    }
-    let response = xai_hooks_plugins_types::MarketplaceListResponse {
-        sources: vec![xai_hooks_plugins_types::MarketplaceScanResult {
-            source_name: xai_grok_plugin_marketplace::OFFICIAL_SOURCE_NAME.into(),
-            source_kind: "git".into(),
-            source_url_or_path: xai_grok_plugin_marketplace::OFFICIAL_SOURCE_GIT_URL.into(),
-            plugins: vec![cta_entry("figma", "installed")],
-            error: None,
-        }],
-    };
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::PluginCtaCatalogLoaded {
-            agent_id: id,
-            result: Ok(response),
-        }),
-        &mut app,
-    );
-    assert!(effects.is_empty());
-    let cta = &expect_agent(&app, id).plugin_cta;
-    assert!(cta.candidates.is_empty());
-    assert_eq!(cta.phase, CtaPhase::Hidden);
-    assert!(cta.hit_connect.rect.is_none());
-    assert!(cta.hit_dismiss.rect.is_none());
-}
-#[test]
 fn cancel_before_first_activity_resets_state_and_discards_orphan_response() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
@@ -1717,9 +1678,6 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         }
         "show_tips" => {
             let _ = dispatch(Action::SetShowTips(false), app);
-        }
-        "auto_update" => {
-            let _ = dispatch(Action::SetAutoUpdate(false), app);
         }
         "vim_mode" => {
             let _ = dispatch(Action::SetVimMode(true), app);

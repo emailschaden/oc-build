@@ -509,10 +509,8 @@ async fn bounded_connect(
     use crate::acp::StartupOutcome;
     let context = || startup_failure::Context {
         target,
-        version: xai_grok_version::display_version_with_commit(
-            xai_grok_version::full_version(),
-            xai_grok_update::channel_label(),
-        ),
+        // oc-build: opencode backend; plain version string (no update channel).
+        version: xai_grok_version::full_version().to_string(),
         log_path: xai_grok_telemetry::unified_log::path(),
     };
     let started = std::time::Instant::now();

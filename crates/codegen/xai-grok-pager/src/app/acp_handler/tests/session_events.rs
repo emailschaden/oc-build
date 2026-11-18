@@ -1593,23 +1593,6 @@
 
     // ── HooksChanged (x.ai/session/update push) ─────────────────────────
 
-    fn hooks_changed_ext(
-        session_id: &str,
-        hooks: Vec<xai_hooks_plugins_types::HookInfo>,
-    ) -> acp::ExtNotification {
-        let notif = SessionNotification {
-            session_id: acp::SessionId::new(session_id),
-            update: XaiSessionUpdate::HooksChanged {
-                hooks,
-                project_trusted: true,
-                load_errors: Vec::new(),
-            },
-            meta: None,
-        };
-        let raw = serde_json::value::to_raw_value(&notif).unwrap();
-        acp::ExtNotification::new("x.ai/session_notification", std::sync::Arc::from(raw))
-    }
-
     fn push_hook(name: &str, source_dir: &str) -> xai_hooks_plugins_types::HookInfo {
         xai_hooks_plugins_types::HookInfo {
             name: name.to_string(),
@@ -1624,59 +1607,5 @@
             pinned: false,
             removable: false,
         }
-    }
-
-    /// The `HooksChanged` push is the channel late-arriving hooks come through.
-    /// Driven end-to-end through `handle_session_notification`: an empty first push must not finish group-collapse seeding, the first non-empty push applies the collapsed default, and later pushes preserve expand state.
-    #[test]
-    fn hooks_changed_push_seeds_group_collapse_on_first_non_empty_delivery() {
-        use crate::views::extensions_modal::{ExtensionsModalState, ExtensionsTab, TabDataState};
-
-        let mut app = make_app_with_agent("sess-1");
-        app.agents.get_mut(&AgentId(0)).unwrap().extensions_modal =
-            Some(ExtensionsModalState::new(ExtensionsTab::Hooks));
-
-        // Empty first push: loads data but must leave seeding open.
-        assert!(handle_session_notification(
-            &hooks_changed_ext("sess-1", Vec::new()),
-            &mut app,
-        ));
-        {
-            let modal = app.agents.get(&AgentId(0)).unwrap_or_else(|| panic!("missing map entry")).extensions_modal.as_ref().unwrap();
-            assert!(matches!(modal.hooks_data, TabDataState::Loaded(_)));
-            assert!(
-                modal.hooks_collapsed_groups.is_empty(),
-                "empty first push must not seed any collapsed groups"
-            );
-        }
-
-        // First non-empty push: every source group gets the collapsed default.
-        let hooks = vec![push_hook("a", "/src1"), push_hook("b", "/src2")];
-        assert!(handle_session_notification(
-            &hooks_changed_ext("sess-1", hooks.clone()),
-            &mut app,
-        ));
-        {
-            let modal = app.agents.get(&AgentId(0)).unwrap_or_else(|| panic!("missing map entry")).extensions_modal.as_ref().unwrap();
-            assert!(modal.hooks_collapsed_groups.contains("/src1"));
-            assert!(modal.hooks_collapsed_groups.contains("/src2"));
-        }
-
-        // User expands /src1; a later push must not re-collapse it.
-        app.agents
-            .get_mut(&AgentId(0))
-            .unwrap()
-            .extensions_modal
-            .as_mut()
-            .unwrap()
-            .hooks_collapsed_groups
-            .remove("/src1");
-        assert!(handle_session_notification(
-            &hooks_changed_ext("sess-1", hooks),
-            &mut app,
-        ));
-        let modal = app.agents.get(&AgentId(0)).unwrap_or_else(|| panic!("missing map entry")).extensions_modal.as_ref().unwrap();
-        assert!(!modal.hooks_collapsed_groups.contains("/src1"));
-        assert!(modal.hooks_collapsed_groups.contains("/src2"));
     }
 

@@ -53,7 +53,6 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "default_selected_permission",
     "plan_mode",
     "show_tips",
-    "auto_update",
     "fork_secondary_model",
     "show_thinking_blocks",
     "prompt_suggestions",
@@ -261,9 +260,6 @@ fn assert_set_bool_action(outcome: SettingsKeyOutcome, key: &str, expected: bool
 
         ("show_tips", Action::SetShowTips(b)) => {
             assert_eq!(b, expected, "SetShowTips value differs from expected")
-        }
-        ("auto_update", Action::SetAutoUpdate(b)) => {
-            assert_eq!(b, expected, "SetAutoUpdate value differs from expected")
         }
         ("respect_manual_folds", Action::SetRespectManualFolds(b)) => {
             assert_eq!(
@@ -1873,7 +1869,6 @@ fn registry_kind_membership_through_pr_14() {
             "remember_tool_approvals",
             "toolset.ask_user_question.timeout_enabled",
             "subagent_model_inheritance",
-            "auto_update",
             "show_tips",
             "voice_keybind_enabled",
             // Per-tip contextual-hint children (hidden from the top-level list, toggled inside the group sub-sheet) are still Bool settings
@@ -2053,7 +2048,6 @@ fn defaults_round_trip_through_registry() {
             "voice_stt_language" => SettingValue::Enum("en"),
             "plan_mode" => SettingValue::Enum("off"),
             "show_tips" => SettingValue::Bool(true),
-            "auto_update" => SettingValue::Bool(true),
             "fork_secondary_model" => SettingValue::String(String::new()),
             "show_thinking_blocks" => SettingValue::Bool(true),
             "prompt_suggestions" => SettingValue::Bool(true),
@@ -2136,7 +2130,6 @@ fn settings_value_payload_matches_kind() {
             | SettingsKeyOutcome::Action(Action::SetAskUserQuestionTimeoutEnabled(_))
             | SettingsKeyOutcome::Action(Action::SetSubagentModelInheritance(_))
             | SettingsKeyOutcome::Action(Action::SetShowTips(_))
-            | SettingsKeyOutcome::Action(Action::SetAutoUpdate(_))
             | SettingsKeyOutcome::Action(Action::SetRespectManualFolds(_))
             | SettingsKeyOutcome::Action(Action::SetShowThinkingBlocks(_))
             | SettingsKeyOutcome::Action(Action::SetPromptSuggestions(_))
@@ -6028,14 +6021,6 @@ fn pr13_space_on_show_tips_dispatches_typed_setter() {
     assert_set_bool_action(outcome, "show_tips", false);
 }
 
-#[test]
-fn pr13_space_on_auto_update_dispatches_typed_setter() {
-    let mut s = make_state();
-    navigate_to(&mut s, "auto_update");
-    let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
-    assert_set_bool_action(outcome, "auto_update", false);
-}
-
 /// Value-column click on `show_tips` toggles in one click.
 #[test]
 fn pr13_mouse_click_on_show_tips_indicator_toggles_in_one_click() {
@@ -6051,12 +6036,12 @@ fn pr13_mouse_click_on_show_tips_indicator_toggles_in_one_click() {
     assert_set_bool_action(outcome, "show_tips", false);
 }
 
-/// Two-stage select-then-toggle on `auto_update`.
+/// Two-stage select-then-toggle on `show_tips`.
 #[test]
-fn pr13_mouse_click_on_auto_update_two_stage_select_then_toggle() {
+fn pr13_mouse_click_on_show_tips_two_stage_select_then_toggle() {
     let mut s = make_state();
     synth_rects(&mut s);
-    let row_y = row_idx_for(&s, "auto_update") as u16;
+    let row_y = row_idx_for(&s, "show_tips") as u16;
 
     // First click: select-only (the focused row was compact_mode).
     let outcome = handle_settings_mouse(
@@ -6077,27 +6062,26 @@ fn pr13_mouse_click_on_auto_update_two_stage_select_then_toggle() {
         10,
         row_y,
     );
-    assert_set_bool_action(outcome, "auto_update", false);
+    assert_set_bool_action(outcome, "show_tips", false);
 }
 
 /// CLI-batch settings are all `restart_required: true`.
 #[test]
 fn pr13_cli_batch_all_settings_are_restart_required() {
     let reg = SettingsRegistry::defaults();
-    for key in ["show_tips", "auto_update"] {
-        let meta = reg
-            .find(key)
-            .unwrap_or_else(|| panic!("registry must contain `{key}` (PR 13)"));
-        assert!(
-            meta.restart_required,
-            "PR-13 setting `{key}` must have restart_required: true \
-             (consumer reads value once at startup; the modal renders \
-             the restart pill when this row is expanded)",
-        );
-        // Sanity: these CLI-batch settings are all SHELL-owned Bool.
-        assert_eq!(meta.owner, SettingOwner::Shell);
-        assert!(matches!(meta.kind, SettingKind::Bool { .. }));
-    }
+    let key = "show_tips";
+    let meta = reg
+        .find(key)
+        .unwrap_or_else(|| panic!("registry must contain `{key}` (PR 13)"));
+    assert!(
+        meta.restart_required,
+        "PR-13 setting `{key}` must have restart_required: true \
+         (consumer reads value once at startup; the modal renders \
+         the restart pill when this row is expanded)",
+    );
+    // Sanity: the CLI-batch setting is SHELL-owned Bool.
+    assert_eq!(meta.owner, SettingOwner::Shell);
+    assert!(matches!(meta.kind, SettingKind::Bool { .. }));
 }
 
 /// CLI-batch defaults round-trip through `current_value_for`.
@@ -6106,23 +6090,22 @@ fn pr13_cli_batch_defaults_roundtrip_via_current_value_for() {
     use xai_grok_pager::settings::current_value_for;
     let ui = UiConfig::default();
     let pager = PagerLocalSnapshot::default();
-    for (key, expected) in [("show_tips", true), ("auto_update", true)] {
-        let value = current_value_for(key, &ui, &pager)
-            .unwrap_or_else(|| panic!("current_value_for(`{key}`) must resolve"));
-        assert_eq!(
-            value,
-            SettingValue::Bool(expected),
-            "PR 13: `{key}` defaults to {expected} (matches the consumer's \
-             .unwrap_or(...) at the original read site)",
-        );
-    }
+    let (key, expected) = ("show_tips", true);
+    let value = current_value_for(key, &ui, &pager)
+        .unwrap_or_else(|| panic!("current_value_for(`{key}`) must resolve"));
+    assert_eq!(
+        value,
+        SettingValue::Bool(expected),
+        "PR 13: `{key}` defaults to {expected} (matches the consumer's \
+         .unwrap_or(...) at the original read site)",
+    );
 }
 
 /// CLI-batch settings are discoverable via search.
 #[test]
 fn pr13_cli_batch_settings_are_discoverable_via_search() {
     let reg = SettingsRegistry::defaults();
-    let cases = [("tip", "show_tips"), ("auto-update", "auto_update")];
+    let cases = [("tip", "show_tips")];
     for (query, expected_key) in cases {
         let hits = reg.search(query);
         assert!(

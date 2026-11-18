@@ -140,48 +140,6 @@ pub(super) fn make_subagent_info(child_sid: &str) -> SubagentInfo {
         transcript: Default::default(),
     }
 }
-#[test]
-fn workflow_catalog_projection_and_open_modal_refresh_are_coalesced() {
-    let workflow = acp::AvailableCommand::new("review", "review")
-        .meta(serde_json::json!({"workflowSource": "project"}).as_object().cloned());
-    assert_eq!(
-            workflow_commands(&[workflow]),
-            vec![("review", "review", Some("project"), None)]
-        );
-    let mut app = make_app_with_agent("session-workflows");
-    let id = AgentId(0);
-    app.agents.get_mut(&id).unwrap().extensions_modal = Some(
-        crate::views::extensions_modal::ExtensionsModalState::new(
-            crate::views::extensions_modal::ExtensionsTab::Skills,
-        ),
-    );
-    queue_open_workflows_modal_refresh(&mut app, id);
-    queue_open_workflows_modal_refresh(&mut app, id);
-    assert_eq!(app.pending_effects.len(), 1);
-    assert!(matches!(
-            app.pending_effects.first(),
-            Some(Effect::FetchWorkflowsList { agent_id, session_id })
-                if *agent_id == id && session_id.0.as_ref() == "session-workflows"
-        ));
-}
-#[test]
-fn workflow_catalog_projection_detects_same_name_metadata_changes() {
-    let command = |description: &str, path: &str| {
-        acp::AvailableCommand::new("review", description)
-            .meta(
-                serde_json::json!({
-                    "workflowSource": "project",
-                    "workflowPath": path,
-                })
-                    .as_object()
-                    .cloned(),
-            )
-    };
-    assert_ne!(
-            workflow_commands(&[command("Workflow: old", "/old/review.rhai")]),
-            workflow_commands(&[command("Workflow: new", "/new/review.rhai")]),
-        );
-}
 pub(super) fn compressed_entry(
     index: usize,
 ) -> xai_grok_shell::extensions::notification::ImageCompressedEntry {

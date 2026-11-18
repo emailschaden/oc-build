@@ -432,7 +432,7 @@ impl AgentView {
         }
     }
 
-    // -- Hooks/plugins modal input handling --
+    // -- Extensions modal input handling --
 
     fn log_extensions_modal_action(
         &self,
@@ -486,7 +486,6 @@ impl AgentView {
         let next_enabled = matches!(
             action,
             ButtonAction::ToggleSelectedPlugin
-                | ButtonAction::ToggleSelectedHook
                 | ButtonAction::ToggleSelectedSkill
                 | ButtonAction::ToggleSelectedMcpServer
         )
@@ -502,37 +501,6 @@ impl AgentView {
                     && let Some(plugin) = data.plugins.get(idx)
                 {
                     (Some(plugin.name.clone()), next_enabled)
-                } else {
-                    (None, None)
-                }
-            }
-            ButtonAction::ToggleSelectedHook | ButtonAction::RemoveSelectedHook => {
-                let TabDataState::Loaded(ref data) = state.hooks_data else {
-                    return (None, None);
-                };
-                if let Some(idx) = state.selected_data_index()
-                    && let Some(hook) = data.hooks.get(idx)
-                {
-                    let label = if matches!(action, ButtonAction::ToggleSelectedHook)
-                        && state.hooks_collapsed_groups.contains(&hook.source_dir)
-                    {
-                        let (label, _) =
-                            crate::views::extensions_modal::derive_source_label(&hook.source_dir);
-                        label
-                    } else {
-                        hook.name.clone()
-                    };
-                    (Some(label), next_enabled)
-                } else if matches!(action, ButtonAction::RemoveSelectedHook)
-                    && let Some(source_dir) = state
-                        .entry_group_keys
-                        .get(state.picker_state.selected)
-                        .and_then(|k| k.as_ref())
-                {
-                    // Group header: removal targets the whole source.
-                    let (label, _) =
-                        crate::views::extensions_modal::derive_source_label(source_dir);
-                    (Some(label), next_enabled)
                 } else {
                     (None, None)
                 }
@@ -568,30 +536,6 @@ impl AgentView {
                     && let Some(server) = servers.get(idx)
                 {
                     (Some(server.name.clone()), next_enabled)
-                } else {
-                    (None, None)
-                }
-            }
-            ButtonAction::InstallSelectedMarketplacePlugin
-            | ButtonAction::UpdateSelectedMarketplacePlugin
-            | ButtonAction::UninstallSelectedMarketplacePlugin => {
-                if let TabDataState::Loaded(ref response) = state.marketplace_data
-                    && let Some((si, Some(pi))) =
-                        state.resolve_marketplace_selection(&response.sources)
-                    && let Some(plugin) = response.sources.get(si).and_then(|s| s.plugins.get(pi))
-                {
-                    (Some(plugin.name.clone()), None)
-                } else {
-                    (None, None)
-                }
-            }
-            ButtonAction::RemoveSelectedMarketplaceSource => {
-                if let TabDataState::Loaded(ref response) = state.marketplace_data
-                    && let Some(source) = state
-                        .resolve_marketplace_selection(&response.sources)
-                        .and_then(|(si, _)| response.sources.get(si))
-                {
-                    (Some(source.source_name.clone()), None)
                 } else {
                     (None, None)
                 }
@@ -738,7 +682,7 @@ impl AgentView {
         {
             let state = self.extensions_modal.as_mut().unwrap();
             // oc-build: opencode backend
-            let labels: Vec<&str> = crate::views::extensions_modal::ExtensionsTab::shown()
+            let labels: Vec<&str> = crate::views::extensions_modal::ExtensionsTab::ALL
                 .iter()
                 .map(|t| t.label())
                 .collect();
@@ -896,24 +840,20 @@ impl AgentView {
         };
 
         // Build the same config as the renderer.
-        // oc-build: opencode backend
-        let labels: Vec<&str> = crate::views::extensions_modal::ExtensionsTab::shown()
+        let labels: Vec<&str> = crate::views::extensions_modal::ExtensionsTab::ALL
             .iter()
             .map(|t| t.label())
             .collect();
-        // oc-build: opencode backend
-        let active_idx = crate::views::extensions_modal::ExtensionsTab::shown()
+        let active_idx = crate::views::extensions_modal::ExtensionsTab::ALL
             .iter()
             .position(|t| *t == state.active_tab)
             .unwrap_or(0);
         let has_filter = matches!(
             state.active_tab,
-            crate::views::extensions_modal::ExtensionsTab::Hooks
-                | crate::views::extensions_modal::ExtensionsTab::Plugins
+            crate::views::extensions_modal::ExtensionsTab::Plugins
                 | crate::views::extensions_modal::ExtensionsTab::McpServers
         );
         let filter = match state.active_tab {
-            crate::views::extensions_modal::ExtensionsTab::Hooks => state.hooks_filter,
             crate::views::extensions_modal::ExtensionsTab::Plugins => state.plugins_filter,
             crate::views::extensions_modal::ExtensionsTab::McpServers => state.mcps_filter,
             _ => crate::views::extensions_modal::StatusFilter::All,
@@ -974,7 +914,7 @@ impl AgentView {
             crate::views::picker::PickerOutcome::TabChanged(idx) => {
                 if let Some(ref mut state) = self.extensions_modal
                     // oc-build: opencode backend
-                    && let Some(&tab) = crate::views::extensions_modal::ExtensionsTab::shown().get(idx)
+                    && let Some(&tab) = crate::views::extensions_modal::ExtensionsTab::ALL.get(idx)
                 {
                     // switch_tab also clears the Add form, error overlay, and pending [processing] badge
                     // The new tab thus opens in a clean browse view
@@ -986,10 +926,6 @@ impl AgentView {
                 let mut cycled = false;
                 if let Some(ref mut state) = self.extensions_modal {
                     cycled = match state.active_tab {
-                        crate::views::extensions_modal::ExtensionsTab::Hooks => {
-                            state.hooks_filter = state.hooks_filter.next();
-                            true
-                        }
                         crate::views::extensions_modal::ExtensionsTab::Plugins => {
                             state.plugins_filter = state.plugins_filter.next();
                             true
@@ -1181,7 +1117,7 @@ impl AgentView {
                 crate::views::modal_window::ModalWindowOutcome::TabChanged(idx) => {
                     // oc-build: opencode backend
                     if let Some(&tab) =
-                        crate::views::extensions_modal::ExtensionsTab::shown().get(idx)
+                        crate::views::extensions_modal::ExtensionsTab::ALL.get(idx)
                     {
                         // Clears Add form, error overlay, and pending badge in addition to resetting picker state
                         state.switch_tab_focus_list(tab);
@@ -1200,7 +1136,7 @@ impl AgentView {
                     if id == 98 {
                         // The "Tab/Shift+Tab tabs" hint: cycle to the next tab, mirroring the Tab keypress flow
                         // oc-build: opencode backend
-                        let all = crate::views::extensions_modal::ExtensionsTab::shown();
+                        let all = crate::views::extensions_modal::ExtensionsTab::ALL;
                         let cur = all.iter().position(|&t| t == state.active_tab).unwrap_or(0);
                         let next = (cur + 1) % all.len();
                         if let Some(&tab) = all.get(next) {
@@ -1286,24 +1222,20 @@ impl AgentView {
         }
 
         // Build the same config as the renderer/key handler.
-        // oc-build: opencode backend
-        let labels: Vec<&str> = crate::views::extensions_modal::ExtensionsTab::shown()
+        let labels: Vec<&str> = crate::views::extensions_modal::ExtensionsTab::ALL
             .iter()
             .map(|t| t.label())
             .collect();
-        // oc-build: opencode backend
-        let active_idx = crate::views::extensions_modal::ExtensionsTab::shown()
+        let active_idx = crate::views::extensions_modal::ExtensionsTab::ALL
             .iter()
             .position(|t| *t == state.active_tab)
             .unwrap_or(0);
         let has_filter = matches!(
             state.active_tab,
-            crate::views::extensions_modal::ExtensionsTab::Hooks
-                | crate::views::extensions_modal::ExtensionsTab::Plugins
+            crate::views::extensions_modal::ExtensionsTab::Plugins
                 | crate::views::extensions_modal::ExtensionsTab::McpServers
         );
         let filter = match state.active_tab {
-            crate::views::extensions_modal::ExtensionsTab::Hooks => state.hooks_filter,
             crate::views::extensions_modal::ExtensionsTab::Plugins => state.plugins_filter,
             crate::views::extensions_modal::ExtensionsTab::McpServers => state.mcps_filter,
             _ => crate::views::extensions_modal::StatusFilter::All,
@@ -1383,7 +1315,7 @@ impl AgentView {
             crate::views::picker::PickerOutcome::TabChanged(idx) => {
                 if let Some(ref mut state) = self.extensions_modal
                     // oc-build: opencode backend
-                    && let Some(&tab) = crate::views::extensions_modal::ExtensionsTab::shown().get(idx)
+                    && let Some(&tab) = crate::views::extensions_modal::ExtensionsTab::ALL.get(idx)
                 {
                     // Clears Add form, error overlay, and pending badge in addition to resetting picker state
                     state.switch_tab_focus_list(tab);
@@ -1394,10 +1326,6 @@ impl AgentView {
                 let mut cycled = false;
                 if let Some(ref mut state) = self.extensions_modal {
                     cycled = match state.active_tab {
-                        crate::views::extensions_modal::ExtensionsTab::Hooks => {
-                            state.hooks_filter = state.hooks_filter.next();
-                            true
-                        }
                         crate::views::extensions_modal::ExtensionsTab::Plugins => {
                             state.plugins_filter = state.plugins_filter.next();
                             true
@@ -1612,13 +1540,6 @@ impl AgentView {
         };
         state.picker_state.scroll_offset = None;
         match state.active_tab {
-            crate::views::extensions_modal::ExtensionsTab::Hooks => {
-                if collapsed {
-                    state.hooks_collapsed_groups.insert(group_key.to_string())
-                } else {
-                    state.hooks_collapsed_groups.remove(group_key)
-                }
-            }
             crate::views::extensions_modal::ExtensionsTab::Plugins => {
                 if collapsed {
                     state.plugins_collapsed_groups.insert(group_key.to_string())
@@ -1631,38 +1552,6 @@ impl AgentView {
                     state.skills_collapsed_groups.insert(group_key.to_string())
                 } else {
                     state.skills_collapsed_groups.remove(group_key)
-                }
-            }
-            // Workflows tab has no collapsible groups.
-            crate::views::extensions_modal::ExtensionsTab::Workflows => false,
-            crate::views::extensions_modal::ExtensionsTab::Marketplace => {
-                let source_has_error = group_key
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|si| {
-                        if let crate::views::extensions_modal::TabDataState::Loaded(ref data) =
-                            state.marketplace_data
-                        {
-                            data.sources.get(si).and_then(|s| s.error.as_ref())
-                        } else {
-                            None
-                        }
-                    })
-                    .is_some();
-                if source_has_error {
-                    if collapsed {
-                        state.picker_state.expanded.remove(&sel)
-                    } else {
-                        state.picker_state.expanded.insert(sel)
-                    }
-                } else if let Ok(source_idx) = group_key.parse::<usize>() {
-                    if collapsed {
-                        state.marketplace_collapsed_sources.insert(source_idx)
-                    } else {
-                        state.marketplace_collapsed_sources.remove(&source_idx)
-                    }
-                } else {
-                    false
                 }
             }
             crate::views::extensions_modal::ExtensionsTab::McpServers => {
@@ -1701,23 +1590,6 @@ impl AgentView {
         }
 
         match action {
-            ButtonAction::HooksAction(hooks_action) => {
-                if let Some(ref mut state) = self.extensions_modal {
-                    state.modal_message = None;
-                    if matches!(hooks_action, xai_hooks_plugins_types::HooksAction::Reload) {
-                        // Reload rebuilds the entire plugin registry; show tab-level "Loading..." instead of a single-entry badge
-                        state.pending_action = Some("Reloading...".into());
-                        state.pending_entry_index = None;
-                        state.hooks_data = TabDataState::Loading;
-                        state.plugins_data = TabDataState::Loading;
-                        state.marketplace_data = TabDataState::Loading;
-                    } else {
-                        state.pending_action = Some("Processing...".into());
-                        state.pending_entry_index = Some(state.picker_state.selected);
-                    }
-                }
-                InputOutcome::Action(Action::ExecuteHooksAction(hooks_action))
-            }
             ButtonAction::PluginsAction(plugins_action) => {
                 if let Some(ref mut state) = self.extensions_modal {
                     state.modal_message = None;
@@ -1730,11 +1602,9 @@ impl AgentView {
                         state.pending_action = Some("Reloading...".into());
                         state.pending_entry_index = None;
                         state.plugins_data = TabDataState::Loading;
-                        state.marketplace_data = TabDataState::Loading;
-                        state.hooks_data = TabDataState::Loading;
                     } else {
                         // Per-plugin actions badge the selected row
-                        // Update gets its own verb (matching the Marketplace tab) so the user sees the fetch is underway, not a generic spinner
+                        // Update gets its own verb so the user sees the fetch is underway, not a generic spinner
                         let label = if matches!(
                             plugins_action,
                             xai_hooks_plugins_types::PluginsAction::Update { .. }
@@ -1876,134 +1746,6 @@ impl AgentView {
                     None => InputOutcome::Changed,
                 }
             }
-            ButtonAction::MarketplaceAction(marketplace_action) => {
-                if let Some(ref mut state) = self.extensions_modal {
-                    use crate::views::extensions_modal::TabDataState;
-                    state.modal_message = None;
-                    match &marketplace_action {
-                        // Refresh re-syncs every source and reloads the whole list
-                        // Show a tab-level loading state instead of decorating the single row under the cursor
-                        xai_hooks_plugins_types::MarketplaceAction::Refresh { .. } => {
-                            state.pending_action = None;
-                            state.pending_entry_index = None;
-                            state.marketplace_data = TabDataState::Loading;
-                        }
-                        // No pending_entry_index: the new source doesn't exist yet, so any index would decorate an unrelated row
-                        xai_hooks_plugins_types::MarketplaceAction::AddSource { .. } => {
-                            state.pending_action = Some("Adding source...".into());
-                        }
-                        xai_hooks_plugins_types::MarketplaceAction::Uninstall { .. } => {
-                            state.pending_action = Some("Uninstalling...".into());
-                            state.pending_entry_index = Some(state.picker_state.selected);
-                        }
-                        _ => {
-                            state.pending_action = Some("Processing...".into());
-                            state.pending_entry_index = Some(state.picker_state.selected);
-                        }
-                    }
-                }
-                InputOutcome::Action(Action::ExecuteMarketplaceAction(marketplace_action))
-            }
-            ButtonAction::RemoveSelectedHook => {
-                use crate::views::extensions_modal::TabDataState;
-                // `x` removes the whole source_dir, so gate at source level: a pinned member may hide behind an unpinned row
-                // Group headers carry no data index; resolve them via their group key so the advertised `x` acts there too
-                let selected = if let Some(ref state) = self.extensions_modal
-                    && let TabDataState::Loaded(ref data) = state.hooks_data
-                {
-                    let source_dir = if let Some(idx) = state.selected_data_index() {
-                        data.hooks.get(idx).map(|h| h.source_dir.clone())
-                    } else {
-                        state
-                            .entry_group_keys
-                            .get(state.picker_state.selected)
-                            .and_then(|k| k.clone())
-                    };
-                    source_dir.map(|source_dir| {
-                        (
-                            crate::views::extensions_modal::hook_source_pinned(
-                                &data.hooks,
-                                &source_dir,
-                            ),
-                            data.hooks
-                                .iter()
-                                .any(|h| h.source_dir == source_dir && h.removable),
-                            source_dir,
-                        )
-                    })
-                } else {
-                    None
-                };
-                let Some((source_pinned, removable, path)) = selected else {
-                    return InputOutcome::Changed;
-                };
-                // Refuse up front with the covering view instead of a confirm that can only fail
-                if source_pinned || !removable {
-                    let message = if source_pinned {
-                        "This hook source is enforced by managed policy and cannot be removed."
-                    } else {
-                        "Only user-added hook directories can be removed here."
-                    };
-                    if let Some(ref mut state) = self.extensions_modal {
-                        state.modal_message = Some(
-                            crate::views::extensions_modal::ModalMessage::Info(message.to_owned()),
-                        );
-                    }
-                    InputOutcome::Changed
-                } else {
-                    let (label, _) = crate::views::extensions_modal::derive_source_label(&path);
-                    self.prompt_extensions_confirm(
-                        format!("Remove hook source \"{label}\"?"),
-                        crate::views::extensions_modal::ConfirmationAction::Hooks(
-                            xai_hooks_plugins_types::HooksAction::Remove { path },
-                        ),
-                    )
-                }
-            }
-            ButtonAction::ToggleSelectedHook => {
-                let Some(state) = self.extensions_modal.as_mut() else {
-                    return InputOutcome::Changed;
-                };
-                let crate::views::extensions_modal::TabDataState::Loaded(ref data) =
-                    state.hooks_data
-                else {
-                    return InputOutcome::Changed;
-                };
-                let Some(hook) = state
-                    .selected_data_index()
-                    .and_then(|idx| data.hooks.get(idx))
-                else {
-                    state.post_select_row_hint("hook", ActionVerb::EnableDisable);
-                    return InputOutcome::Changed;
-                };
-                let source = &hook.source_dir;
-                let action = if state.hooks_collapsed_groups.contains(source) {
-                    // Group toggle: collect all hooks in this source group.
-                    let group_hooks: Vec<&xai_hooks_plugins_types::HookInfo> = data
-                        .hooks
-                        .iter()
-                        .filter(|h| h.source_dir == *source)
-                        .collect();
-                    // Direction comes from the unpinned hooks only (all-pinned groups read enabled)
-                    // Shared with the button-label mirror so the two can't drift
-                    let any_enabled = crate::views::extensions_modal::hook_group_any_enabled(
-                        group_hooks.iter().copied(),
-                    );
-                    xai_hooks_plugins_types::HooksAction::ToggleSource {
-                        hook_names: group_hooks.iter().map(|h| h.name.clone()).collect(),
-                        disable: any_enabled,
-                    }
-                } else if hook.disabled {
-                    xai_hooks_plugins_types::HooksAction::Enable {
-                        hook_name: hook.name.clone(),
-                    }
-                } else {
-                    xai_hooks_plugins_types::HooksAction::Disable {
-                        hook_name: hook.name.clone(),
-                    }
-                };
-                self.execute_modal_button_action(ButtonAction::HooksAction(action))
-            }
             ButtonAction::ToggleSelectedPlugin => {
                 if let Some(plugin) = self.selected_plugin_for_action(ActionVerb::EnableDisable) {
                     let plugin_id = plugin.id;
@@ -2071,17 +1813,6 @@ impl AgentView {
                 if let Some(ref mut state) = self.extensions_modal {
                     use crate::views::extensions_modal::{ExtensionsTab, TabDataState};
                     match state.active_tab {
-                        ExtensionsTab::Hooks => {
-                            if let TabDataState::Loaded(ref data) = state.hooks_data
-                                && let Some(idx) = state.selected_data_index()
-                                && let Some(hook) = data.hooks.get(idx)
-                            {
-                                let key = hook.source_dir.clone();
-                                if !state.hooks_collapsed_groups.remove(&key) {
-                                    state.hooks_collapsed_groups.insert(key);
-                                }
-                            }
-                        }
                         ExtensionsTab::Plugins => {
                             let sel = state.picker_state.selected;
                             if let Some(gk) = state
@@ -2097,43 +1828,6 @@ impl AgentView {
                                 state.picker_state.expanded.remove(&sel);
                             } else {
                                 state.picker_state.expanded.insert(sel);
-                            }
-                        }
-                        ExtensionsTab::Marketplace => {
-                            if let TabDataState::Loaded(ref data) = state.marketplace_data {
-                                match state.resolve_marketplace_selection(&data.sources) {
-                                    Some((source_index, None)) => {
-                                        let has_error = data
-                                            .sources
-                                            .get(source_index)
-                                            .and_then(|s| s.error.as_ref())
-                                            .is_some();
-                                        if has_error {
-                                            let sel = state.picker_state.selected;
-                                            if state.picker_state.expanded.contains(&sel) {
-                                                state.picker_state.expanded.remove(&sel);
-                                            } else {
-                                                state.picker_state.expanded.insert(sel);
-                                            }
-                                        } else if !state
-                                            .marketplace_collapsed_sources
-                                            .remove(&source_index)
-                                        {
-                                            state
-                                                .marketplace_collapsed_sources
-                                                .insert(source_index);
-                                        }
-                                    }
-                                    Some((_, Some(_))) => {
-                                        let sel = state.picker_state.selected;
-                                        if state.picker_state.expanded.contains(&sel) {
-                                            state.picker_state.expanded.remove(&sel);
-                                        } else {
-                                            state.picker_state.expanded.insert(sel);
-                                        }
-                                    }
-                                    None => {}
-                                }
                             }
                         }
                         ExtensionsTab::McpServers => {
@@ -2159,8 +1853,7 @@ impl AgentView {
                                 }
                             }
                         }
-                        // Workflows rows carry no group keys, so only the detail-expansion branch applies on that tab
-                        ExtensionsTab::Skills | ExtensionsTab::Workflows => {
+                        ExtensionsTab::Skills => {
                             let sel = state.picker_state.selected;
                             if let Some(gk) = state
                                 .entry_group_keys
@@ -2183,7 +1876,7 @@ impl AgentView {
             }
             ButtonAction::CycleFilter => {
                 if let Some(ref mut state) = self.extensions_modal {
-                    use crate::views::extensions_modal::{ExtensionsTab, TabDataState};
+                    use crate::views::extensions_modal::ExtensionsTab;
                     match state.active_tab {
                         ExtensionsTab::Plugins => {
                             state.plugins_filter = state.plugins_filter.next();
@@ -2193,49 +1886,14 @@ impl AgentView {
                             state.mcps_filter = state.mcps_filter.next();
                             state.picker_state.selected = 0;
                         }
-                        ExtensionsTab::Hooks => {
-                            let new_filter = state.hooks_filter.next();
-                            state.hooks_filter = new_filter;
-                            if let TabDataState::Loaded(ref data) = state.hooks_data {
-                                state.picker_state.selected = data
-                                    .hooks
-                                    .iter()
-                                    .position(|h| {
-                                        crate::views::extensions_modal::fuzzy_matches_hook(
-                                            h,
-                                            state.picker_state.query(),
-                                        ) && new_filter.matches(!h.disabled)
-                                    })
-                                    .unwrap_or(0);
-                            }
-                        }
                         ExtensionsTab::Skills => {
                             state.skills_filter = state.skills_filter.next();
                             state.picker_state.selected = 0;
                         }
-                        _ => {}
                     }
                 }
                 InputOutcome::Changed
             }
-            ButtonAction::InstallSelectedMarketplacePlugin => self
-                .execute_selected_marketplace_plugin_action(
-                    "Installing...",
-                    ActionVerb::Install,
-                    |plugin| xai_hooks_plugins_types::MarketplaceAction::Install {
-                        source_url_or_path: plugin.source_url_or_path,
-                        plugin_relative_path: plugin.relative_path,
-                    },
-                ),
-            ButtonAction::UpdateSelectedMarketplacePlugin => self
-                .execute_selected_marketplace_plugin_action(
-                    "Updating...",
-                    ActionVerb::Update,
-                    |plugin| xai_hooks_plugins_types::MarketplaceAction::Update {
-                        source_url_or_path: plugin.source_url_or_path,
-                        plugin_relative_path: plugin.relative_path,
-                    },
-                ),
             ButtonAction::StartInput {
                 command_prefix,
                 fields,
@@ -2245,40 +1903,6 @@ impl AgentView {
                     state.input = Some(ModalInput::from_specs(command_prefix, fields));
                 }
                 InputOutcome::Changed
-            }
-            ButtonAction::UninstallSelectedMarketplacePlugin => {
-                if let Some(plugin) =
-                    self.selected_marketplace_plugin_for_action(ActionVerb::Uninstall)
-                {
-                    return self.prompt_extensions_confirm(
-                        format!("Uninstall marketplace plugin \"{}\"?", plugin.name),
-                        crate::views::extensions_modal::ConfirmationAction::Marketplace(
-                            xai_hooks_plugins_types::MarketplaceAction::Uninstall {
-                                source_url_or_path: plugin.source_url_or_path,
-                                plugin_relative_path: plugin.relative_path,
-                            },
-                        ),
-                    );
-                }
-                InputOutcome::Changed
-            }
-            ButtonAction::RemoveSelectedMarketplaceSource => {
-                let Some(source) =
-                    self.selected_marketplace_source_for_action(ActionVerb::RemoveSource)
-                else {
-                    return InputOutcome::Changed;
-                };
-                self.prompt_extensions_confirm(
-                    format!(
-                        "Remove source \"{}\" and uninstall all its plugins?",
-                        source.name
-                    ),
-                    crate::views::extensions_modal::ConfirmationAction::Marketplace(
-                        xai_hooks_plugins_types::MarketplaceAction::RemoveSource {
-                            source_url_or_path: source.source_url_or_path,
-                        },
-                    ),
-                )
             }
         }
     }
@@ -2311,14 +1935,9 @@ impl AgentView {
         use crate::views::extensions_modal::{ButtonAction, ConfirmationAction};
 
         let outcome = match action {
-            ConfirmationAction::Hooks(hooks_action) => {
-                self.execute_modal_button_action(ButtonAction::HooksAction(hooks_action))
-            }
             ConfirmationAction::Plugins(plugins_action) => {
                 self.execute_modal_button_action(ButtonAction::PluginsAction(plugins_action))
             }
-            ConfirmationAction::Marketplace(marketplace_action) => self
-                .execute_modal_button_action(ButtonAction::MarketplaceAction(marketplace_action)),
             ConfirmationAction::DeleteMcpServer { server_name } => {
                 if let Some(ref mut s) = self.extensions_modal {
                     s.pending_action = Some("removing...".into());
@@ -2332,78 +1951,6 @@ impl AgentView {
             state.pending_entry_index = pending_entry_index;
         }
         outcome
-    }
-
-    fn execute_selected_marketplace_plugin_action(
-        &mut self,
-        pending_label: &'static str,
-        verb: ActionVerb,
-        make_action: impl FnOnce(
-            SelectedMarketplacePlugin,
-        ) -> xai_hooks_plugins_types::MarketplaceAction,
-    ) -> InputOutcome {
-        let Some(plugin) = self.selected_marketplace_plugin_for_action(verb) else {
-            return InputOutcome::Changed;
-        };
-        if let Some(ref mut state) = self.extensions_modal {
-            state.pending_action = Some(pending_label.into());
-            state.pending_entry_index = Some(state.picker_state.selected);
-        }
-        InputOutcome::Action(Action::ExecuteMarketplaceAction(make_action(plugin)))
-    }
-
-    /// The selected Marketplace-tab plugin row. Marketplace plugin actions are per-plugin, so a source header has no target and posts the row hint instead.
-    /// source header has no target and posts the row hint instead.
-    fn selected_marketplace_plugin_for_action(
-        &mut self,
-        verb: ActionVerb,
-    ) -> Option<SelectedMarketplacePlugin> {
-        use crate::views::extensions_modal::TabDataState;
-        let state = self.extensions_modal.as_mut()?;
-        let TabDataState::Loaded(ref response) = state.marketplace_data else {
-            return None;
-        };
-        let (source, plugin_index) = state
-            .resolve_marketplace_selection(&response.sources)
-            .and_then(|(si, pi)| Some((response.sources.get(si)?, pi)))?;
-        match plugin_index.and_then(|pi| source.plugins.get(pi)) {
-            Some(plugin) => Some(SelectedMarketplacePlugin {
-                source_url_or_path: source.source_url_or_path.clone(),
-                relative_path: plugin.relative_path.clone(),
-                name: plugin.name.clone(),
-            }),
-            None => {
-                // A source whose scan failed or found nothing has no plugin row to point at
-                if !source.plugins.is_empty() {
-                    state.post_select_row_hint("plugin", verb);
-                }
-                None
-            }
-        }
-    }
-
-    /// The selected Marketplace-tab source header. Source actions are per-source, so a plugin row
-    /// has no target and posts the row hint instead.
-    fn selected_marketplace_source_for_action(
-        &mut self,
-        verb: ActionVerb,
-    ) -> Option<SelectedMarketplaceSource> {
-        use crate::views::extensions_modal::TabDataState;
-        let state = self.extensions_modal.as_mut()?;
-        let TabDataState::Loaded(ref response) = state.marketplace_data else {
-            return None;
-        };
-        let (source_index, plugin_index) =
-            state.resolve_marketplace_selection(&response.sources)?;
-        if plugin_index.is_some() {
-            state.post_select_row_hint("source", verb);
-            return None;
-        }
-        let source = response.sources.get(source_index)?;
-        Some(SelectedMarketplaceSource {
-            name: source.source_name.clone(),
-            source_url_or_path: source.source_url_or_path.clone(),
-        })
     }
 
     /// The selected Plugins-tab row. A group header spans repos, so it has no target and posts the row hint instead.
@@ -2434,142 +1981,6 @@ struct SelectedPlugin {
     id: String,
     name: String,
     enabled: bool,
-}
-
-/// Marketplace plugin row resolved for a per-plugin action.
-struct SelectedMarketplacePlugin {
-    source_url_or_path: String,
-    relative_path: String,
-    name: String,
-}
-
-/// Marketplace source header resolved for a per-source action.
-struct SelectedMarketplaceSource {
-    name: String,
-    source_url_or_path: String,
-}
-
-#[cfg(test)]
-mod marketplace_modal_action_tests {
-    use crate::app::actions::Action;
-    use crate::app::app_view::InputOutcome;
-    use crate::views::extensions_modal::{
-        ButtonAction, ExtensionsModalState, ExtensionsTab, TabDataState,
-    };
-
-    pub(super) fn marketplace_plugin(
-        name: &str,
-        relative_path: &str,
-    ) -> xai_hooks_plugins_types::MarketplacePluginEntry {
-        xai_hooks_plugins_types::MarketplacePluginEntry {
-            name: name.into(),
-            version: Some("2.0.0".into()),
-            description: None,
-            category: None,
-            author: None,
-            tags: Vec::new(),
-            keywords: Vec::new(),
-            domains: Vec::new(),
-            homepage: None,
-            relative_path: relative_path.into(),
-            skill_count: 0,
-            has_hooks: false,
-            has_agents: false,
-            has_mcp: false,
-            install_status: "update_available".into(),
-            installed_version: Some("1.0.0".into()),
-            components: None,
-            remote_url: None,
-            remote_ref: None,
-            remote_sha: None,
-            remote_subdir: None,
-        }
-    }
-
-    #[test]
-    fn update_selected_marketplace_plugin_dispatches_update_and_sets_pending_state() {
-        let mut agent = super::test_fixtures::make_agent();
-        let mut modal = ExtensionsModalState::new(ExtensionsTab::Marketplace);
-        modal.marketplace_data =
-            TabDataState::Loaded(xai_hooks_plugins_types::MarketplaceListResponse {
-                sources: vec![xai_hooks_plugins_types::MarketplaceScanResult {
-                    source_name: "test-source".into(),
-                    source_kind: "git".into(),
-                    source_url_or_path: "https://example.com/plugins.git".into(),
-                    plugins: vec![marketplace_plugin("test-plugin", "plugins/test-plugin")],
-                    error: None,
-                }],
-            });
-        modal.entry_labels_cache = vec!["test-source".into(), "test-plugin".into()];
-        modal.entry_group_keys = vec![Some("0".into()), None];
-        modal.entry_data_indices = vec![None, Some(0)];
-        modal.picker_state.selected = 1;
-        agent.extensions_modal = Some(modal);
-
-        let outcome =
-            agent.execute_modal_button_action(ButtonAction::UpdateSelectedMarketplacePlugin);
-
-        match outcome {
-            InputOutcome::Action(Action::ExecuteMarketplaceAction(
-                xai_hooks_plugins_types::MarketplaceAction::Update {
-                    source_url_or_path,
-                    plugin_relative_path,
-                },
-            )) => {
-                assert_eq!(source_url_or_path, "https://example.com/plugins.git");
-                assert_eq!(plugin_relative_path, "plugins/test-plugin");
-            }
-            other => panic!("expected marketplace update action, got {other:?}"),
-        }
-        let state = agent
-            .extensions_modal
-            .as_ref()
-            .expect("modal should remain open");
-        assert_eq!(state.pending_action.as_deref(), Some("Updating..."));
-        assert_eq!(state.pending_entry_index, Some(1));
-    }
-
-    #[test]
-    fn refresh_marketplace_sets_tab_loading_state_not_row_pending() {
-        let mut agent = super::test_fixtures::make_agent();
-        let mut modal = ExtensionsModalState::new(ExtensionsTab::Marketplace);
-        modal.marketplace_data =
-            TabDataState::Loaded(xai_hooks_plugins_types::MarketplaceListResponse {
-                sources: vec![xai_hooks_plugins_types::MarketplaceScanResult {
-                    source_name: "test-source".into(),
-                    source_kind: "git".into(),
-                    source_url_or_path: "https://example.com/plugins.git".into(),
-                    plugins: vec![marketplace_plugin("test-plugin", "plugins/test-plugin")],
-                    error: None,
-                }],
-            });
-        modal.entry_labels_cache = vec!["test-source".into(), "test-plugin".into()];
-        modal.entry_group_keys = vec![Some("0".into()), None];
-        modal.entry_data_indices = vec![None, Some(0)];
-        modal.picker_state.selected = 1;
-        agent.extensions_modal = Some(modal);
-
-        let outcome = agent.execute_modal_button_action(ButtonAction::MarketplaceAction(
-            xai_hooks_plugins_types::MarketplaceAction::Refresh {
-                source_url_or_path: None,
-            },
-        ));
-
-        assert!(matches!(
-            outcome,
-            InputOutcome::Action(Action::ExecuteMarketplaceAction(
-                xai_hooks_plugins_types::MarketplaceAction::Refresh {
-                    source_url_or_path: None
-                }
-            ))
-        ));
-        let state = agent
-            .extensions_modal
-            .as_ref()
-            .expect("modal should remain open");
-        assert!(matches!(state.marketplace_data, TabDataState::Loading));
-        assert_eq!(state.pending_entry_index, None);
-    }
 }
 
 #[cfg(test)]
@@ -2638,51 +2049,6 @@ mod extensions_action_target_tests {
         agent.extensions_modal = Some(modal);
         render_modal(&mut agent);
         agent
-    }
-
-    fn marketplace_modal_agent() -> super::AgentView {
-        let mut modal = ExtensionsModalState::new(ExtensionsTab::Marketplace);
-        modal.marketplace_data =
-            TabDataState::Loaded(xai_hooks_plugins_types::MarketplaceListResponse {
-                sources: vec![xai_hooks_plugins_types::MarketplaceScanResult {
-                    source_name: "qa-plugin-git".into(),
-                    source_kind: "git".into(),
-                    source_url_or_path: "https://example.com/plugins.git".into(),
-                    plugins: vec![
-                        super::marketplace_modal_action_tests::marketplace_plugin(
-                            "test-plugin",
-                            "plugins/test-plugin",
-                        ),
-                        super::marketplace_modal_action_tests::marketplace_plugin(
-                            "other-plugin",
-                            "plugins/other-plugin",
-                        ),
-                    ],
-                    error: None,
-                }],
-            });
-        pipeline_agent(modal)
-    }
-
-    fn assert_marketplace_install_dispatched(
-        outcome: crate::app::app_view::InputOutcome,
-        agent: &super::AgentView,
-        relative_path: &str,
-    ) {
-        match outcome {
-            crate::app::app_view::InputOutcome::Action(
-                crate::app::actions::Action::ExecuteMarketplaceAction(
-                    xai_hooks_plugins_types::MarketplaceAction::Install {
-                        plugin_relative_path,
-                        ..
-                    },
-                ),
-            ) => assert_eq!(plugin_relative_path, relative_path),
-            other => panic!("expected marketplace install dispatch, got {other:?}"),
-        }
-        let state = agent.extensions_modal.as_ref().unwrap();
-        assert_eq!(state.pending_action.as_deref(), Some("Installing..."));
-        assert_eq!(state.picker_state.query(), "");
     }
 
     /// Plugins modal with one grouped plugin (group header row + plugin row).
@@ -2825,7 +2191,7 @@ mod extensions_action_target_tests {
     #[test]
     fn mouse_tab_switch_focuses_the_list_not_the_tab_bar() {
         let tab_index = |tab| {
-            ExtensionsTab::shown()
+            ExtensionsTab::ALL
                 .iter()
                 .position(|t| *t == tab)
                 .unwrap()
@@ -2883,9 +2249,9 @@ mod extensions_action_target_tests {
             .expect("footer `Tab tabs` hint");
         agent.handle_extensions_modal_mouse(&left_down(tab_hint.x, tab_hint.y));
         render_modal(&mut agent);
-        let tabs = ExtensionsTab::shown();
+        let tabs = ExtensionsTab::ALL;
         let next = match tabs.len() {
-            0 => panic!("ExtensionsTab::shown() is empty"),
+            0 => panic!("ExtensionsTab::ALL is empty"),
             n => *tabs
                 .get((tab_index(ExtensionsTab::Plugins) + 1) % n)
                 .unwrap_or_else(|| panic!("next extensions tab")),
@@ -3214,224 +2580,6 @@ mod extensions_action_target_tests {
     }
 
     #[test]
-    fn marketplace_actions_resolve_plugin_and_source_names() {
-        let mut modal = ExtensionsModalState::new(ExtensionsTab::Marketplace);
-        modal.marketplace_data =
-            TabDataState::Loaded(xai_hooks_plugins_types::MarketplaceListResponse {
-                sources: vec![xai_hooks_plugins_types::MarketplaceScanResult {
-                    source_name: "test-source".into(),
-                    source_kind: "git".into(),
-                    source_url_or_path: "https://example.com/plugins.git".into(),
-                    plugins: vec![super::marketplace_modal_action_tests::marketplace_plugin(
-                        "test-plugin",
-                        "plugins/test-plugin",
-                    )],
-                    error: None,
-                }],
-            });
-        modal.entry_labels_cache = vec!["test-source".into(), "test-plugin".into()];
-        modal.entry_group_keys = vec![Some("0".into()), None];
-        modal.entry_data_indices = vec![None, Some(0)];
-        modal.picker_state.selected = 1;
-
-        for action in [
-            ButtonAction::InstallSelectedMarketplacePlugin,
-            ButtonAction::UpdateSelectedMarketplacePlugin,
-            ButtonAction::UninstallSelectedMarketplacePlugin,
-        ] {
-            let (target, enabled) = AgentView::extensions_action_target(&modal, &action);
-            assert_eq!(target.as_deref(), Some("test-plugin"), "{action:?}");
-            assert_eq!(enabled, None);
-        }
-
-        let (target, enabled) = AgentView::extensions_action_target(
-            &modal,
-            &ButtonAction::RemoveSelectedMarketplaceSource,
-        );
-        assert_eq!(target.as_deref(), Some("test-source"));
-        assert_eq!(enabled, None);
-    }
-
-    fn hook_info(
-        name: &str,
-        source_dir: &str,
-        disabled: bool,
-    ) -> xai_hooks_plugins_types::HookInfo {
-        xai_hooks_plugins_types::HookInfo {
-            name: name.into(),
-            event: xai_hooks_plugins_types::HookEvent::PreToolUse,
-            handler_type: xai_hooks_plugins_types::HookHandlerType::Command,
-            matcher: None,
-            command: None,
-            url: None,
-            timeout_ms: 0,
-            source_dir: source_dir.into(),
-            disabled,
-            pinned: false,
-            removable: false,
-        }
-    }
-
-    fn hooks_modal(hooks: Vec<xai_hooks_plugins_types::HookInfo>) -> ExtensionsModalState {
-        let mut modal = ExtensionsModalState::new(ExtensionsTab::Hooks);
-        modal.hooks_data = TabDataState::Loaded(xai_hooks_plugins_types::HooksListResponse {
-            hooks,
-            project_trusted: true,
-            load_errors: Vec::new(),
-        });
-        modal.entry_data_indices = vec![Some(0)];
-        modal.entry_group_keys = vec![None];
-        modal.picker_state.selected = 0;
-        modal
-    }
-
-    /// `x` on a source with a managed-policy member refuses without a confirm, even when the selected row is an unpinned sibling.
-    #[test]
-    fn remove_refuses_policy_source_without_confirm() {
-        let mut agent = super::test_fixtures::make_agent();
-        let mut pinned = hook_info("policy/hook-a", "/etc/grok", false);
-        pinned.pinned = true;
-        let sibling = hook_info("policy/hook-b", "/etc/grok", false);
-        let mut modal = hooks_modal(vec![pinned, sibling]);
-        // The unpinned sibling is selected; removal targets the source.
-        modal.entry_data_indices = vec![Some(0), Some(1)];
-        modal.entry_group_keys = vec![None, None];
-        modal.picker_state.selected = 1;
-        agent.extensions_modal = Some(modal);
-
-        agent.execute_modal_button_action(ButtonAction::RemoveSelectedHook);
-        use crate::views::extensions_modal::ModalMessage;
-        match &agent.extensions_modal.as_ref().unwrap().modal_message {
-            Some(ModalMessage::Info(msg)) => {
-                assert!(msg.contains("managed policy"), "unexpected copy: {msg}");
-            }
-            other => panic!("expected Info refusal, got {other:?}"),
-        }
-    }
-
-    /// Headers carry no data index, so `x` resolves them via group key: the advertised remove must reach the confirm on a removable source and the policy refusal on a pinned one (never a silent no-op).
-    /// advertised remove must reach the confirm on a removable source and the
-    /// policy refusal on a pinned one (never a silent no-op).
-    #[test]
-    fn remove_on_group_header_resolves_source_via_group_key() {
-        use crate::views::extensions_modal::ModalMessage;
-
-        let mut agent = super::test_fixtures::make_agent();
-        let mut removable = hook_info("user/hook-a", "/reg/user", false);
-        removable.removable = true;
-        let mut modal = hooks_modal(vec![removable]);
-        modal.entry_data_indices = vec![None, Some(0)];
-        modal.entry_group_keys = vec![Some("/reg/user".to_string()), None];
-        modal.picker_state.selected = 0;
-        agent.extensions_modal = Some(modal);
-
-        agent.execute_modal_button_action(ButtonAction::RemoveSelectedHook);
-        match &agent.extensions_modal.as_ref().unwrap().modal_message {
-            Some(ModalMessage::Confirmation { message, .. }) => {
-                assert!(
-                    message.contains("Remove hook source"),
-                    "unexpected copy: {message}"
-                );
-            }
-            other => panic!("expected remove confirm from header selection, got {other:?}"),
-        }
-
-        let mut agent = super::test_fixtures::make_agent();
-        let mut pinned = hook_info("policy/hook-a", "/etc/grok", false);
-        pinned.pinned = true;
-        pinned.removable = true;
-        let mut modal = hooks_modal(vec![pinned]);
-        modal.entry_data_indices = vec![None, Some(0)];
-        modal.entry_group_keys = vec![Some("/etc/grok".to_string()), None];
-        modal.picker_state.selected = 0;
-        agent.extensions_modal = Some(modal);
-
-        agent.execute_modal_button_action(ButtonAction::RemoveSelectedHook);
-        match &agent.extensions_modal.as_ref().unwrap().modal_message {
-            Some(ModalMessage::Info(msg)) => {
-                assert!(msg.contains("managed policy"), "unexpected copy: {msg}");
-            }
-            other => panic!("expected Info refusal from header selection, got {other:?}"),
-        }
-    }
-
-    /// Telemetry target for a header-initiated remove is the source label,
-    /// mirroring what the handler removes.
-    #[test]
-    fn remove_target_resolves_source_label_on_group_header() {
-        let mut removable = hook_info("user/hook-a", "/reg/user", false);
-        removable.removable = true;
-        let mut modal = hooks_modal(vec![removable]);
-        modal.entry_data_indices = vec![None, Some(0)];
-        modal.entry_group_keys = vec![Some("/reg/user".to_string()), None];
-        modal.picker_state.selected = 0;
-
-        let (target, enabled) =
-            AgentView::extensions_action_target(&modal, &ButtonAction::RemoveSelectedHook);
-        let expected_label = crate::views::extensions_modal::derive_source_label("/reg/user").0;
-        assert_eq!(target.as_deref(), Some(expected_label.as_str()));
-        assert_eq!(enabled, None);
-    }
-
-    /// Space on a hook row toggles that hook alone in the direction of its own state and marks the row pending; while its group sits in the collapsed set (a search query forces collapsed groups open) the same key toggles the whole source in the group's direction instead.
-    /// row pending; while its group sits in the collapsed set (a search query forces collapsed
-    /// groups open) the same key toggles the whole source in the group's direction instead.
-    #[test]
-    fn toggle_selected_hook_dispatches_for_selected_row_in_current_direction() {
-        use xai_hooks_plugins_types::HooksAction;
-        let dispatch = |disabled: bool, collapsed: bool| {
-            let mut agent = super::test_fixtures::make_agent();
-            let mut modal = hooks_modal(vec![
-                hook_info("src/hook-a", "/tmp/hooks", disabled),
-                hook_info("src/hook-b", "/tmp/hooks", false),
-            ]);
-            modal.entry_data_indices = vec![None, Some(0), Some(1)];
-            modal.entry_group_keys = vec![Some("/tmp/hooks".into()), None, None];
-            modal.picker_state.selected = 1;
-            if collapsed {
-                modal.hooks_collapsed_groups.insert("/tmp/hooks".into());
-            }
-            agent.extensions_modal = Some(modal);
-
-            let outcome = agent.execute_modal_button_action(ButtonAction::ToggleSelectedHook);
-            let action = match outcome {
-                crate::app::app_view::InputOutcome::Action(
-                    crate::app::actions::Action::ExecuteHooksAction(action),
-                ) => action,
-                other => panic!(
-                    "disabled={disabled} collapsed={collapsed}: expected hooks action, got {other:?}"
-                ),
-            };
-            let state = agent.extensions_modal.as_ref().expect("modal stays open");
-            assert_eq!(state.pending_action.as_deref(), Some("Processing..."));
-            assert_eq!(state.pending_entry_index, Some(1));
-            assert_eq!(state.modal_message, None);
-            action
-        };
-        let hook_name = || "src/hook-a".to_string();
-        assert_eq!(
-            dispatch(true, false),
-            HooksAction::Enable {
-                hook_name: hook_name()
-            }
-        );
-        assert_eq!(
-            dispatch(false, false),
-            HooksAction::Disable {
-                hook_name: hook_name()
-            }
-        );
-        // hook-b stays enabled, so the group reads enabled even though the selected row is disabled
-        assert_eq!(
-            dispatch(true, true),
-            HooksAction::ToggleSource {
-                hook_names: vec!["src/hook-a".into(), "src/hook-b".into()],
-                disable: true,
-            }
-        );
-    }
-
-    #[test]
     fn mcp_tool_row_with_stale_indices_yields_no_target() {
         let mut modal = ExtensionsModalState::new(ExtensionsTab::McpServers);
         modal.mcps_data = TabDataState::Loaded(vec![server_info("my-server", true)]);
@@ -3454,7 +2602,6 @@ mod extensions_action_target_tests {
             ButtonAction::ToggleSelectedPlugin,
             ButtonAction::ToggleSelectedSkill,
             ButtonAction::ToggleSelectedMcpServer,
-            ButtonAction::InstallSelectedMarketplacePlugin,
             ButtonAction::PluginsAction(xai_hooks_plugins_types::PluginsAction::Reload),
         ] {
             let (target, enabled) = AgentView::extensions_action_target(&modal, &action);
@@ -4128,43 +3275,6 @@ mod extensions_modal_confirmation_tests {
         }
     }
 
-    fn hook_info(name: &str, source_dir: &str) -> xai_hooks_plugins_types::HookInfo {
-        xai_hooks_plugins_types::HookInfo {
-            name: name.into(),
-            event: xai_hooks_plugins_types::HookEvent::PreToolUse,
-            handler_type: xai_hooks_plugins_types::HookHandlerType::Command,
-            matcher: None,
-            command: None,
-            url: None,
-            timeout_ms: 0,
-            source_dir: source_dir.into(),
-            disabled: false,
-            pinned: false,
-            removable: false,
-        }
-    }
-
-    fn marketplace_loaded() -> TabDataState<xai_hooks_plugins_types::MarketplaceListResponse> {
-        TabDataState::Loaded(xai_hooks_plugins_types::MarketplaceListResponse {
-            sources: vec![xai_hooks_plugins_types::MarketplaceScanResult {
-                source_name: "test-source".into(),
-                source_kind: "git".into(),
-                source_url_or_path: "https://example.com/plugins.git".into(),
-                plugins: vec![
-                    super::marketplace_modal_action_tests::marketplace_plugin(
-                        "plug-a",
-                        "plugins/plug-a",
-                    ),
-                    super::marketplace_modal_action_tests::marketplace_plugin(
-                        "plug-b",
-                        "plugins/plug-b",
-                    ),
-                ],
-                error: None,
-            }],
-        })
-    }
-
     fn assert_prompt(
         state: &ExtensionsModalState,
         message_sub: &str,
@@ -4223,38 +3333,6 @@ mod extensions_modal_confirmation_tests {
         plugins.entry_group_keys = vec![None];
         plugins.picker_state.selected = 0;
 
-        let mut market_plugin = ExtensionsModalState::new(ExtensionsTab::Marketplace);
-        market_plugin.marketplace_data = marketplace_loaded();
-        market_plugin.entry_labels_cache =
-            vec!["test-source".into(), "plug-a".into(), "plug-b".into()];
-        market_plugin.entry_group_keys = vec![Some("0".into()), None, None];
-        market_plugin.entry_data_indices = vec![None, Some(0), Some(1)];
-        market_plugin.picker_state.selected = 1;
-
-        let mut market_source = ExtensionsModalState::new(ExtensionsTab::Marketplace);
-        market_source.marketplace_data = marketplace_loaded();
-        market_source.entry_labels_cache = vec!["test-source".into(), "plug-a".into()];
-        market_source.entry_group_keys = vec![Some("0".into()), None];
-        market_source.entry_data_indices = vec![None, Some(0)];
-        market_source.picker_state.selected = 0;
-
-        let source = "/tmp/my-hooks-dir";
-        let mut hooks = ExtensionsModalState::new(ExtensionsTab::Hooks);
-        hooks.hooks_data = TabDataState::Loaded(xai_hooks_plugins_types::HooksListResponse {
-            hooks: vec![{
-                // Only removable (user-registered) sources reach the confirm.
-                let mut h = hook_info("hook-a", source);
-                h.removable = true;
-                h
-            }],
-            project_trusted: true,
-            load_errors: Vec::new(),
-        });
-        hooks.entry_data_indices = vec![Some(0)];
-        hooks.entry_group_keys = vec![None];
-        hooks.picker_state.selected = 0;
-        let hook_label = crate::views::extensions_modal::derive_source_label(source).0;
-
         vec![
             PromptCase {
                 modal: mcp,
@@ -4275,38 +3353,6 @@ mod extensions_modal_confirmation_tests {
                         confirmed: false,
                     },
                 ),
-                row: 0,
-            },
-            PromptCase {
-                modal: market_plugin,
-                button: ButtonAction::UninstallSelectedMarketplacePlugin,
-                message_sub: "Uninstall marketplace plugin \"plug-a\"?".into(),
-                expected: ConfirmationAction::Marketplace(
-                    xai_hooks_plugins_types::MarketplaceAction::Uninstall {
-                        source_url_or_path: "https://example.com/plugins.git".into(),
-                        plugin_relative_path: "plugins/plug-a".into(),
-                    },
-                ),
-                row: 1,
-            },
-            PromptCase {
-                modal: market_source,
-                button: ButtonAction::RemoveSelectedMarketplaceSource,
-                message_sub: "Remove source \"test-source\" and uninstall all its plugins?".into(),
-                expected: ConfirmationAction::Marketplace(
-                    xai_hooks_plugins_types::MarketplaceAction::RemoveSource {
-                        source_url_or_path: "https://example.com/plugins.git".into(),
-                    },
-                ),
-                row: 0,
-            },
-            PromptCase {
-                modal: hooks,
-                button: ButtonAction::RemoveSelectedHook,
-                message_sub: format!("Remove hook source \"{hook_label}\"?"),
-                expected: ConfirmationAction::Hooks(xai_hooks_plugins_types::HooksAction::Remove {
-                    path: source.into(),
-                }),
                 row: 0,
             },
         ]
@@ -4422,40 +3468,6 @@ mod extensions_modal_confirmation_tests {
             })
         );
         assert!(state.modal_message.is_none());
-    }
-
-    #[test]
-    fn marketplace_y_keeps_uninstalling_label_on_captured_row() {
-        let mut agent = super::test_fixtures::make_agent();
-        let mut modal = ExtensionsModalState::new(ExtensionsTab::Marketplace);
-        modal.marketplace_data = marketplace_loaded();
-        modal.entry_labels_cache = vec!["test-source".into(), "plug-a".into(), "plug-b".into()];
-        modal.entry_group_keys = vec![Some("0".into()), None, None];
-        modal.entry_data_indices = vec![None, Some(0), Some(1)];
-        modal.picker_state.selected = 1;
-        agent.extensions_modal = Some(modal);
-
-        assert_no_action(
-            agent.execute_modal_button_action(ButtonAction::UninstallSelectedMarketplacePlugin),
-        );
-        agent
-            .extensions_modal
-            .as_mut()
-            .unwrap()
-            .picker_state
-            .selected = 2;
-        match agent.handle_extensions_modal_key(&key(KeyCode::Char('y'))) {
-            InputOutcome::Action(Action::ExecuteMarketplaceAction(
-                xai_hooks_plugins_types::MarketplaceAction::Uninstall {
-                    plugin_relative_path,
-                    ..
-                },
-            )) => assert_eq!(plugin_relative_path, "plugins/plug-a"),
-            other => panic!("expected marketplace uninstall, got {other:?}"),
-        }
-        let state = agent.extensions_modal.as_ref().unwrap();
-        assert_eq!(state.pending_action.as_deref(), Some("Uninstalling..."));
-        assert_eq!(state.pending_entry_index, Some(1));
     }
 
     #[test]

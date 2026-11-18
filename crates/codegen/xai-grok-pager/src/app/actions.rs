@@ -377,12 +377,8 @@ pub enum Action {
     ReloadSkills,
     /// Refresh MCP server list from the modal.
     RefreshMcpList,
-    /// Execute a hooks management action from the modal.
-    ExecuteHooksAction(xai_hooks_plugins_types::HooksAction),
     /// Execute a plugins management action from the modal.
     ExecutePluginsAction(xai_hooks_plugins_types::PluginsAction),
-    /// Execute a marketplace management action from the modal.
-    ExecuteMarketplaceAction(xai_hooks_plugins_types::MarketplaceAction),
     /// Add or update an MCP server via x.ai/mcp/upsert.
     UpsertMcpServer {
         name: String,
@@ -571,9 +567,6 @@ pub enum Action {
     /// Commit the `show_tips` preference. Persisted to `[cli].show_tips`.
     /// Restart-required: tips are resolved once at startup.
     SetShowTips(bool),
-    /// Commit the `auto_update` preference. Persisted to `[cli].auto_update`.
-    /// Restart-required: auto-update check fires once at startup.
-    SetAutoUpdate(bool),
     /// Commit `[ui.display_refresh].auto_cadence_enabled`. Restart-required: cadence is pinned once at startup.
     SetDisplayRefreshAutoCadence(bool),
     /// Preview a theme without persisting; updates the live display only.
@@ -1758,11 +1751,6 @@ pub enum Effect {
         server_name: String,
         values: std::collections::HashMap<String, String>,
     },
-    /// Fetch hooks list from the shell (x.ai/hooks/list).
-    FetchHooksList {
-        agent_id: AgentId,
-        session_id: acp::SessionId,
-    },
     /// Fetch plugins list from the shell (x.ai/plugins/list).
     FetchPluginsList {
         agent_id: AgentId,
@@ -1796,27 +1784,11 @@ pub enum Effect {
         agent_id: AgentId,
         session_id: acp::SessionId,
     },
-    /// Execute a hooks management action via ACP.
-    HooksAction {
-        agent_id: AgentId,
-        session_id: acp::SessionId,
-        action: xai_hooks_plugins_types::HooksAction,
-    },
     /// Execute a plugins management action via ACP.
     PluginsAction {
         agent_id: AgentId,
         session_id: acp::SessionId,
         action: xai_hooks_plugins_types::PluginsAction,
-    },
-    /// Fetch marketplace plugin list from the shell.
-    FetchMarketplaceList {
-        agent_id: AgentId,
-        session_id: acp::SessionId,
-    },
-    /// Fetch the official-marketplace catalog into agent-level CTA state, independent of the Extensions modal.
-    FetchPluginCtaCatalog {
-        agent_id: AgentId,
-        session_id: acp::SessionId,
     },
     /// Fetch skills list from the shell (x.ai/skills/list).
     FetchSkillsList {
@@ -1827,22 +1799,12 @@ pub enum Effect {
         /// The number the Skills tab gave this fetch; only the newest fetch's answer shows.
         fetch: u64,
     },
-    FetchWorkflowsList {
-        agent_id: AgentId,
-        session_id: acp::SessionId,
-    },
     /// Toggle a skill via x.ai/skills/toggle (enable/disable without restart).
     ToggleSkill {
         agent_id: AgentId,
         session_id: acp::SessionId,
         skill_name: String,
         enabled: bool,
-    },
-    /// Execute a marketplace action (install/uninstall/refresh) via ACP.
-    MarketplaceAction {
-        agent_id: AgentId,
-        session_id: acp::SessionId,
-        action: xai_hooks_plugins_types::MarketplaceAction,
     },
     /// Install a plugin from the inline CTA via `x.ai/marketplace/action`, reported back via `TaskResult::CtaPluginInstallDone`.
     InstallPluginFromCta {
@@ -2589,11 +2551,6 @@ pub enum TaskResult {
         server_name: String,
         result: Result<(), String>,
     },
-    /// Hooks list fetched from shell.
-    HooksListLoaded {
-        agent_id: AgentId,
-        result: Result<xai_hooks_plugins_types::HooksListResponse, String>,
-    },
     /// Plugins list fetched from shell.
     PluginsListLoaded {
         agent_id: AgentId,
@@ -2625,25 +2582,10 @@ pub enum TaskResult {
         agent_id: AgentId,
         result: Result<xai_grok_shell::extensions::memory::MemoryDreamResponse, String>,
     },
-    /// Hooks action completed.
-    HooksActionResult {
-        agent_id: AgentId,
-        result: Result<xai_hooks_plugins_types::ActionOutcome, String>,
-    },
     /// Plugins action completed.
     PluginsActionResult {
         agent_id: AgentId,
         result: Result<xai_hooks_plugins_types::ActionOutcome, String>,
-    },
-    /// Marketplace list loaded.
-    MarketplaceListLoaded {
-        agent_id: AgentId,
-        result: Result<xai_hooks_plugins_types::MarketplaceListResponse, String>,
-    },
-    /// Official-marketplace CTA catalog loaded into agent-level state.
-    PluginCtaCatalogLoaded {
-        agent_id: AgentId,
-        result: Result<xai_hooks_plugins_types::MarketplaceListResponse, String>,
     },
     /// Skills list loaded.
     SkillsListLoaded {
@@ -2652,20 +2594,10 @@ pub enum TaskResult {
         fetch: u64,
         result: Result<xai_grok_shell::extensions::skills::SkillsListResponse, String>,
     },
-    WorkflowsListLoaded {
-        agent_id: AgentId,
-        session_id: acp::SessionId,
-        result: Result<Vec<crate::views::extensions_modal::WorkflowInfo>, String>,
-    },
     /// Skill toggle completed (enable/disable).
     SkillsToggleDone {
         agent_id: AgentId,
         result: Result<xai_grok_shell::extensions::skills::SkillsListResponse, String>,
-    },
-    /// Marketplace action completed.
-    MarketplaceActionResult {
-        agent_id: AgentId,
-        result: Result<xai_hooks_plugins_types::ActionOutcome, String>,
     },
     /// Inline-CTA plugin install completed.
     CtaPluginInstallDone {

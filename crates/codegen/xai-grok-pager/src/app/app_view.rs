@@ -560,15 +560,7 @@ pub struct AppView {
     pub plugin_cta_marketplace: Option<String>,
     pub workspace_dashboard_enabled: bool,
     /// Consumer billing surface (credit fetches / warnings). False for team and API-key auth.
-    /// `/usage` itself stays available for session token/cost unless [`Self::has_external_auth_provider`].
     pub usage_visible: bool,
-    /// External `auth_provider_command` deployment.
-    /// No grok.com billing session exists; `/usage` and credit UI stay off.
-    pub has_external_auth_provider: bool,
-    /// `AuthMeta::backend_billed`: the agent's backend handles billing itself.
-    pub backend_billed: bool,
-    /// Periodic billing poll requested (credits >= 99%).
-    pub billing_poll_wanted: bool,
     /// Local on-disk session list (dormant/idle sessions) shown on the dashboard.
     /// We fetch the same `x.ai/session/list` the resume picker uses and render those as idle rows.
     pub dashboard_local_sessions: Vec<crate::app::roster::RosterEntry>,
@@ -935,8 +927,6 @@ pub struct AppView {
     pub coding_data_write_seq: u64,
     /// Persisted `[cli].show_tips` mirror. `None` means no override (default `true`).
     pub show_tips: Option<bool>,
-    /// Persisted `[cli].auto_update` mirror. `None` means no override (default `true`).
-    pub auto_update: Option<bool>,
     /// Persisted `[toolset.ask_user_question].timeout_enabled` mirror, seeded from the effective TOML merge like `show_tips`.
     /// `None` means unset in TOML (default `true`); toggles write the user layer.
     pub ask_user_question_timeout_enabled: Option<bool>,
@@ -1367,7 +1357,6 @@ impl AppView {
             coding_data_pending_write: None,
             coding_data_write_seq: 0,
             show_tips: None,
-            auto_update: None,
             ask_user_question_timeout_enabled: None,
             subagent_model_inheritance: crate::settings::FeatureOverrideState::new(
                 xai_grok_shell::agent::config::Feature::SubagentModelInheritance,
@@ -1403,9 +1392,6 @@ impl AppView {
             plugin_cta_marketplace: None,
             workspace_dashboard_enabled: false,
             usage_visible: true,
-            has_external_auth_provider: false,
-            backend_billed: false,
-            billing_poll_wanted: false,
             dashboard_local_sessions: Vec::new(),
             dashboard_sessions_loading: false,
             workspace_membership: Default::default(),

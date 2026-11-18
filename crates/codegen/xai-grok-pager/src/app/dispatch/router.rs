@@ -73,7 +73,7 @@ use super::settings::setters::{
     clear_default_model, clear_fork_secondary_model, clear_subagent_model_inheritance,
     preview_auto_dark_theme, preview_auto_light_theme, preview_theme,
     set_ask_user_question_timeout_enabled, set_auto_dark_theme, set_auto_light_theme,
-    set_auto_update, set_collapsed_edit_blocks, set_combine_queued_prompts, set_compact_mode,
+    set_collapsed_edit_blocks, set_combine_queued_prompts, set_compact_mode,
     set_confirm_before_rewind, set_contextual_hint_export_copy, set_contextual_hint_image_input,
     set_contextual_hint_plan_mode, set_contextual_hint_send_now, set_contextual_hint_small_screen,
     set_contextual_hint_ssh_wrap, set_contextual_hint_undo, set_contextual_hint_word_select,
@@ -759,21 +759,12 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
                 return vec![];
             };
             modal.skills_data = crate::views::extensions_modal::TabDataState::Loading;
-            modal.workflows_data = crate::views::extensions_modal::TabDataState::Loading;
-            vec![
-                Effect::FetchSkillsList {
-                    agent_id: id,
-                    session_id: session_id.clone(),
-                    // `r` on the Workflows tab reloads the skills too, from the cache
-                    refresh: modal.active_tab
-                        == crate::views::extensions_modal::ExtensionsTab::Skills,
-                    fetch: modal.next_skills_fetch(),
-                },
-                Effect::FetchWorkflowsList {
-                    agent_id: id,
-                    session_id,
-                },
-            ]
+            vec![Effect::FetchSkillsList {
+                agent_id: id,
+                session_id,
+                refresh: modal.active_tab == crate::views::extensions_modal::ExtensionsTab::Skills,
+                fetch: modal.next_skills_fetch(),
+            }]
         }
         Action::RefreshMcpList => {
             let ActiveView::Agent(id) = app.active_view else {
@@ -795,22 +786,6 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
                 cache: false,
             }]
         }
-        Action::ExecuteHooksAction(action) => {
-            let ActiveView::Agent(id) = app.active_view else {
-                return vec![];
-            };
-            let Some(agent) = app.agents.get(&id) else {
-                return vec![];
-            };
-            let Some(session_id) = agent.session.session_id.clone() else {
-                return vec![];
-            };
-            vec![Effect::HooksAction {
-                agent_id: id,
-                session_id,
-                action,
-            }]
-        }
         Action::ExecutePluginsAction(action) => {
             let ActiveView::Agent(id) = app.active_view else {
                 return vec![];
@@ -822,22 +797,6 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
                 return vec![];
             };
             vec![Effect::PluginsAction {
-                agent_id: id,
-                session_id,
-                action,
-            }]
-        }
-        Action::ExecuteMarketplaceAction(action) => {
-            let ActiveView::Agent(id) = app.active_view else {
-                return vec![];
-            };
-            let Some(agent) = app.agents.get(&id) else {
-                return vec![];
-            };
-            let Some(session_id) = agent.session.session_id.clone() else {
-                return vec![];
-            };
-            vec![Effect::MarketplaceAction {
                 agent_id: id,
                 session_id,
                 action,
@@ -1159,7 +1118,6 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::ClearForkSecondaryModel => clear_fork_secondary_model(app),
         Action::SetMaxThoughtsWidth(v) => set_max_thoughts_width(app, v),
         Action::SetShowTips(v) => set_show_tips(app, v),
-        Action::SetAutoUpdate(v) => set_auto_update(app, v),
         Action::SetDisplayRefreshAutoCadence(v) => set_display_refresh_auto_cadence(app, v),
         Action::PreviewTheme(v) => preview_theme(app, v),
         Action::PreviewAutoDarkTheme(v) => preview_auto_dark_theme(app, v),
@@ -1680,21 +1638,11 @@ pub(super) fn dispatch_action_result(
                             session_id,
                             action: xai_hooks_plugins_types::PluginsAction::Reload,
                         });
-                    } else if let Some(modal) = agent.extensions_modal.as_mut() {
-                        effects.push(Effect::FetchHooksList {
-                            agent_id,
-                            session_id: session_id.clone(),
-                        });
+                    } else if agent.extensions_modal.is_some() {
                         effects.push(Effect::FetchPluginsList {
                             agent_id,
                             session_id: session_id.clone(),
                         });
-                        crate::app::dispatch::transcript::push_marketplace_fetch(
-                            modal,
-                            &mut effects,
-                            agent_id,
-                            session_id.clone(),
-                        );
                         effects.push(Effect::FetchMcpsList {
                             agent_id,
                             session_id,

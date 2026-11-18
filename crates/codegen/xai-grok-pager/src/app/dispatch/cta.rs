@@ -18,61 +18,16 @@ pub(super) const CTA_MCP_ABSENT_MAX_ATTEMPTS: u32 = 1;
 
 /// Settle the CTA into its brief "installed" confirmation.
 /// Schedule the auto-dismiss timer.
-/// When a session exists, refresh the not-installed candidate set so the just-installed plugin drops out of CTA matching.
 pub(super) fn cta_settle_installed(
     cta: &mut crate::app::agent_view::PluginCtaState,
     agent_id: AgentId,
     name: String,
-    session_id: Option<acp::SessionId>,
 ) -> Vec<Effect> {
     cta.phase = crate::app::agent_view::CtaPhase::Installed { name: name.clone() };
-    let mut effects = vec![Effect::DismissCtaInstalled {
+    vec![Effect::DismissCtaInstalled {
         agent_id,
         plugin_name: name,
-    }];
-    if let Some(session_id) = session_id {
-        effects.push(Effect::FetchPluginCtaCatalog {
-            agent_id,
-            session_id,
-        });
-    }
-    effects
-}
-
-/// One source wins so the candidates and the install target always come from it.
-/// Unset (the default) is two-tier: a URL-verified official source beats any name-only "xAI Official" match regardless of order.
-/// A name-only match then keeps mirrors registered under the official name working; first registered wins within a tier.
-pub(super) fn plugin_cta_candidates(
-    response: xai_hooks_plugins_types::MarketplaceListResponse,
-    cta_marketplace: Option<&str>,
-) -> (
-    Vec<xai_hooks_plugins_types::MarketplacePluginEntry>,
-    Option<String>,
-) {
-    let mut sources = response.sources;
-    let winner = match cta_marketplace {
-        Some(name) => sources.iter().position(|s| s.source_name == name),
-        None => sources
-            .iter()
-            .position(|s| {
-                xai_grok_plugin_marketplace::is_official_source_url(&s.source_url_or_path)
-            })
-            .or_else(|| {
-                sources.iter().position(|s| {
-                    s.source_name == xai_grok_plugin_marketplace::OFFICIAL_SOURCE_NAME
-                })
-            }),
-    };
-    let Some(idx) = winner else {
-        return (Vec::new(), None);
-    };
-    let source = sources.swap_remove(idx);
-    let candidates = source
-        .plugins
-        .into_iter()
-        .filter(|plugin| plugin.install_status == "not_installed")
-        .collect();
-    (candidates, Some(source.source_url_or_path))
+    }]
 }
 
 /// Resolve the marketplace-relative path for a CTA plugin by name, used to rebuild a retryable `CtaPhase::Error` when a reload or MCP read after the install fails.
@@ -224,11 +179,11 @@ pub(super) fn handle_cta_plugin_install_done(
                 }]
             } else {
                 // Skills-only plugin: no MCP servers to wait on, so skip the fetch/"Setting up…" flash and settle immediately
-                cta_settle_installed(&mut agent.plugin_cta, agent_id, name, Some(session_id))
+                cta_settle_installed(&mut agent.plugin_cta, agent_id, name)
             }
         }
         // Install succeeded but the session vanished; nothing left to chain, so show the brief installed confirmation
-        (Ok(_), None) => cta_settle_installed(&mut agent.plugin_cta, agent_id, name, None),
+        (Ok(_), None) => cta_settle_installed(&mut agent.plugin_cta, agent_id, name),
         (Err(message), _) => {
             agent.plugin_cta.phase = CtaPhase::Error {
                 plugin_relative_path,
@@ -277,7 +232,7 @@ pub(super) fn handle_cta_plugin_reload_done(
                 }]
             }
             // Skills-only plugin (or no session): settle immediately without an MCP fetch
-            session_id => cta_settle_installed(&mut agent.plugin_cta, agent_id, name, session_id),
+            _ => cta_settle_installed(&mut agent.plugin_cta, agent_id, name),
         },
         Err(message) => {
             let plugin_relative_path =
@@ -368,20 +323,9 @@ pub(super) fn handle_plugin_cta_mcps_loaded(
                 } else {
                     agent.pending_extensions_fetch = true;
                 }
-                if let Some(session_id) = session_id {
-                    effects.push(Effect::FetchPluginCtaCatalog {
-                        agent_id,
-                        session_id,
-                    });
-                }
             } else if !agent.plugin_cta.expects_mcp || settled || timed_out || absent_settle {
                 // Skills-only plugin, all-Ready read, no servers at all, or budget exhausted: show the brief installed confirmation
-                effects.extend(cta_settle_installed(
-                    &mut agent.plugin_cta,
-                    agent_id,
-                    name,
-                    session_id,
-                ));
+                effects.extend(cta_settle_installed(&mut agent.plugin_cta, agent_id, name));
             } else if let Some(session_id) = session_id {
                 // MCP init hasn't settled and a verdict is still possible; re-probe after a short delay and stay in AwaitingMcps
                 agent.plugin_cta.mcp_attempt += 1;
@@ -392,12 +336,7 @@ pub(super) fn handle_plugin_cta_mcps_loaded(
                 });
             } else {
                 // No session left to re-probe with; settle.
-                effects.extend(cta_settle_installed(
-                    &mut agent.plugin_cta,
-                    agent_id,
-                    name,
-                    None,
-                ));
+                effects.extend(cta_settle_installed(&mut agent.plugin_cta, agent_id, name));
             }
             effects
         }
@@ -412,64 +351,6 @@ pub(super) fn handle_plugin_cta_mcps_loaded(
             vec![]
         }
     }
-}
-
-pub(super) fn handle_plugin_cta_catalog_loaded(
-    app: &mut AppView,
-    agent_id: AgentId,
-    result: Result<xai_hooks_plugins_types::MarketplaceListResponse, String>,
-) -> Vec<Effect> {
-    use crate::app::agent_view::CtaPhase;
-    match result {
-        Ok(mut response) => {
-            response.sanitize();
-            let enabled = app.plugin_cta_enabled;
-            let cta_marketplace = app.plugin_cta_marketplace.as_deref();
-            if let Some(agent) = app.agents.get_mut(&agent_id) {
-                let (candidates, source_url_or_path) =
-                    plugin_cta_candidates(response, cta_marketplace);
-                agent.plugin_cta.candidates = candidates;
-                agent.plugin_cta.source_url_or_path = source_url_or_path;
-                // Cache the dismissed set once here so recomputing after the debounce never reads config.toml from the UI thread
-                // Only needed when enabled (the matcher short-circuits to Hidden before consulting it otherwise)
-                if enabled {
-                    agent.plugin_cta.dismissed = xai_grok_shell::config::dismissed_plugin_ctas();
-                }
-                // Recompute the matcher-driven phase now that the catalog landed
-                // Typing and pausing before the async catalog arrived (common at startup) should show the CTA without another keystroke
-                // Only touch matcher-driven phases; Installing/AwaitingReload/AwaitingMcps/Installed/Error own their own transitions
-                if matches!(
-                    agent.plugin_cta.phase,
-                    CtaPhase::Hidden | CtaPhase::Matched { .. }
-                ) {
-                    let prompt_text = agent.prompt.text().to_string();
-                    let new_phase = plugin_cta_phase_for(
-                        enabled,
-                        agent.plugin_cta.source_url_or_path.is_some(),
-                        &agent.plugin_cta.candidates,
-                        &prompt_text,
-                        |name| agent.plugin_cta.dismissed.contains(name),
-                    );
-                    if let Some(plugin_name) =
-                        cta_impression_plugin_name(&agent.plugin_cta.phase, &new_phase)
-                    {
-                        log_event(xai_grok_telemetry::events::PluginCtaImpression {
-                            plugin_name: plugin_name.to_string(),
-                        });
-                    }
-                    if matches!(new_phase, CtaPhase::Hidden) {
-                        agent.plugin_cta.hit_connect.clear();
-                        agent.plugin_cta.hit_dismiss.clear();
-                    }
-                    agent.plugin_cta.phase = new_phase;
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(agent = ?agent_id, error = %e, "couldn't load plugin CTA catalog");
-        }
-    }
-    vec![]
 }
 
 pub(super) fn handle_plugin_cta_debounce_expired(

@@ -79,11 +79,6 @@ fn cta_install_done_skills_only_settles_installed_without_fetch() {
             .iter()
             .any(|e| matches!(e, Effect::DismissCtaInstalled { .. }))
     );
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::FetchPluginCtaCatalog { .. }))
-    );
 }
 
 #[test]

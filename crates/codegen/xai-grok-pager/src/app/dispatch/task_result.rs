@@ -2,7 +2,7 @@
 use super::auth::{handle_mcp_auth_trigger_done, handle_mcp_setup_submit_done};
 use super::cta::{
     handle_cta_plugin_install_done, handle_cta_plugin_reload_done,
-    handle_plugin_cta_catalog_loaded, handle_plugin_cta_debounce_expired,
+    handle_plugin_cta_debounce_expired,
     handle_plugin_cta_mcps_loaded,
 };
 use super::ctx::{find_agent_by_session_id, get_active_agent_mut};
@@ -40,7 +40,7 @@ use super::status::{
     usage_modal_state_mut,
 };
 use super::transcript::{
-    handle_hooks_list_loaded, handle_marketplace_list_loaded, handle_marketplace_updates_available,
+    handle_marketplace_updates_available,
     handle_mcp_toggle_done, handle_plugins_list_loaded, handle_skills_toggle_done,
 };
 use super::turn::{clear_pending_kill, handle_bg_task_killed};
@@ -1082,9 +1082,6 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             server_name,
             result,
         } => handle_mcp_setup_submit_done(app, agent_id, server_name, result),
-        TaskResult::HooksListLoaded { agent_id, result } => {
-            handle_hooks_list_loaded(app, agent_id, result)
-        }
         TaskResult::PluginsListLoaded { agent_id, result } => {
             handle_plugins_list_loaded(app, agent_id, result)
         }
@@ -1142,9 +1139,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
-        TaskResult::HooksActionResult { agent_id, result }
-        | TaskResult::PluginsActionResult { agent_id, result }
-        | TaskResult::MarketplaceActionResult { agent_id, result } => {
+        TaskResult::PluginsActionResult { agent_id, result } => {
             dispatch_action_result(app, agent_id, result)
         }
         TaskResult::CtaPluginInstallDone {
@@ -1178,12 +1173,6 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::McpToggleDone { agent_id, result } => {
             handle_mcp_toggle_done(app, agent_id, result)
         }
-        TaskResult::MarketplaceListLoaded { agent_id, result } => {
-            handle_marketplace_list_loaded(app, agent_id, result)
-        }
-        TaskResult::PluginCtaCatalogLoaded { agent_id, result } => {
-            handle_plugin_cta_catalog_loaded(app, agent_id, result)
-        }
         TaskResult::SkillsListLoaded {
             agent_id,
             session_id,
@@ -1197,23 +1186,6 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             {
                 modal.pending_action = None;
                 modal.pending_entry_index = None;
-            }
-            vec![]
-        }
-        TaskResult::WorkflowsListLoaded {
-            agent_id,
-            session_id,
-            result,
-        } => {
-            use crate::views::extensions_modal::TabDataState;
-            if let Some(agent) = app.agents.get_mut(&agent_id)
-                && agent.session.session_id.as_ref() == Some(&session_id)
-                && let Some(ref mut modal) = agent.extensions_modal
-            {
-                modal.workflows_data = match result {
-                    Ok(workflows) => TabDataState::Loaded(workflows),
-                    Err(e) => TabDataState::Error(e),
-                };
             }
             vec![]
         }

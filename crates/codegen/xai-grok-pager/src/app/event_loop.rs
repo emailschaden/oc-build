@@ -1414,7 +1414,6 @@ pub(crate) async fn run(
     );
     let config_session_bools = load_initial_config_session_bools();
     app.show_tips = config_session_bools.show_tips;
-    app.auto_update = config_session_bools.auto_update;
     app.ask_user_question_timeout_enabled = config_session_bools.ask_user_question_timeout_enabled;
     crate::appearance::cache::prime(&app.current_ui);
     crate::appearance::cache::apply_remote_keep_text_selection_default(
@@ -2329,7 +2328,6 @@ pub(crate) fn load_initial_ui_config() -> xai_grok_shell::agent::config::UiConfi
 #[derive(Default)]
 struct InitialConfigSessionBools {
     show_tips: Option<bool>,
-    auto_update: Option<bool>,
     ask_user_question_timeout_enabled: Option<bool>,
 }
 fn load_initial_config_session_bools() -> InitialConfigSessionBools {
@@ -2339,7 +2337,6 @@ fn load_initial_config_session_bools() -> InitialConfigSessionBools {
     let cli_bool = |key: &str| -> Option<bool> { root.get("cli")?.get(key)?.as_bool() };
     InitialConfigSessionBools {
         show_tips: cli_bool("show_tips"),
-        auto_update: cli_bool("auto_update"),
         ask_user_question_timeout_enabled: root
             .get("toolset")
             .and_then(|t| t.get("ask_user_question"))

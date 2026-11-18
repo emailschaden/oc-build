@@ -30,8 +30,6 @@ use std::env;
 use std::io::Write;
 use std::num::NonZeroUsize;
 use xai_grok_pager::app::{Command, PagerArgs};
-// oc-build: opencode backend; no update channel, the label is always empty.
-const CHANNEL_LABEL: &str = "";
 /// Entrypoint tag for `grok -p`; keys the quiet stderr default in `init_tracing_simple`.
 const HEADLESS_ENTRYPOINT: &str = "headless";
 /// Initialize simple tracing for non-TUI agent modes.
@@ -365,17 +363,9 @@ fn install_heap_profile_hooks() {
         prof_available: jemalloc_prof_available,
     });
 }
-fn version_text(channel_label: &str) -> String {
-    format!(
-        "grok {}\n",
-        xai_grok_version::display_version_with_commit(
-            xai_grok_version::full_version(),
-            channel_label,
-        )
-    )
-}
-fn write_version(writer: &mut impl std::io::Write, channel_label: &str) -> std::io::Result<()> {
-    writer.write_all(version_text(channel_label).as_bytes())
+// oc-build: opencode backend; plain version string (no update channel).
+fn write_version(writer: &mut impl std::io::Write) -> std::io::Result<()> {
+    writeln!(writer, "grok {}", xai_grok_version::full_version())
 }
 fn crash_dir_for(_args: &PagerArgs) -> std::path::PathBuf {
     xai_grok_shell::util::grok_home::grok_home().join("crash")
@@ -384,7 +374,7 @@ fn dispatch_version_if_requested(args: &PagerArgs) -> bool {
     if !args.version {
         return false;
     }
-    if let Err(error) = write_version(&mut std::io::stdout().lock(), CHANNEL_LABEL) {
+    if let Err(error) = write_version(&mut std::io::stdout().lock()) {
         eprintln!("Error: {error}");
         std::process::exit(1);
     }
@@ -532,7 +522,7 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
                     });
                     println!("{}", serde_json::to_string(&payload)?);
                 } else {
-                    write_version(&mut std::io::stdout().lock(), CHANNEL_LABEL)?;
+                    write_version(&mut std::io::stdout().lock())?;
                 }
                 return Ok(());
             }
@@ -767,20 +757,12 @@ mod tests {
         );
     }
     #[test]
-    fn version_output_writer_preserves_channel_aware_contract() {
+    fn version_output_is_the_plain_version_with_commit() {
         xai_grok_version::set_full_version(env!("VERSION_WITH_COMMIT"));
-        for (label, expected_suffix) in [
-            (" [alpha]", " [alpha]\n"),
-            (" [stable]", " [stable]\n"),
-            ("", ")\n"),
-        ] {
-            let mut output = Vec::new();
-            write_version(&mut output, label).unwrap();
-            let output = String::from_utf8(output).unwrap();
-            assert!(output.starts_with("grok "));
-            assert!(output.contains(env!("VERSION_WITH_COMMIT")));
-            assert!(output.ends_with(expected_suffix), "{output:?}");
-        }
+        let mut output = Vec::new();
+        write_version(&mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output, format!("grok {}\n", env!("VERSION_WITH_COMMIT")));
     }
     #[test]
     fn version_flags_and_doctor_are_distinct_early_intents() {

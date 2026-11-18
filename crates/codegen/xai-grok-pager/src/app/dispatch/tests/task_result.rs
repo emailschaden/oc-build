@@ -345,31 +345,6 @@ fn doctor_apply_success_only_renders_resolution_instructions() {
     assert!(!output.contains("Findings\n"), "{output}");
 }
 
-#[test]
-fn stale_workflows_result_does_not_repaint_replaced_session_modal() {
-    let mut app = test_app_with_agent();
-    app.agents.get_mut(&AgentId(0)).unwrap().extensions_modal =
-        Some(crate::views::extensions_modal::ExtensionsModalState::new(
-            crate::views::extensions_modal::ExtensionsTab::Skills,
-        ));
-    let _ = dispatch(
-        Action::TaskComplete(TaskResult::WorkflowsListLoaded {
-            agent_id: AgentId(0),
-            session_id: acp::SessionId::new("old-session"),
-            result: Ok(vec![]),
-        }),
-        &mut app,
-    );
-    assert!(matches!(
-        expect_agent(&app, AgentId(0))
-            .extensions_modal
-            .as_ref()
-            .unwrap()
-            .workflows_data,
-        crate::views::extensions_modal::TabDataState::Loading
-    ));
-}
-
 fn foreign_resume_hint(
     tool: xai_grok_foreign_sessions::ForeignSessionTool,
 ) -> xai_grok_foreign_sessions::RecentForeignSession {
@@ -687,62 +662,6 @@ fn clipboard_failure_routes_to_originating_dashboard() {
         Some("Couldn't read clipboard contents")
     );
     assert!(expect_agent(&app, AgentId(0)).toast.is_none());
-}
-
-#[test]
-fn marketplace_list_loaded_sanitizes_components_at_ingestion() {
-    use crate::views::extensions_modal::{ExtensionsModalState, ExtensionsTab, TabDataState};
-
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    app.agents.get_mut(&id).unwrap().extensions_modal =
-        Some(ExtensionsModalState::new(ExtensionsTab::Marketplace));
-
-    let mut entry = cta_entry("dirty", "not_installed");
-    entry.components = Some(xai_hooks_plugins_types::PluginComponents {
-        skills: vec![xai_hooks_plugins_types::ComponentItem {
-            name: "evil\u{1b}[31mskill".into(),
-            description: Some(format!("\u{7}{}", "d".repeat(300))),
-        }],
-        ..Default::default()
-    });
-    let response = xai_hooks_plugins_types::MarketplaceListResponse {
-        sources: vec![xai_hooks_plugins_types::MarketplaceScanResult {
-            source_name: "s".into(),
-            source_kind: "git".into(),
-            source_url_or_path: "https://example.com/repo.git".into(),
-            plugins: vec![entry],
-            error: None,
-        }],
-    };
-
-    dispatch(
-        Action::TaskComplete(TaskResult::MarketplaceListLoaded {
-            agent_id: id,
-            result: Ok(response),
-        }),
-        &mut app,
-    );
-
-    let modal = expect_agent(&app, id).extensions_modal.as_ref().unwrap();
-    let TabDataState::Loaded(ref data) = modal.marketplace_data else {
-        panic!("marketplace data not loaded");
-    };
-    let Some(components) = data
-        .sources
-        .first()
-        .and_then(|s| s.plugins.first())
-        .and_then(|p| p.components.as_ref())
-    else {
-        panic!("expected marketplace plugin components");
-    };
-    let Some(skill) = components.skills.first() else {
-        panic!("expected a skill: {:?}", components.skills);
-    };
-    assert_eq!(skill.name, "evil[31mskill");
-    let desc = skill.description.as_deref().unwrap();
-    assert_eq!(desc.chars().count(), 120);
-    assert!(desc.chars().all(|c| c == 'd'));
 }
 
 #[test]

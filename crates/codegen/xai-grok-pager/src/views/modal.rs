@@ -482,13 +482,6 @@ pub(crate) fn default_palette_entries(slash: &crate::slash::SlashController) -> 
             command: PaletteCommand::SectionHeader("Tools".into()),
         },
         PaletteEntry {
-            label: "Hooks".into(),
-            shortcut: "/hooks".into(),
-            command: PaletteCommand::OpenExtensionsTab(
-                crate::views::extensions_modal::ExtensionsTab::Hooks,
-            ),
-        },
-        PaletteEntry {
             label: "Plugins".into(),
             shortcut: "/plugins".into(),
             command: PaletteCommand::OpenExtensionsTab(
@@ -496,24 +489,10 @@ pub(crate) fn default_palette_entries(slash: &crate::slash::SlashController) -> 
             ),
         },
         PaletteEntry {
-            label: "Marketplace".into(),
-            shortcut: "/marketplace".into(),
-            command: PaletteCommand::OpenExtensionsTab(
-                crate::views::extensions_modal::ExtensionsTab::Marketplace,
-            ),
-        },
-        PaletteEntry {
             label: "Skills".into(),
             shortcut: "/skills".into(),
             command: PaletteCommand::OpenExtensionsTab(
                 crate::views::extensions_modal::ExtensionsTab::Skills,
-            ),
-        },
-        PaletteEntry {
-            label: "Workflows".into(),
-            shortcut: "/workflows".into(),
-            command: PaletteCommand::OpenExtensionsTab(
-                crate::views::extensions_modal::ExtensionsTab::Workflows,
             ),
         },
         PaletteEntry {
@@ -575,12 +554,6 @@ pub(crate) fn default_palette_entries(slash: &crate::slash::SlashController) -> 
                 .registry()
                 .mode_support(invocation.token)
                 .supports(screen_mode)
-        {
-            return false;
-        }
-        // oc-build: opencode backend; drop tabs opencode has no equivalent for.
-        if let PaletteCommand::OpenExtensionsTab(tab) = &entry.command
-            && !crate::views::extensions_modal::ExtensionsTab::shown().contains(tab)
         {
             return false;
         }
@@ -1404,7 +1377,7 @@ mod palette_sharing_tests {
                 "Tools entry {label:?} dispatches to the wrong tab",
             );
         }
-        let positions: Vec<usize> = ExtensionsTab::shown()
+        let positions: Vec<usize> = ExtensionsTab::ALL
             .iter()
             .map(|tab| {
                 entries
