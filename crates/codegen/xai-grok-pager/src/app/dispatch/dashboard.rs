@@ -90,25 +90,6 @@ pub(super) fn ensure_dashboard_state(app: &mut AppView) {
     state.set_screen_mode(app.screen_mode);
     state.set_recap_visible(app.session_recap_available);
     state.set_voice_visible(app.voice_mode_enabled);
-    state.set_restricted_commands(&app.tier_restricted_commands);
-    let billing = app.usage_visible;
-    let usage_cmd = !app.has_external_auth_provider;
-    state
-        .dispatch
-        .slash_controller
-        .set_billing_surface_visible(billing);
-    state
-        .dispatch
-        .slash_controller
-        .set_usage_command_visible(usage_cmd);
-    state
-        .peek_reply
-        .slash_controller
-        .set_billing_surface_visible(billing);
-    state
-        .peek_reply
-        .slash_controller
-        .set_usage_command_visible(usage_cmd);
     app.dashboard = Some(state);
 }
 /// Configure the dashboard for display: snapshot app-wide state (cwd, models, plugins, permission mode) and clear the staged dispatch settings.
@@ -193,7 +174,6 @@ pub(super) fn dispatch_open_dashboard(app: &mut AppView) -> Vec<Effect> {
         d.gc_stale_refs(&dashboard_alive_fn(&app.agents, workspace.as_ref()));
         d.set_recap_visible(app.session_recap_available);
         d.set_voice_visible(app.voice_mode_enabled);
-        d.set_restricted_commands(&app.tier_restricted_commands);
     }
     let agent_cwds: Vec<(AgentId, std::path::PathBuf)> = app
         .agents
@@ -219,9 +199,6 @@ pub(super) fn dispatch_open_dashboard(app: &mut AppView) -> Vec<Effect> {
         return crate::app::workspace_sync::drain(app);
     }
     app.dashboard_sessions_loading = true;
-    if app.leader_mode {
-        return vec![Effect::FetchRoster];
-    }
     vec![Effect::FetchDashboardSessions]
 }
 fn dashboard_alive_fn<'a>(
@@ -434,9 +411,8 @@ pub(super) fn dispatch_dashboard_attach(
         }
         DashboardRowId::Roster { session_id } => {
             let (session_cwd, conversation_entry) = app
-                .leader_roster
+                .dashboard_local_sessions
                 .iter()
-                .chain(app.dashboard_local_sessions.iter())
                 .find(|e| e.session_id == session_id)
                 .map(|e| {
                     let is_conversation = e.origin.kind == "conversation";
@@ -1169,17 +1145,6 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
                 source,
             });
         }
-        if reg.is_restricted(invocation.token) {
-            let token = invocation.token.to_string();
-            if let Some(d) = app.dashboard.as_mut() {
-                d.dispatch.set_text("");
-                d.set_error_toast(&format!(
-                    "/{token} requires SuperGrok: upgrade at {}",
-                    super::billing::UPSELL_URL_UPGRADE
-                ));
-            }
-            return vec![];
-        }
         let Some(command) = reg.get(invocation.token).cloned() else {
             return dispatch_dashboard_dispatch(app, text, false);
         };
@@ -1209,8 +1174,6 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
             session_id: None,
             bundle_state: &app.bundle_state,
             screen_mode: app.screen_mode,
-            billing_surface_visible: app.usage_visible,
-            usage_command_visible: !app.has_external_auth_provider,
             pager_state: crate::settings::PagerLocalSnapshot {
                 multiline_mode: dashboard_multiline,
                 yolo_mode: app.default_yolo,
@@ -1706,11 +1669,7 @@ pub(super) fn dashboard_focusables(app: &AppView) -> Vec<crate::views::dashboard
         return Vec::new();
     };
     let home = crate::views::dashboard::render::cached_home();
-    let roster: &[crate::app::roster::RosterEntry] = if app.leader_mode {
-        &app.leader_roster
-    } else {
-        &app.dashboard_local_sessions
-    };
+    let roster: &[crate::app::roster::RosterEntry] = &app.dashboard_local_sessions;
     let (rows, grouping) = if app.workspace_dashboard_enabled {
         workspace_rows(app, &d.filter)
     } else {
@@ -1812,9 +1771,8 @@ pub(super) fn dispatch_dashboard_stop(app: &mut AppView) -> Vec<Effect> {
         }
         DashboardRowId::Roster { session_id } => {
             let entry = app
-                .leader_roster
+                .dashboard_local_sessions
                 .iter()
-                .chain(app.dashboard_local_sessions.iter())
                 .find(|e| e.session_id == session_id.as_str());
             match entry {
                 None => {
@@ -2043,9 +2001,8 @@ fn delete_dashboard_row(
         }
         DashboardRowId::Roster { session_id } => {
             let Some(entry) = app
-                .leader_roster
+                .dashboard_local_sessions
                 .iter()
-                .chain(app.dashboard_local_sessions.iter())
                 .find(|e| e.session_id == session_id)
                 .cloned()
             else {

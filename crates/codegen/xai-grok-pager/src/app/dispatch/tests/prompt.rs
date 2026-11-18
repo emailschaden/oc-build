@@ -1045,40 +1045,6 @@ fn chip_submit_while_enqueued_clears_follow_up_chips() {
 }
 
 #[test]
-fn send_prompt_while_running_queues_without_drain() {
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    app.agents.get_mut(&id).unwrap().session.state = AgentState::TurnRunning;
-
-    let effects = dispatch(Action::SendPrompt("queued".into()), &mut app);
-
-    // A plain prompt typed while a turn is running is sent IMMEDIATELY (server-authoritative) rather than held in the local drip-feed queue
-    // It does NOT start a concurrent turn
-    assert_eq!(effects.len(), 1);
-    let pid = match effects.first() {
-        Some(Effect::SendPrompt {
-            text, prompt_id, ..
-        }) => {
-            assert_eq!(text, "queued");
-            prompt_id.clone()
-        }
-        other => panic!("expected immediate SendPrompt, got {other:?}"),
-    };
-    // Not in the local queue; turn state unchanged (no new turn started).
-    assert_eq!(agent_ref(&app, id).session.queue_len(), 0);
-    assert!(agent_ref(&app, id).session.state.is_turn_running());
-    // Optimistic echo present in the shared queue, keyed by prompt_id.
-    let q = app
-        .shared_prompt_queue("test-session")
-        .expect("optimistic echo present");
-    let [front] = q.as_slice() else {
-        panic!("expected one optimistic echo, got {q:?}");
-    };
-    assert_eq!(front.id, pid);
-    assert_eq!(front.text, "queued");
-}
-
-#[test]
 fn send_prompt_while_running_queues_on_server_when_follow_up_steer() {
     struct ResetFollowUp(crate::appearance::FollowUpBehavior);
     impl Drop for ResetFollowUp {
@@ -1090,7 +1056,6 @@ fn send_prompt_while_running_queues_on_server_when_follow_up_steer() {
     crate::appearance::cache::set_follow_up_behavior(crate::appearance::FollowUpBehavior::Steer);
 
     let mut app = test_app_with_agent();
-    app.leader_mode = false;
     let id = AgentId(0);
     app.agents.get_mut(&id).unwrap().session.state = AgentState::TurnRunning;
 
@@ -1117,7 +1082,6 @@ fn send_prompt_while_running_with_follow_up_queue_stays_local_when_not_leader() 
     crate::appearance::cache::set_follow_up_behavior(crate::appearance::FollowUpBehavior::Queue);
 
     let mut app = test_app_with_agent();
-    app.leader_mode = false;
     let id = AgentId(0);
     app.agents.get_mut(&id).unwrap().session.state = AgentState::TurnRunning;
 
@@ -1146,7 +1110,6 @@ fn send_while_running_with_pending_local_and_steer_preserves_fifo() {
     crate::appearance::cache::set_follow_up_behavior(crate::appearance::FollowUpBehavior::Steer);
 
     let mut app = test_app_with_agent();
-    app.leader_mode = false;
     let id = AgentId(0);
     {
         let agent = app.agents.get_mut(&id).unwrap();
@@ -1184,7 +1147,6 @@ fn send_prompt_with_images_while_running_and_steer_stays_local() {
     crate::appearance::cache::set_follow_up_behavior(crate::appearance::FollowUpBehavior::Steer);
 
     let mut app = test_app_with_agent();
-    app.leader_mode = false;
     let id = AgentId(0);
     {
         let agent = app.agents.get_mut(&id).unwrap();
@@ -1261,72 +1223,6 @@ fn send_while_running_with_pending_local_prompt_preserves_fifo() {
     );
 }
 
-#[test]
-fn turn_end_drains_next_queued_prompt() {
-    // A plain prompt typed while running is sent server-authoritatively and drained by the leader, not by the local queue
-    // The leader's `running_prompt_id` broadcast is modeled here by a stashed adoption that arrived before the previous turn's PromptResponse
-    // The PromptResponse handler adopts it after `finish_turn`, rendering its user block
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-
-    // Submit first prompt (drains immediately and starts the turn)
-    let effects = dispatch(Action::SendPrompt("first".into()), &mut app);
-    assert_eq!(effects.len(), 1);
-    assert!(agent_ref(&app, id).session.state.is_turn_running());
-
-    // Submit second prompt while running: immediate server-authoritative send (no local queue entry)
-    let effects = dispatch(Action::SendPrompt("second".into()), &mut app);
-    let pid_second = match effects.first() {
-        Some(Effect::SendPrompt {
-            text, prompt_id, ..
-        }) => {
-            assert_eq!(text, "second");
-            prompt_id.clone()
-        }
-        other => panic!("expected immediate SendPrompt, got {other:?}"),
-    };
-    assert_eq!(agent_ref(&app, id).session.queue_len(), 0);
-
-    // Model the leader's running=second broadcast arriving before first's PromptResponse: stash the adoption (FIFO handoff race)
-    app.pending_running_adoptions.insert(
-        id,
-        crate::app::acp_handler::PendingRunningAdoption {
-            prompt_id: pid_second.clone(),
-            text: Some("second".to_string()),
-            combined_texts: None,
-            kind: "prompt".to_string(),
-            turn_ended: false,
-        },
-    );
-
-    // The turn ends: PromptResponse runs `finish_turn`, clearing current_prompt_id, then the stashed adoption is applied (turn-start shim)
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::PromptResponse {
-            agent_id: id,
-            result: Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)),
-            http_status: None,
-            prompt_id: None,
-        }),
-        &mut app,
-    );
-
-    // No re-send (the prompt was already sent at enqueue time): only the billing refresh effect
-    assert_eq!(effects.len(), 1);
-    assert!(matches!(
-        effects.first(),
-        Some(Effect::FetchBilling { silent: true, .. })
-    ));
-    assert!(agent_ref(&app, id).session.state.is_turn_running());
-    // current_prompt_id was handed off to the second prompt for correlation.
-    assert_eq!(
-        agent_ref(&app, id).session.current_prompt_id.as_deref(),
-        Some(pid_second.as_str())
-    );
-    assert!(app.pending_running_adoptions.is_empty());
-    // Scrollback: user "first", then "Worked for", then user "second"
-    assert_eq!(agent_ref(&app, id).scrollback.len(), 3);
-}
-
 /// PromptResponse FIFO handoff must forward `combined_texts` (one bubble each).
 #[test]
 fn prompt_response_fifo_handoff_paints_multi_bubble_combined() {
@@ -1392,12 +1288,7 @@ fn turn_end_with_empty_queue_stays_idle() {
         &mut app,
     );
 
-    // Silent billing refresh after turn completion.
-    assert_eq!(effects.len(), 1);
-    assert!(matches!(
-        effects.first(),
-        Some(Effect::FetchBilling { silent: true, .. })
-    ));
+    assert!(effects.is_empty());
     assert!(agent_ref(&app, id).session.state.is_idle());
     // Session event "Worked for" added.
     assert_eq!(agent_ref(&app, id).scrollback.len(), 1);
@@ -1426,31 +1317,19 @@ fn multiple_queued_prompts_drain_one_per_turn() {
         })
     };
 
-    // Turn end: drain "b" and FetchBilling
+    // Turn end: drain "b"
     let effects = dispatch(end_turn(), &mut app);
     assert!(matches!(effects.first(), Some(Effect::SendPrompt { text, .. }) if text == "b"));
-    assert!(matches!(
-        effects.get(1),
-        Some(Effect::FetchBilling { silent: true, .. })
-    ));
     assert_eq!(agent_ref(&app, id).session.queue_len(), 1);
 
-    // Turn end: drain "c" and FetchBilling
+    // Turn end: drain "c"
     let effects = dispatch(end_turn(), &mut app);
     assert!(matches!(effects.first(), Some(Effect::SendPrompt { text, .. }) if text == "c"));
-    assert!(matches!(
-        effects.get(1),
-        Some(Effect::FetchBilling { silent: true, .. })
-    ));
     assert_eq!(agent_ref(&app, id).session.queue_len(), 0);
 
-    // Turn end: FetchBilling only
+    // Turn end: nothing left to drain
     let effects = dispatch(end_turn(), &mut app);
-    assert_eq!(effects.len(), 1);
-    assert!(matches!(
-        effects.first(),
-        Some(Effect::FetchBilling { silent: true, .. })
-    ));
+    assert!(effects.is_empty());
     assert!(agent_ref(&app, id).session.state.is_idle());
 }
 
@@ -1472,12 +1351,7 @@ fn prompt_response_resets_turn_state() {
         }),
         &mut app,
     );
-    // Silent billing refresh after turn completion.
-    assert_eq!(effects.len(), 1);
-    assert!(matches!(
-        effects.first(),
-        Some(Effect::FetchBilling { silent: true, .. })
-    ));
+    assert!(effects.is_empty());
     assert!(agent_ref(&app, id).session.state.is_idle());
     assert!(agent_ref(&app, id).turn_started_at.is_none());
     // mark_turn_finished must stamp the activity anchor used by the dashboard relative-time label
@@ -1510,326 +1384,6 @@ fn prompt_response_releases_retained_memory_once() {
         &mut app,
     );
     assert_eq!(test_support::calls(), before + 1);
-}
-
-/// Turn end with prompt suggestions enabled fires the `x.ai/suggestPrompt` fetch (before the billing refresh).
-/// The loaded suggestion routes back into the agent's controller by id and generation.
-#[test]
-fn turn_end_fetches_prompt_suggestion_when_enabled() {
-    crate::appearance::cache::set_prompt_suggestions(true);
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    app.agents.get_mut(&id).unwrap().session.state = AgentState::TurnRunning;
-    app.agents.get_mut(&id).unwrap().turn_started_at = Some(std::time::Instant::now());
-
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::PromptResponse {
-            agent_id: id,
-            result: Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)),
-            http_status: None,
-            prompt_id: None,
-        }),
-        &mut app,
-    );
-
-    assert_eq!(effects.len(), 2, "suggestion fetch + billing: {effects:?}");
-    let Some(Effect::FetchPromptSuggestion {
-        agent_id,
-        generation,
-        model,
-        session_id,
-    }) = effects.first()
-    else {
-        panic!("expected FetchPromptSuggestion first, got {effects:?}");
-    };
-    assert_eq!(*agent_id, id);
-    assert!(session_id.is_some());
-    // No `grok-4.6` in the test catalog and no env override, so `None` on the wire; the shell then uses its own `grok-4.6` default
-    // Suggestion calls never use the session model
-    assert_eq!(*model, None);
-
-    // The loaded suggestion lands in the right agent's controller.
-    let generation = *generation;
-    dispatch(
-        Action::TaskComplete(TaskResult::PromptSuggestionLoaded {
-            agent_id: id,
-            suggestion: Some("run the tests".into()),
-            generation,
-        }),
-        &mut app,
-    );
-    assert_eq!(
-        agent_ref(&app, id).prompt.prompt_suggestion.ghost_for(""),
-        Some("run the tests")
-    );
-}
-
-/// A cancelled turn never suggests (the user interrupted; silence), and any previous suggestion is wiped at the turn boundary.
-#[test]
-fn cancelled_turn_does_not_fetch_prompt_suggestion() {
-    crate::appearance::cache::set_prompt_suggestions(true);
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    {
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.session.state = AgentState::TurnRunning;
-        agent.turn_started_at = Some(std::time::Instant::now());
-        agent
-            .prompt
-            .prompt_suggestion
-            .set_suggestion_for_test("stale suggestion");
-    }
-
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::PromptResponse {
-            agent_id: id,
-            result: Ok(acp::PromptResponse::new(acp::StopReason::Cancelled)),
-            http_status: None,
-            prompt_id: None,
-        }),
-        &mut app,
-    );
-
-    assert!(
-        !effects
-            .iter()
-            .any(|e| matches!(e, Effect::FetchPromptSuggestion { .. })),
-        "cancelled turn must not fetch a suggestion: {effects:?}"
-    );
-    assert!(
-        !agent_ref(&app, id)
-            .prompt
-            .prompt_suggestion
-            .has_suggestion(),
-        "turn boundary wipes any stale suggestion"
-    );
-}
-
-/// A draft in the prompt means the user is already mid-thought: no fetch.
-#[test]
-fn turn_end_with_draft_does_not_fetch_prompt_suggestion() {
-    crate::appearance::cache::set_prompt_suggestions(true);
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    {
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.session.state = AgentState::TurnRunning;
-        agent.turn_started_at = Some(std::time::Instant::now());
-        agent.prompt.textarea.insert_str("half-typed follow-up");
-    }
-
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::PromptResponse {
-            agent_id: id,
-            result: Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)),
-            http_status: None,
-            prompt_id: None,
-        }),
-        &mut app,
-    );
-
-    assert!(
-        !effects
-            .iter()
-            .any(|e| matches!(e, Effect::FetchPromptSuggestion { .. })),
-        "a draft suppresses the suggestion fetch: {effects:?}"
-    );
-}
-
-/// The reconnect-pending early return skips the fetch gate, but the turn boundary must still wipe a stale ghost.
-/// The wipe runs before the early returns.
-#[test]
-fn reconnect_pending_turn_end_still_wipes_prompt_suggestion() {
-    crate::appearance::cache::set_prompt_suggestions(true);
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    app.reconnect_pending = true;
-    {
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.session.state = AgentState::TurnRunning;
-        agent.turn_started_at = Some(std::time::Instant::now());
-        agent
-            .prompt
-            .prompt_suggestion
-            .set_suggestion_for_test("stale suggestion");
-    }
-
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::PromptResponse {
-            agent_id: id,
-            result: Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)),
-            http_status: None,
-            prompt_id: None,
-        }),
-        &mut app,
-    );
-
-    assert!(
-        !effects
-            .iter()
-            .any(|e| matches!(e, Effect::FetchPromptSuggestion { .. })),
-        "reconnect-pending turn end must not fetch a suggestion: {effects:?}"
-    );
-    assert!(
-        !agent_ref(&app, id)
-            .prompt
-            .prompt_suggestion
-            .has_suggestion(),
-        "turn boundary wipes the stale suggestion even on the reconnect path"
-    );
-}
-
-/// A non-empty server-authoritative shared queue means more queued turns are coming: no suggestion fetch.
-/// Mirrors the local `pending_prompts` guard.
-#[test]
-fn turn_end_with_shared_queue_does_not_fetch_prompt_suggestion() {
-    crate::appearance::cache::set_prompt_suggestions(true);
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    {
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.session.state = AgentState::TurnRunning;
-        agent.turn_started_at = Some(std::time::Instant::now());
-        agent
-            .shared_queue
-            .push(crate::app::prompt_queue::QueueEntryWire {
-                id: "q1".into(),
-                version: 1,
-                owner: None,
-                last_editor: None,
-                kind: "prompt".into(),
-                text: "queued server-side".into(),
-                position: 0,
-                combined_texts: None,
-            });
-    }
-
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::PromptResponse {
-            agent_id: id,
-            result: Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)),
-            http_status: None,
-            prompt_id: None,
-        }),
-        &mut app,
-    );
-
-    assert!(
-        !effects
-            .iter()
-            .any(|e| matches!(e, Effect::FetchPromptSuggestion { .. })),
-        "a non-empty server shared queue suppresses the suggestion fetch: {effects:?}"
-    );
-}
-
-/// A stale generation (a newer turn ended meanwhile) is discarded on load.
-#[test]
-fn stale_prompt_suggestion_generation_is_discarded() {
-    crate::appearance::cache::set_prompt_suggestions(true);
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    let stale = app
-        .agents
-        .get_mut(&id)
-        .unwrap()
-        .prompt
-        .prompt_suggestion
-        .begin_fetch();
-    // A newer fetch supersedes the stale one.
-    let _newer = app
-        .agents
-        .get_mut(&id)
-        .unwrap()
-        .prompt
-        .prompt_suggestion
-        .begin_fetch();
-
-    dispatch(
-        Action::TaskComplete(TaskResult::PromptSuggestionLoaded {
-            agent_id: id,
-            suggestion: Some("stale".into()),
-            generation: stale,
-        }),
-        &mut app,
-    );
-    assert!(
-        !agent_ref(&app, id)
-            .prompt
-            .prompt_suggestion
-            .has_suggestion()
-    );
-}
-
-/// A suggestion that loads onto an idle, empty prompt is immediately visible: its `shown` impression is latched right at load.
-#[test]
-fn prompt_suggestion_loaded_visible_latches_shown() {
-    crate::appearance::cache::set_prompt_suggestions(true);
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    let generation = app
-        .agents
-        .get_mut(&id)
-        .unwrap()
-        .prompt
-        .prompt_suggestion
-        .begin_fetch();
-
-    dispatch(
-        Action::TaskComplete(TaskResult::PromptSuggestionLoaded {
-            agent_id: id,
-            suggestion: Some("run the tests".into()),
-            generation,
-        }),
-        &mut app,
-    );
-
-    let agent = agent_ref(&app, id);
-    assert!(agent.prompt.prompt_suggestion_visible());
-    assert!(
-        agent.prompt.prompt_suggestion.shown_logged(),
-        "visible-at-load suggestion latches its impression immediately"
-    );
-}
-
-/// A suggestion that arrives while the user has a divergent draft typed is NOT visible at load: no impression is latched.
-/// The latch stays armed so the `shown` fires at first actual visibility (via the prompt key path).
-/// That keeps the funnel's `shown >= accepted + dismissed` invariant.
-#[test]
-fn prompt_suggestion_loaded_behind_divergent_draft_defers_shown() {
-    crate::appearance::cache::set_prompt_suggestions(true);
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    let generation = {
-        let agent = app.agents.get_mut(&id).unwrap();
-        // The user started a divergent draft while the fetch was in flight.
-        agent.prompt.textarea.insert_str("x");
-        agent.prompt.prompt_suggestion.begin_fetch()
-    };
-
-    dispatch(
-        Action::TaskComplete(TaskResult::PromptSuggestionLoaded {
-            agent_id: id,
-            suggestion: Some("run the tests".into()),
-            generation,
-        }),
-        &mut app,
-    );
-
-    let agent = app.agents.get_mut(&id).unwrap();
-    assert!(
-        agent.prompt.prompt_suggestion.has_suggestion(),
-        "suggestion installs even when hidden by the draft"
-    );
-    assert!(!agent.prompt.prompt_suggestion_visible());
-    assert!(
-        !agent.prompt.prompt_suggestion.shown_logged(),
-        "hidden-at-load suggestion must not count an impression"
-    );
-
-    // Clearing the draft makes the ghost visible; the next pass through the shared helper (key path / load path) latches the impression once
-    agent.prompt.set_text("");
-    agent.log_prompt_suggestion_shown_if_visible();
-    assert!(agent.prompt.prompt_suggestion.shown_logged());
 }
 
 /// A context overflow (the `ContextTooLarge` block from the RetryState handler) suppresses both the redundant `TurnFailed` and the error toast.
@@ -1941,123 +1495,6 @@ fn prompt_response_request_failed_banner_suppresses_turn_failed_and_toast() {
     );
 }
 
-/// The 401/402 race fallbacks must fire on the banner-formatted error text PromptResponse carries.
-/// The RetryState notification may lose the race, so no ReAuthRequired block exists yet.
-#[test]
-fn prompt_response_formatted_401_suppresses_turn_failed_and_stashes_prompt() {
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    {
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.session.state = AgentState::TurnRunning;
-        agent.turn_started_at = Some(std::time::Instant::now());
-        agent.session.in_flight_prompt = Some(crate::app::agent::InFlightPrompt {
-            text: "resend me".into(),
-            images: Vec::new(),
-            scrollback_entry: crate::scrollback::entry::EntryId::new(1),
-            combined_scrollback_entries: Vec::new(),
-            chip_elements: Vec::new(),
-        });
-    }
-    dispatch(
-        Action::TaskComplete(TaskResult::PromptResponse {
-            agent_id: id,
-            result: Err("Request failed (401): Invalid or expired credentials".to_string()),
-            http_status: Some(401),
-            prompt_id: None,
-        }),
-        &mut app,
-    );
-    let agent = agent_ref(&app, id);
-    let has_turn_failed = (0..agent.scrollback.len()).any(|idx| {
-        matches!(
-            agent.scrollback.entry(idx).map(|e| &e.block),
-            Some(RenderBlock::SessionEvent(ev))
-                if matches!(ev.event, SessionEvent::TurnFailed { .. })
-        )
-    });
-    assert!(
-        !has_turn_failed,
-        "401 must suppress the redundant TurnFailed"
-    );
-    assert_eq!(
-        agent
-            .reauth_stashed_prompt
-            .as_ref()
-            .map(|p| p.text.as_str()),
-        Some("resend me"),
-        "401 must stash the prompt for auto-resubmit after /login"
-    );
-}
-
-#[test]
-fn prompt_response_formatted_402_takes_credit_limit_path() {
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    {
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.session.state = AgentState::TurnRunning;
-        agent.turn_started_at = Some(std::time::Instant::now());
-    }
-    // http_status field absent (older shell): the status must be recovered from the formatted text
-    dispatch(
-        Action::TaskComplete(TaskResult::PromptResponse {
-            agent_id: id,
-            result: Err("Request failed (402): Grok Build usage balance exhausted".to_string()),
-            http_status: None,
-            prompt_id: None,
-        }),
-        &mut app,
-    );
-    let agent = agent_ref(&app, id);
-    let has_turn_failed = (0..agent.scrollback.len()).any(|idx| {
-        matches!(
-            agent.scrollback.entry(idx).map(|e| &e.block),
-            Some(RenderBlock::SessionEvent(ev))
-                if matches!(ev.event, SessionEvent::TurnFailed { .. })
-        )
-    });
-    assert!(
-        !has_turn_failed,
-        "a credit-limit 402 shows the upsell, not TurnFailed"
-    );
-}
-
-#[test]
-fn credit_limit_402_does_not_overwrite_stash_when_in_flight_cleared() {
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    {
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.session.state = AgentState::TurnRunning;
-        agent.turn_started_at = Some(std::time::Instant::now());
-        agent.session.in_flight_prompt = None;
-        agent.credit_limit_stashed_prompt = Some(crate::app::agent::InFlightPrompt {
-            text: "kept".into(),
-            images: Vec::new(),
-            scrollback_entry: crate::scrollback::EntryId::new(0),
-            combined_scrollback_entries: Vec::new(),
-            chip_elements: Vec::new(),
-        });
-    }
-    dispatch(
-        Action::TaskComplete(TaskResult::PromptResponse {
-            agent_id: id,
-            result: Err("Request failed (402): Grok Build usage balance exhausted".to_string()),
-            http_status: Some(402),
-            prompt_id: None,
-        }),
-        &mut app,
-    );
-    assert_eq!(
-        agent_ref(&app, id)
-            .credit_limit_stashed_prompt
-            .as_ref()
-            .map(|p| p.text.as_str()),
-        Some("kept")
-    );
-}
-
 #[test]
 fn prompt_response_disk_full_suppresses_turn_failed_and_toast() {
     fn run(pre_seed_disk_full: bool, with_user_echo: bool) -> (bool, bool, usize) {
@@ -2155,76 +1592,6 @@ fn prompt_response_routes_idle_title_through_frame_pipeline() {
         app.deferred_notification.as_ref().unwrap().1,
         3,
         "deferred notification must wait >75 ms (Ghostty title debounce)",
-    );
-}
-
-#[test]
-fn turn_complete_notification_suppressed_when_queue_non_empty() {
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-
-    // Start first turn.
-    let effects = dispatch(Action::SendPrompt("first".into()), &mut app);
-    assert_eq!(effects.len(), 1);
-    assert!(agent_ref(&app, id).session.state.is_turn_running());
-
-    // Send a second prompt while the first is running: immediate server-authoritative send
-    let effects = dispatch(Action::SendPrompt("second".into()), &mut app);
-    let pid_second = match effects.first() {
-        Some(Effect::SendPrompt { prompt_id, .. }) => prompt_id.clone(),
-        other => panic!("expected immediate SendPrompt, got {other:?}"),
-    };
-    // Model the leader's running=second broadcast arriving before first's PromptResponse (a stashed adoption: the next turn is about to start)
-    app.pending_running_adoptions.insert(
-        id,
-        crate::app::acp_handler::PendingRunningAdoption {
-            prompt_id: pid_second,
-            text: Some("second".to_string()),
-            combined_texts: None,
-            kind: "prompt".to_string(),
-            turn_ended: false,
-        },
-    );
-
-    // First turn completes; a server prompt is about to start (pending adoption), so the TurnComplete notification must be suppressed
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::PromptResponse {
-            agent_id: id,
-            result: Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)),
-            http_status: None,
-            prompt_id: None,
-        }),
-        &mut app,
-    );
-    // No re-send; only billing refresh. The second prompt is adopted.
-    assert_eq!(effects.len(), 1);
-    assert!(matches!(
-        effects.first(),
-        Some(Effect::FetchBilling { silent: true, .. })
-    ));
-    assert!(agent_ref(&app, id).session.state.is_turn_running());
-    assert!(
-        app.deferred_notification.is_none(),
-        "notification must be suppressed while another turn is about to start",
-    );
-    assert!(
-        app.pending_notification_escapes.is_none(),
-        "idle title escapes must also be suppressed while prompt queue is non-empty",
-    );
-
-    // Second turn completes: queue is now empty, notification must fire
-    dispatch(
-        Action::TaskComplete(TaskResult::PromptResponse {
-            agent_id: id,
-            result: Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)),
-            http_status: None,
-            prompt_id: None,
-        }),
-        &mut app,
-    );
-    assert!(
-        app.deferred_notification.is_some(),
-        "notification must fire when prompt queue is empty",
     );
 }
 
@@ -2499,12 +1866,7 @@ fn prompt_response_resets_cancelling_to_idle() {
         }),
         &mut app,
     );
-    // Silent billing refresh after turn completion.
-    assert_eq!(effects.len(), 1);
-    assert!(matches!(
-        effects.first(),
-        Some(Effect::FetchBilling { silent: true, .. })
-    ));
+    assert!(effects.is_empty());
     assert!(agent_ref(&app, id).session.state.is_idle());
     // Cancellation produces a "Turn cancelled" session event.
     assert_eq!(agent_ref(&app, id).scrollback.len(), 1);
@@ -2541,12 +1903,8 @@ fn cancel_with_queued_prompt_drains_on_completion() {
         &mut app,
     );
 
-    assert_eq!(effects.len(), 2);
+    assert_eq!(effects.len(), 1);
     assert!(matches!(effects.first(), Some(Effect::SendPrompt { text, .. }) if text == "queued"));
-    assert!(matches!(
-        effects.get(1),
-        Some(Effect::FetchBilling { silent: true, .. })
-    ));
     assert!(agent_ref(&app, id).session.state.is_turn_running());
     assert_eq!(agent_ref(&app, id).session.queue_len(), 0);
 }
@@ -2568,12 +1926,7 @@ fn cancel_with_empty_queue_stays_idle() {
         }),
         &mut app,
     );
-    // Silent billing refresh after turn completion.
-    assert_eq!(effects.len(), 1);
-    assert!(matches!(
-        effects.first(),
-        Some(Effect::FetchBilling { silent: true, .. })
-    ));
+    assert!(effects.is_empty());
     assert!(agent_ref(&app, id).session.state.is_idle());
 }
 
@@ -2622,12 +1975,8 @@ fn cancel_with_multiple_queued_prompts_drains_only_front_prompt() {
         &mut app,
     );
 
-    assert_eq!(effects.len(), 2);
+    assert_eq!(effects.len(), 1);
     assert!(matches!(effects.first(), Some(Effect::SendPrompt { text, .. }) if text == "queued-1"));
-    assert!(matches!(
-        effects.get(1),
-        Some(Effect::FetchBilling { silent: true, .. })
-    ));
     assert!(agent_ref(&app, id).session.state.is_turn_running());
     assert_eq!(agent_ref(&app, id).session.queue_len(), 1);
     assert_eq!(
@@ -2675,12 +2024,8 @@ fn cancel_drain_is_blocked_when_editing_front_prompt() {
         &mut app,
     );
 
-    // Drain blocked but billing refresh still happens.
-    assert_eq!(effects.len(), 1);
-    assert!(matches!(
-        effects.first(),
-        Some(Effect::FetchBilling { silent: true, .. })
-    ));
+    // Drain blocked.
+    assert!(effects.is_empty());
     assert!(agent_ref(&app, id).session.state.is_idle());
     assert_eq!(agent_ref(&app, id).session.queue_len(), 2);
     assert_eq!(
@@ -4364,76 +3709,6 @@ fn send_prompt_now_dispatch_arms_expectation_and_suppresses_marker() {
     );
 }
 
-/// Older-shell control: a plain `SendPrompt` during a held wait stays unarmed, so a meta-less cancel still renders its marker.
-#[test]
-fn plain_send_during_blocking_wait_does_not_arm_and_meta_less_cancel_is_visible() {
-    use crate::app::agent_view::test_fixtures::simulate_task_output_wait;
-
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    dispatch(Action::SendPrompt("first".into()), &mut app);
-    assert!(
-        agent_ref(&app, id).expect_send_now_cancel.is_none(),
-        "an idle-drain send must NOT arm the expectation"
-    );
-    simulate_task_output_wait(app.agents.get_mut(&id).unwrap(), "bg-1");
-
-    let effects = dispatch(Action::SendPrompt("wake up and do this".into()), &mut app);
-    let prompt_id = match effects.as_slice() {
-        [Effect::SendPrompt { prompt_id, .. }] => prompt_id.clone(),
-        other => panic!("mid-turn plain prompt takes the immediate server send, got {other:?}"),
-    };
-    let agent = agent_ref(&app, id);
-    assert!(
-        agent.expect_send_now_cancel.is_none(),
-        "a plain send into a held wait must not arm send-now"
-    );
-    assert!(
-        agent.follow_without_jump_prompt_id.is_none(),
-        "a plain send must not pin follow-without-jump"
-    );
-    assert!(
-        !agent.send_now_painted_blocks.contains_key(&prompt_id),
-        "a plain send must not paint a speculative send-now block"
-    );
-
-    let _ = dispatch(cancelled_prompt_response(id, None), &mut app);
-    assert_eq!(
-        count_cancelled_markers(&app, id),
-        1,
-        "older-shell meta-less cancel after an unarmed plain send stays visible"
-    );
-}
-
-/// Modern shell: wire `cancelTrigger=send_now` suppresses the marker without a pager arm.
-#[test]
-fn plain_send_during_blocking_wait_trusts_wire_send_now_trigger() {
-    use crate::app::agent_view::test_fixtures::simulate_task_output_wait;
-
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    dispatch(Action::SendPrompt("first".into()), &mut app);
-    simulate_task_output_wait(app.agents.get_mut(&id).unwrap(), "bg-1");
-
-    let effects = dispatch(Action::SendPrompt("wake up and do this".into()), &mut app);
-    let prompt_id = match effects.as_slice() {
-        [Effect::SendPrompt { prompt_id, .. }] => prompt_id.clone(),
-        other => panic!("mid-turn plain prompt takes the immediate server send, got {other:?}"),
-    };
-    let agent = agent_ref(&app, id);
-    assert!(agent.expect_send_now_cancel.is_none());
-    assert!(agent.follow_without_jump_prompt_id.is_none());
-    assert!(!agent.send_now_painted_blocks.contains_key(&prompt_id));
-
-    let _ = dispatch(cancelled_prompt_response(id, Some("send_now")), &mut app);
-    assert_eq!(count_cancelled_markers(&app, id), 0);
-    assert_eq!(
-        count_completed_markers(&app, id),
-        0,
-        "no substitute completed marker for a wire send-now cancel"
-    );
-}
-
 fn count_user_prompts(app: &AppView, id: AgentId) -> usize {
     let agent = agent_ref(app, id);
     (0..agent.scrollback.len())
@@ -4544,149 +3819,6 @@ fn cancelled_response_during_newer_wake_still_shows_cancel_marker() {
         count_cancelled_markers(&app, id),
         1,
         "ambient wake state must not hide a real cancel"
-    );
-}
-
-/// Pending foreground-subagent UI: a confirmed held row stays reachable and actionable.
-#[test]
-fn plain_send_during_pending_subagent_wait_keeps_confirmed_queue_row_reachable() {
-    use crate::app::agent_view::{ActivePane, test_fixtures::simulate_subagent_wait};
-    use crate::app::app_view::InputOutcome;
-    use crate::app::prompt_queue::QueueEntryWire;
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-    use xai_acp_lib::AcpClientMessage;
-
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    dispatch(Action::SendPrompt("first".into()), &mut app);
-    let running_prompt_id = agent_ref(&app, id)
-        .session
-        .current_prompt_id
-        .clone()
-        .expect("idle drain starts a running turn");
-    simulate_subagent_wait(app.agents.get_mut(&id).unwrap());
-
-    const HELD: &str = "interrupt the subagent";
-    let effects = dispatch(Action::SendPrompt(HELD.into()), &mut app);
-    let prompt_id = match effects.as_slice() {
-        [Effect::SendPrompt { prompt_id, .. }] => prompt_id.clone(),
-        other => panic!("plain prompt takes the immediate server send, got {other:?}"),
-    };
-    {
-        let agent = agent_ref(&app, id);
-        assert!(agent.expect_send_now_cancel.is_none());
-        assert!(agent.follow_without_jump_prompt_id.is_none());
-        assert!(!agent.send_now_painted_blocks.contains_key(&prompt_id));
-    }
-
-    const AUTH_VERSION: u64 = 3;
-    let params = serde_json::json!({
-        "sessionId": "test-session",
-        "entries": [{
-            "id": prompt_id,
-            "version": AUTH_VERSION,
-            "kind": "prompt",
-            "text": HELD,
-            "position": 0,
-        }],
-        "runningPromptId": running_prompt_id,
-    });
-    let (response_tx, _rx) = tokio::sync::oneshot::channel();
-    crate::app::acp_handler::handle(
-        AcpClientMessage::ExtNotification(xai_acp_lib::AcpArgs {
-            request: acp::ExtNotification::new(
-                "x.ai/queue/changed",
-                std::sync::Arc::from(serde_json::value::to_raw_value(&params).unwrap()),
-            ),
-            response_tx,
-        }),
-        &mut app,
-    );
-
-    {
-        let agent = agent_ref(&app, id);
-        assert_eq!(
-            agent.shared_queue.as_slice(),
-            [QueueEntryWire {
-                id: prompt_id.clone(),
-                version: AUTH_VERSION,
-                owner: None,
-                last_editor: None,
-                kind: "prompt".into(),
-                text: HELD.into(),
-                position: 0,
-                combined_texts: None,
-            }]
-        );
-    }
-
-    {
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.sync_queue_pane();
-        assert!(!agent.visible_queue_is_empty());
-        let ids = agent.queue.entry_ids();
-        assert_eq!(ids.len(), 1, "confirmed held row must be the only pane row");
-        let Some(&row_id) = ids.first() else {
-            panic!("expected pane row id: {ids:?}");
-        };
-        let row = agent
-            .queue
-            .row_ref(row_id)
-            .expect("synced pane row is resolvable");
-        assert_eq!(row.server_id.as_deref(), Some(prompt_id.as_str()));
-        assert_eq!(row.version, AUTH_VERSION);
-    }
-
-    let _ = dispatch(Action::ShowQueue, &mut app);
-    let queue_text = last_system_text(&app, id);
-    assert!(
-        queue_text.contains(HELD),
-        "/queue must list the confirmed prompt, got {queue_text:?}"
-    );
-
-    app.registry = crate::actions::ActionRegistry::non_vscode_for_test();
-    app.agents.get_mut(&id).unwrap().hide_queue_pane();
-    let outcome = app.handle_input(&Event::Key(KeyEvent::new(
-        KeyCode::Char(';'),
-        KeyModifiers::CONTROL,
-    )));
-    assert!(
-        matches!(outcome, InputOutcome::Changed),
-        "Ctrl+; must toggle the queue overlay, got {outcome:?}"
-    );
-    {
-        let agent = app.agents.get_mut(&id).unwrap();
-        assert!(agent.queue.overlay.visible, "Ctrl+; must show the overlay");
-        assert!(agent.queue.overlay.focused, "Ctrl+; must focus the overlay");
-        assert_eq!(agent.active_pane, ActivePane::Queue);
-        let ids = agent.queue.entry_ids();
-        assert_eq!(ids.len(), 1);
-        let Some(&row_id) = ids.first() else {
-            panic!("expected overlay row id: {ids:?}");
-        };
-        let row = agent
-            .queue
-            .row_ref(row_id)
-            .expect("overlay still has the row");
-        assert_eq!(row.server_id.as_deref(), Some(prompt_id.as_str()));
-        assert_eq!(row.version, AUTH_VERSION);
-        agent.queue.list_state.select_by_id(row_id);
-    }
-
-    let outcome = app.handle_input(&Event::Key(KeyEvent::new(
-        KeyCode::Enter,
-        KeyModifiers::CONTROL,
-    )));
-    assert!(
-        matches!(
-            outcome,
-            InputOutcome::Action(Action::QueueInterjectShared {
-                ref id,
-                expected_version,
-                new_text: None,
-            }) if id == &prompt_id && expected_version == AUTH_VERSION
-        ),
-        "queue send-now must target the confirmed row, got {outcome:?}"
     );
 }
 
@@ -5017,52 +4149,6 @@ fn failed_send_now_requeues_payload_and_retires_echo() {
         "the optimistic echo must be retired"
     );
     assert!(agent.toast.is_some(), "the failure must explain itself");
-}
-
-/// An image-bearing prompt submitted during a parked sendable wait routes through send-now (images ride as content blocks).
-/// It must not silently hold in the local queue behind the wait.
-#[test]
-fn image_prompt_during_sendable_wait_routes_to_send_now() {
-    use crate::app::agent_view::test_fixtures::simulate_task_output_wait;
-
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    dispatch(Action::SendPrompt("first".into()), &mut app);
-    simulate_task_output_wait(app.agents.get_mut(&id).unwrap(), "bg-1");
-
-    let img = crate::prompt_images::from_clipboard_data(&crate::clipboard::ImageData {
-        data: vec![1, 2, 3],
-        mime_type: "image/png".into(),
-    });
-    {
-        let agent = app.agents.get_mut(&id).unwrap();
-        // A real chip insert: `drain_images` reconciles against live textarea elements, so a bare `images.push` would be dropped as stale
-        agent.prompt.insert_image(img).unwrap();
-    }
-
-    let effects = dispatch(Action::SendPrompt("look at [Image #1]".into()), &mut app);
-    match effects.as_slice() {
-        [Effect::SendPromptNow { blocks, .. }] => {
-            assert!(
-                blocks
-                    .iter()
-                    .any(|b| matches!(b, acp::ContentBlock::Image(_))),
-                "the pasted image must ride the send-now blocks"
-            );
-        }
-        other => {
-            panic!("expected SendPromptNow for an image prompt in a sendable wait, got {other:?}")
-        }
-    }
-    let agent = agent_ref(&app, id);
-    assert!(
-        agent.session.pending_prompts.is_empty(),
-        "the message must not ALSO be held in the local queue"
-    );
-    assert!(
-        agent.prompt.images.is_empty(),
-        "the composer images must be consumed by the send"
-    );
 }
 
 /// The local drip-feed drain must hold while a non-running server row exists.
@@ -6346,33 +5432,6 @@ fn unloadable_image_toasts_on_drain() {
         toast_text(&app, id),
         Some("Image #2 couldn't be read — not sent")
     );
-}
-
-/// `/remember` clears the composer through its own path; attached images are still reported.
-#[test]
-fn remember_note_with_images_toasts() {
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    {
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.prompt.set_text("/remember keep this ");
-        agent.prompt.set_cursor(agent.prompt.text().len());
-        agent
-            .prompt
-            .insert_image(crate::app::agent_view::test_fixtures::test_pasted_image())
-            .unwrap();
-    }
-    let text = agent_ref(&app, id).prompt.text().to_string();
-
-    dispatch(Action::SendPrompt(text), &mut app);
-
-    assert_eq!(
-        toast_text(&app, id),
-        Some("Images not sent with /remember — paste them again")
-    );
-    let agent = agent_ref(&app, id);
-    assert!(agent.prompt.images.is_empty());
-    assert!(agent.prompt.text().is_empty());
 }
 
 /// A command that toasts on its own (`/multiline`) must not bury the image notice.

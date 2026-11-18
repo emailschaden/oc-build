@@ -67,7 +67,6 @@ struct LocalFollowUp {
 }
 impl LocalFollowUp {
     fn enter(app: &mut AppView, behavior: crate::appearance::FollowUpBehavior) -> Self {
-        app.leader_mode = false;
         let previous = crate::appearance::cache::load_follow_up_behavior();
         crate::appearance::cache::set_follow_up_behavior(behavior);
         Self { previous }

@@ -346,66 +346,6 @@ fn doctor_apply_success_only_renders_resolution_instructions() {
 }
 
 #[test]
-fn stale_auth_copy_timeout_does_not_clear_newer_feedback() {
-    let mut app = test_app();
-    app.auth_state = AuthState::Authenticating {
-        request_seq: 1,
-        handle: None,
-        auth_url: Some("https://grok.com/auth".to_owned()),
-        mode: AuthMode::Command,
-    };
-
-    let first_effects = crate::app::dispatch::router::dispatch_copy_auth_url(&mut app, |_| {
-        crate::clipboard::ClipboardDelivery::Failed
-    });
-    let [
-        Effect::ScheduleClearAuthCopyFeedback {
-            generation: first_generation,
-        },
-    ] = first_effects.as_slice()
-    else {
-        panic!("first copy must schedule feedback clear");
-    };
-
-    let second_effects = crate::app::dispatch::router::dispatch_copy_auth_url(&mut app, |_| {
-        crate::clipboard::ClipboardDelivery::Confirmed
-    });
-    let [
-        Effect::ScheduleClearAuthCopyFeedback {
-            generation: second_generation,
-        },
-    ] = second_effects.as_slice()
-    else {
-        panic!("second copy must schedule feedback clear");
-    };
-    assert_ne!(first_generation, second_generation);
-    assert_eq!(
-        app.auth_clipboard_delivery,
-        Some(crate::clipboard::ClipboardDelivery::Confirmed)
-    );
-
-    dispatch_task_result(
-        TaskResult::AuthCopyFeedbackTimeout {
-            generation: *first_generation,
-        },
-        &mut app,
-    );
-    assert_eq!(
-        app.auth_clipboard_delivery,
-        Some(crate::clipboard::ClipboardDelivery::Confirmed),
-        "the first copy's stale timeout must preserve the second feedback"
-    );
-
-    dispatch_task_result(
-        TaskResult::AuthCopyFeedbackTimeout {
-            generation: *second_generation,
-        },
-        &mut app,
-    );
-    assert_eq!(app.auth_clipboard_delivery, None);
-}
-
-#[test]
 fn stale_workflows_result_does_not_repaint_replaced_session_modal() {
     let mut app = test_app_with_agent();
     app.agents.get_mut(&AgentId(0)).unwrap().extensions_modal =
@@ -1298,16 +1238,12 @@ fn switch_model_complete_success_updates_model_and_pushes_message() {
         expect_agent(&app, id).scrollback.len(),
         initial_scrollback + 1
     );
-    // PersistPreferredModel effect emitted.
-    assert_eq!(effects.len(), 1);
-    assert!(matches!(
-        effects.first(),
-        Some(Effect::PersistPreferredModel { model_id: mid, .. }) if *mid == model_id.clone()
-    ));
+    // oc-build: opencode backend; the pick is not saved to ~/.grok/config.toml.
+    assert!(effects.is_empty());
 }
 
 #[test]
-fn switch_model_complete_skips_message_and_persist_when_unchanged() {
+fn switch_model_complete_skips_message_when_unchanged() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     let model_id = acp::ModelId::new(std::sync::Arc::from("grok-4.5"));
@@ -1338,16 +1274,11 @@ fn switch_model_complete_skips_message_and_persist_when_unchanged() {
         before,
         "no message added"
     );
-    assert!(
-        !effects
-            .iter()
-            .any(|e| matches!(e, Effect::PersistPreferredModel { .. })),
-        "no persist effect for no-op switch"
-    );
+    assert!(effects.is_empty(), "no effect for no-op switch");
 }
 
 #[test]
-fn switch_model_complete_persists_resolved_effort_from_catalog_meta() {
+fn switch_model_complete_resolves_effort_from_catalog_meta() {
     use xai_grok_shell::sampling::types::ReasoningEffort;
     let mut app = test_app_with_agent();
     let id = AgentId(0);
@@ -1394,26 +1325,11 @@ fn switch_model_complete_persists_resolved_effort_from_catalog_meta() {
         Some(ReasoningEffort::Xhigh)
     );
 
-    assert_eq!(effects.len(), 1);
-    match effects.first() {
-        Some(Effect::PersistPreferredModel {
-            model_id: mid,
-            reasoning_effort,
-        }) => {
-            assert_eq!(*mid, model_id);
-            assert_eq!(
-                *reasoning_effort,
-                Some(ReasoningEffort::Xhigh),
-                "persisted effort must mirror the live UI effort so a \
-                     fresh chat does not reset reasoning to a stale default",
-            );
-        }
-        other => panic!("expected PersistPreferredModel, got {other:?}"),
-    }
+    assert!(effects.is_empty());
 }
 
 #[test]
-fn switch_to_non_reasoning_model_clears_persisted_effort() {
+fn switch_to_non_reasoning_model_clears_effort() {
     use xai_grok_shell::sampling::types::ReasoningEffort;
     let mut app = test_app_with_agent();
     let id = AgentId(0);
@@ -1460,18 +1376,7 @@ fn switch_to_non_reasoning_model_clears_persisted_effort() {
         "reasoning_effort must be cleared when switching to a non-reasoning model",
     );
 
-    assert_eq!(effects.len(), 1);
-    match effects.first() {
-        Some(Effect::PersistPreferredModel {
-            reasoning_effort, ..
-        }) => {
-            assert_eq!(
-                *reasoning_effort, None,
-                "persisted effort must be None so config.toml clears the stale value",
-            );
-        }
-        other => panic!("expected PersistPreferredModel, got {other:?}"),
-    }
+    assert!(effects.is_empty());
 }
 
 #[test]
@@ -1724,11 +1629,7 @@ fn same_agent_type_switch_no_modal() {
     // The model switched and no modal opened
     assert_eq!(expect_agent(&app, id).session.models.current, Some(model_b));
     assert!(expect_agent(&app, id).question_view.is_none());
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::PersistPreferredModel { .. }))
-    );
+    assert!(effects.is_empty());
 }
 
 #[test]
@@ -1851,75 +1752,6 @@ fn session_success_arms_finish_startup_obligation() {
             "a usable session must take the startup obligation: {label}",
         );
     }
-}
-
-#[test]
-fn bundle_status_ready_populates_state() {
-    let mut app = test_app();
-
-    dispatch(
-        Action::TaskComplete(TaskResult::BundleStatusReady {
-            has_cache: true,
-            version: Some("v2".into()),
-            personas: vec!["researcher".into(), "auditor".into()],
-            roles: vec!["reviewer".into()],
-            agents: vec!["default".into()],
-            skills: vec!["commit".into(), "code-review".into()],
-            persona_details: vec![crate::app::bundle::PersonaDetail {
-                name: "researcher".into(),
-                description: Some("thorough researcher".into()),
-                has_inputs: true,
-                has_outputs: false,
-                source_path: None,
-                scope_label: None,
-            }],
-            role_details: vec![crate::app::bundle::RoleDetail {
-                name: "reviewer".into(),
-                description: "code reviewer".into(),
-            }],
-        }),
-        &mut app,
-    );
-
-    assert!(app.bundle_state.has_cache);
-    assert_eq!(app.bundle_state.version, "v2");
-    assert_eq!(app.bundle_state.personas, vec!["researcher", "auditor"]);
-    assert_eq!(app.bundle_state.roles, vec!["reviewer"]);
-    assert_eq!(app.bundle_state.agents, vec!["default"]);
-    assert_eq!(app.bundle_state.skills, vec!["commit", "code-review"]);
-    assert_eq!(app.bundle_state.persona_details.len(), 1);
-    assert_eq!(
-        app.bundle_state
-            .persona_details
-            .first()
-            .map(|d| d.name.as_str()),
-        Some("researcher")
-    );
-    assert_eq!(app.bundle_state.role_details.len(), 1);
-    assert_eq!(
-        app.bundle_state
-            .role_details
-            .first()
-            .map(|d| d.name.as_str()),
-        Some("reviewer")
-    );
-}
-
-#[test]
-fn bundle_status_failed_logs_but_keeps_state() {
-    let mut app = test_app();
-    app.bundle_state.has_cache = true;
-    app.bundle_state.version = "keep-me".into();
-
-    dispatch(
-        Action::TaskComplete(TaskResult::BundleStatusFailed {
-            error: "status fetch failed".into(),
-        }),
-        &mut app,
-    );
-
-    assert!(app.bundle_state.has_cache);
-    assert_eq!(app.bundle_state.version, "keep-me");
 }
 
 #[test]
@@ -2607,443 +2439,12 @@ fn reset_session_title_complete_pushes_system_block() {
     );
 }
 
-/// Regression: when the 30s gate poll detects the subscription gate has been lifted, it must emit `CheckSubscription` so the shell refreshes the JWT.
-/// Until that refresh the auth token lacks the subscription claim and all API calls return 403.
-#[test]
-fn gate_refreshed_emits_check_subscription_on_gate_lift() {
-    let mut app = test_app();
-    // User starts gated (no subscription).
-    app.gate = Some(xai_grok_login::GateInfo {
-        message: "SuperGrok subscription required".into(),
-        url: Some("https://grok.com/supergrok".into()),
-        label: Some("Subscribe".into()),
-    });
-    assert!(!app.has_access());
-
-    // Server-side settings now show no gate (user purchased subscription).
-    let settings = xai_grok_shell::util::config::RemoteSettings::default();
-    let effects = dispatch_task_result(
-        TaskResult::GateRefreshed {
-            settings: Some(settings),
-        },
-        &mut app,
-    );
-
-    // Gate must be lifted.
-    assert!(app.has_access(), "gate should be lifted");
-    assert!(app.welcome_prompt_focused, "prompt should be focused");
-
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::CheckSubscription { verify: None })),
-        "must emit CheckSubscription to refresh JWT; got: {effects:?}"
-    );
-}
-
-/// When the gate poll returns settings that still have a gate, no effects are emitted and the user stays blocked.
-#[test]
-fn gate_refreshed_no_effect_when_still_gated() {
-    let mut app = test_app();
-    app.gate = Some(xai_grok_login::GateInfo {
-        message: "Subscribe".into(),
-        url: None,
-        label: None,
-    });
-
-    let settings = xai_grok_shell::util::config::RemoteSettings {
-        gate_message: Some("Subscribe".into()),
-        ..Default::default()
-    };
-    let effects = dispatch_task_result(
-        TaskResult::GateRefreshed {
-            settings: Some(settings),
-        },
-        &mut app,
-    );
-
-    assert!(!app.has_access(), "gate should remain");
-    assert!(effects.is_empty(), "no effects when still gated");
-}
-
-/// When the user was never gated, GateRefreshed is a no-op.
-#[test]
-fn gate_refreshed_no_effect_when_already_unblocked() {
-    let mut app = test_app();
-    assert!(app.has_access()); // no gate
-
-    let settings = xai_grok_shell::util::config::RemoteSettings::default();
-    let effects = dispatch_task_result(
-        TaskResult::GateRefreshed {
-            settings: Some(settings),
-        },
-        &mut app,
-    );
-
-    assert!(effects.is_empty(), "no effects when already unblocked");
-}
-
-/// A gate newly imposed by the 30s settings poll (possibly stale) must be deferred for live verification instead of painting the paywall directly.
-/// The gate is held out of `app.gate`, and both `CheckSubscription` and a verify timeout are emitted.
-#[test]
-fn gate_refreshed_newly_blocked_defers_gate_for_verification() {
-    let mut app = test_app();
-    assert!(app.has_access()); // ungated
-
-    let settings = xai_grok_shell::util::config::RemoteSettings {
-        gate_message: Some("Subscribe".into()),
-        ..Default::default()
-    };
-    let effects = dispatch_task_result(
-        TaskResult::GateRefreshed {
-            settings: Some(settings),
-        },
-        &mut app,
-    );
-
-    assert!(
-        app.has_access(),
-        "deferred gate must not show as paywall before verification"
-    );
-    assert!(app.pending_gate_verification.is_some());
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::CheckSubscription { verify: Some(_) })),
-        "must live-check before showing the paywall; got: {effects:?}"
-    );
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::ScheduleGateVerifyTimeout { .. })),
-        "must arm the verification timeout; got: {effects:?}"
-    );
-}
-
 fn test_gate() -> xai_grok_login::GateInfo {
     xai_grok_login::GateInfo {
         message: "Subscribe".into(),
         url: None,
         label: None,
     }
-}
-
-/// The live check confirmed access (meta without a gate): the deferred stale gate is dropped and the paywall never shows.
-#[test]
-fn verify_check_with_meta_resolves_pending_gate() {
-    let mut app = test_app();
-    let _effs = app.impose_gate(test_gate());
-    assert!(app.has_access());
-
-    let meta = serde_json::to_value(xai_grok_login::AuthMeta::default()).unwrap();
-    dispatch_task_result(
-        TaskResult::CheckSubscriptionComplete {
-            verify: Some(app.gate_verify_gen),
-            meta: Some(meta),
-        },
-        &mut app,
-    );
-
-    assert!(app.has_access(), "live check says subscribed — no paywall");
-    assert!(app.pending_gate_verification.is_none());
-}
-
-/// The live check confirmed the block (meta WITH a gate): the paywall shows with the authoritative gate.
-#[test]
-fn verify_check_with_gated_meta_shows_gate() {
-    let mut app = test_app();
-    let _effs = app.impose_gate(test_gate());
-
-    let meta = serde_json::to_value(xai_grok_login::AuthMeta {
-        gate: Some(test_gate()),
-        ..Default::default()
-    })
-    .unwrap();
-    dispatch_task_result(
-        TaskResult::CheckSubscriptionComplete {
-            verify: Some(app.gate_verify_gen),
-            meta: Some(meta),
-        },
-        &mut app,
-    );
-
-    assert!(!app.has_access(), "verified gate must show");
-    assert!(app.pending_gate_verification.is_none());
-}
-
-/// The verification's own check failed (meta None) while its stale gate was deferred: err on blocking, so the deferred gate is promoted.
-#[test]
-fn verify_check_failure_promotes_pending_gate() {
-    let mut app = test_app();
-    let _effs = app.impose_gate(test_gate());
-
-    let effects = dispatch_task_result(
-        TaskResult::CheckSubscriptionComplete {
-            verify: Some(app.gate_verify_gen),
-            meta: None,
-        },
-        &mut app,
-    );
-
-    assert!(!app.has_access(), "check failed — deferred gate must show");
-    assert!(app.pending_gate_verification.is_none());
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::SchedulePaywallCheck)),
-        "freshly shown gate must arm the 5s auto-lift chain; got: {effects:?}"
-    );
-}
-
-/// A failed GENERIC check (the watch, focus, or paywall chain; no generation) must never promote a deferred gate.
-/// Only the deferral's own generation-scoped check or timeout may promote it.
-/// A superseded or unrelated check failing is not evidence about the current verification.
-#[test]
-fn check_subscription_complete_failure_leaves_pending_gate_untouched() {
-    let mut app = test_app();
-    let _effs = app.impose_gate(test_gate());
-
-    let effects = dispatch_task_result(
-        TaskResult::CheckSubscriptionComplete {
-            verify: None,
-            meta: None,
-        },
-        &mut app,
-    );
-
-    assert!(effects.is_empty());
-    assert!(
-        app.has_access(),
-        "generic check failure must not promote the deferred gate"
-    );
-    assert!(
-        app.pending_gate_verification.is_some(),
-        "verification must stay in flight"
-    );
-}
-
-/// A failed verification check from a SUPERSEDED deferral (older generation) must not promote the newer pending gate.
-#[test]
-fn verify_check_stale_generation_failure_is_ignored() {
-    let mut app = test_app();
-    let _effs = app.impose_gate(test_gate());
-    let stale_gen = app.gate_verify_gen;
-    // Second deferral supersedes the first (its check is in flight).
-    let _effs = app.impose_gate(test_gate());
-
-    let effects = dispatch_task_result(
-        TaskResult::CheckSubscriptionComplete {
-            verify: Some(stale_gen),
-            meta: None,
-        },
-        &mut app,
-    );
-
-    assert!(effects.is_empty());
-    assert!(
-        app.has_access(),
-        "superseded verification failure must not promote the newer gate"
-    );
-    assert!(app.pending_gate_verification.is_some());
-}
-
-/// A check failure with no deferred gate (the plain paywall-poller path) must not invent a gate.
-#[test]
-fn check_subscription_complete_failure_without_pending_gate_is_noop() {
-    let mut app = test_app();
-    dispatch_task_result(
-        TaskResult::CheckSubscriptionComplete {
-            verify: None,
-            meta: None,
-        },
-        &mut app,
-    );
-    assert!(app.has_access());
-}
-
-/// The verification window expired before the live check resolved: err on blocking.
-/// The deferred gate is promoted, and the freshly shown paywall gets the 5s auto-lift chain.
-#[test]
-fn gate_verify_timeout_promotes_pending_gate() {
-    let mut app = test_app();
-    let _effs = app.impose_gate(test_gate());
-    assert!(app.has_access());
-
-    let effects = dispatch_task_result(
-        TaskResult::GateVerifyTimeout {
-            generation: app.gate_verify_gen,
-        },
-        &mut app,
-    );
-
-    assert!(!app.has_access(), "timeout — deferred gate must show");
-    assert!(app.pending_gate_verification.is_none());
-    assert!(
-        app.paywall_check_started.is_some(),
-        "promoted gate must arm the paywall auto-check chain"
-    );
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::SchedulePaywallCheck)),
-        "promoted gate must schedule the 5s chain; got: {effects:?}"
-    );
-}
-
-/// The timeout fires after the check already resolved the gate: no-op.
-#[test]
-fn gate_verify_timeout_noop_when_already_resolved() {
-    let mut app = test_app();
-    let _effs = app.impose_gate(test_gate());
-    let generation = app.gate_verify_gen;
-    // Live check resolved first (access confirmed).
-    let meta = serde_json::to_value(xai_grok_login::AuthMeta::default()).unwrap();
-    dispatch_task_result(
-        TaskResult::CheckSubscriptionComplete {
-            verify: None,
-            meta: Some(meta),
-        },
-        &mut app,
-    );
-
-    dispatch_task_result(TaskResult::GateVerifyTimeout { generation }, &mut app);
-    assert!(
-        app.has_access(),
-        "stale timeout must not re-impose the gate"
-    );
-}
-
-/// A timeout from a SUPERSEDED verification (older generation) must not promote a newer deferred gate whose own live check is still in flight.
-#[test]
-fn gate_verify_timeout_stale_generation_is_ignored() {
-    let mut app = test_app();
-    // First deferral resolves (access confirmed)
-    let _effs = app.impose_gate(test_gate());
-    let stale_gen = app.gate_verify_gen;
-    let meta = serde_json::to_value(xai_grok_login::AuthMeta::default()).unwrap();
-    dispatch_task_result(
-        TaskResult::CheckSubscriptionComplete {
-            verify: None,
-            meta: Some(meta),
-        },
-        &mut app,
-    );
-    // Then a SECOND gate is deferred (its check is in flight)
-    let _effs = app.impose_gate(test_gate());
-    assert!(app.has_access());
-
-    // The FIRST deferral's timer fires now; it must not promote the second deferral's pending gate
-    let effects = dispatch_task_result(
-        TaskResult::GateVerifyTimeout {
-            generation: stale_gen,
-        },
-        &mut app,
-    );
-
-    assert!(effects.is_empty());
-    assert!(
-        app.has_access(),
-        "stale-generation timer must not promote the newer pending gate"
-    );
-    assert!(
-        app.pending_gate_verification.is_some(),
-        "the newer verification must stay in flight"
-    );
-}
-
-/// A verified gate landing via `CheckSubscriptionComplete` (gated meta while ungated) must start the 5s paywall auto-check chain.
-/// Verify-before-paywall paths never went through the login-path chain start.
-#[test]
-fn verified_gate_via_check_complete_starts_paywall_chain() {
-    let mut app = test_app();
-    let _effs = app.impose_gate(test_gate());
-
-    let meta = serde_json::to_value(xai_grok_login::AuthMeta {
-        gate: Some(test_gate()),
-        ..Default::default()
-    })
-    .unwrap();
-    let effects = dispatch_task_result(
-        TaskResult::CheckSubscriptionComplete {
-            verify: None,
-            meta: Some(meta),
-        },
-        &mut app,
-    );
-
-    assert!(!app.has_access());
-    assert!(
-        app.paywall_check_started.is_some(),
-        "verified gate must arm the paywall auto-check chain"
-    );
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::SchedulePaywallCheck)),
-        "verified gate must schedule the 5s chain; got: {effects:?}"
-    );
-
-    // Steady-state paywall-poller responses (already gated) must NOT fan out extra timers
-    let meta = serde_json::to_value(xai_grok_login::AuthMeta {
-        gate: Some(test_gate()),
-        ..Default::default()
-    })
-    .unwrap();
-    let effects = dispatch_task_result(
-        TaskResult::CheckSubscriptionComplete {
-            verify: None,
-            meta: Some(meta),
-        },
-        &mut app,
-    );
-    assert!(
-        effects.is_empty(),
-        "already-gated check responses must not schedule more timers; got: {effects:?}"
-    );
-}
-
-/// `GateRefreshed` with gate-free settings while a deferred gate awaits verification must drop the pending copy.
-/// The fresh settings are newer than the stale snapshot that produced it.
-/// It must still run the lift bookkeeping (`CheckSubscription` for the JWT refresh).
-#[test]
-fn gate_refreshed_without_gate_clears_pending_verification() {
-    let mut app = test_app();
-    let _effs = app.impose_gate(test_gate());
-    let generation = app.gate_verify_gen;
-
-    let settings = xai_grok_shell::util::config::RemoteSettings::default();
-    let effects = dispatch_task_result(
-        TaskResult::GateRefreshed {
-            settings: Some(settings),
-        },
-        &mut app,
-    );
-
-    assert!(app.pending_gate_verification.is_none());
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::CheckSubscription { verify: None })),
-        "settings-confirmed lift of a pending gate must refresh the JWT; got: {effects:?}"
-    );
-    // The still-armed timer must find nothing to promote.
-    dispatch_task_result(TaskResult::GateVerifyTimeout { generation }, &mut app);
-    assert!(
-        app.has_access(),
-        "cleared pending gate must not resurface via the timer"
-    );
-}
-
-/// Logout clears any deferred gate and the check debounce.
-#[test]
-fn logout_clears_pending_gate_verification() {
-    let mut app = test_app();
-    let _effs = app.impose_gate(test_gate());
-
-    dispatch_task_result(TaskResult::LogoutComplete, &mut app);
-
-    assert!(app.pending_gate_verification.is_none());
-    assert!(app.last_subscription_check_at.is_none());
 }
 
 /// `apply_setting_rollback` on a known key reverts the in-memory cache without emitting any new effects.

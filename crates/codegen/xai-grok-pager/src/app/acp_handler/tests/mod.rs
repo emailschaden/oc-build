@@ -212,7 +212,6 @@ pub(super) fn make_app_with_agent(session_id: &str) -> AppView {
         Vec::new(),
         crate::render::draw::EscapeWriter::disconnected(),
     );
-    app.leader_mode = true;
     let id = AgentId(0);
     let agent = make_agent(Some(session_id));
     app.agents.insert(id, agent);
@@ -2319,4 +2318,3 @@ mod background_tasks;
 mod models;
 mod mcp;
 mod git_head;
-mod version_mismatch;

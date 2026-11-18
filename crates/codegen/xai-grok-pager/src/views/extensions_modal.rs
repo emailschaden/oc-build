@@ -499,19 +499,10 @@ impl ExtensionsTab {
     ];
 
     // oc-build: opencode backend
-    /// Tabs offered in this process: [`Self::ALL`], or in opencode mode only those opencode can
-    /// back (no Hooks, Marketplace or Workflows).
+    /// Tabs offered in this process: those opencode can back (no Hooks, Marketplace or
+    /// Workflows).
     pub fn shown() -> &'static [Self] {
-        const OPENCODE: &[ExtensionsTab] = &[
-            ExtensionsTab::Plugins,
-            ExtensionsTab::Skills,
-            ExtensionsTab::McpServers,
-        ];
-        if crate::acp::opencode_shim::is_active() {
-            OPENCODE
-        } else {
-            Self::ALL
-        }
+        &[Self::Plugins, Self::Skills, Self::McpServers]
     }
 
     /// Display label for the tab bar.
@@ -5248,110 +5239,6 @@ mod tests {
     }
 
     #[test]
-    fn workflows_tab_renders_catalog_flat() {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Workflows);
-        state.workflows_data = TabDataState::Loaded(vec![WorkflowInfo {
-            name: "fix-ci".to_string(),
-            description: "Fix failing CI on the current PR".to_string(),
-            when_to_use: Some("when CI is red".to_string()),
-            source: "builtin".to_string(),
-            path: None,
-        }]);
-        let area = Rect::new(0, 0, 100, 40);
-        let mut buf = Buffer::empty(area);
-        render_extensions_modal(&mut buf, area, &mut state, None, false, 0);
-
-        assert_eq!(
-            buffer_count(&buf, "fix-ci"),
-            1,
-            "the workflow name must render as a flat row"
-        );
-        assert_eq!(
-            buffer_count(&buf, "(builtin)"),
-            1,
-            "the workflow source must render as the right label"
-        );
-        assert!(
-            !state
-                .entry_labels_cache
-                .iter()
-                .any(|l| l.starts_with("Workflows (")),
-            "the flat catalog must not render a group header"
-        );
-        assert!(
-            state.entry_data_indices.iter().all(|d| d.is_none()),
-            "workflow rows are browse-only"
-        );
-        assert!(
-            state.entry_group_keys.iter().all(|k| k.is_none()),
-            "workflow rows are not collapsible groups"
-        );
-    }
-
-    #[test]
-    fn workflows_tab_shows_all_entries_without_unusable_name_badge() {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Workflows);
-        state.workflows_data = TabDataState::Loaded(vec![
-            WorkflowInfo {
-                name: "valid-workflow".into(),
-                description: "Valid".into(),
-                when_to_use: None,
-                source: "project".into(),
-                path: None,
-            },
-            WorkflowInfo {
-                name: "Not Launchable".into(),
-                description: "Invalid".into(),
-                when_to_use: None,
-                source: "project".into(),
-                path: None,
-            },
-        ]);
-        let area = Rect::new(0, 0, 100, 40);
-        let mut buf = Buffer::empty(area);
-        render_extensions_modal(&mut buf, area, &mut state, None, false, 0);
-        assert_eq!(buffer_count(&buf, "valid-workflow"), 1);
-        assert_eq!(
-            buffer_count(&buf, "Not Launchable"),
-            1,
-            "odd-named catalog entries still render"
-        );
-        assert_eq!(
-            buffer_count(&buf, "[no slash command]"),
-            0,
-            "no unusable-name badge"
-        );
-    }
-
-    #[test]
-    fn workflows_tab_empty_shows_placeholder() {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Workflows);
-        state.workflows_data = TabDataState::Loaded(vec![]);
-        let area = Rect::new(0, 0, 100, 40);
-        let mut buf = Buffer::empty(area);
-        render_extensions_modal(&mut buf, area, &mut state, None, false, 0);
-        assert_eq!(
-            state.entry_labels_cache,
-            [workflows_picker_rows::WORKFLOWS_EMPTY_PLACEHOLDER]
-        );
-        assert_eq!(
-            buffer_count(&buf, "No workflows available"),
-            1,
-            "empty catalog renders the dimmed placeholder row"
-        );
-    }
-
-    #[test]
-    fn workflows_tab_error_renders_dimmed_row() {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Workflows);
-        state.workflows_data = TabDataState::Error("boom".into());
-        let area = Rect::new(0, 0, 100, 40);
-        let mut buf = Buffer::empty(area);
-        render_extensions_modal(&mut buf, area, &mut state, None, false, 0);
-        assert_eq!(buffer_count(&buf, "Error: boom"), 1);
-    }
-
-    #[test]
     fn workflows_tab_loading_shows_spinner_not_placeholder() {
         // `ExtensionsModalState::new` starts `workflows_data` at Loading.
         let mut state = ExtensionsModalState::new(ExtensionsTab::Workflows);
@@ -5486,105 +5373,6 @@ mod tests {
         assert!(hook_source_pinned(&hooks, "/etc/grok"));
         assert!(!hook_source_pinned(&hooks, "/home/u/.grok"));
         assert!(!hook_source_pinned(&hooks, "/nonexistent"));
-    }
-
-    /// The Space hint is suppressed for policy-enforced selections; mixed groups and unpinned rows keep it.
-    #[test]
-    fn policy_enforced_selection_suppresses_space_hint() {
-        let mut pinned = make_hook("policy/a", "/etc/grok", false);
-        pinned.pinned = true;
-        let mut user = make_hook("user/b", "/home/u/.grok", false);
-        user.removable = true;
-
-        // Entry maps as the picker builds them (headers carry a group key, no data index):
-        //   0: header /etc/grok, 1: pinned row, 2: header user, 3: user row
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Hooks);
-        state.hooks_data = TabDataState::Loaded(xai_hooks_plugins_types::HooksListResponse {
-            hooks: vec![pinned, user],
-            project_trusted: true,
-            load_errors: Vec::new(),
-        });
-        let data_indices = vec![None, Some(0), None, Some(1)];
-        let group_keys = vec![
-            Some("/etc/grok".to_string()),
-            None,
-            Some("/home/u/.grok".to_string()),
-            None,
-        ];
-
-        let enforced =
-            |sel| selected_hook_policy_enforced_at(&state, &data_indices, &group_keys, sel);
-        let removable =
-            |sel| selected_hook_source_removable_at(&state, &data_indices, &group_keys, sel);
-        // Policy group header and the pinned row: Space and x suppressed.
-        assert!(enforced(0));
-        assert!(enforced(1));
-        assert!(!removable(0));
-        assert!(!removable(1));
-        // Registered-dir header and row: both hints stay.
-        assert!(!enforced(2));
-        assert!(!enforced(3));
-        assert!(removable(2));
-        assert!(removable(3));
-
-        // Mixed group header: unpinned members keep it toggleable.
-        let mut mixed_pinned = make_hook("policy/c", "/mixed", false);
-        mixed_pinned.pinned = true;
-        let mixed_user = make_hook("user/d", "/mixed", false);
-        let mixed_state = {
-            let mut s = ExtensionsModalState::new(ExtensionsTab::Hooks);
-            s.hooks_data = TabDataState::Loaded(xai_hooks_plugins_types::HooksListResponse {
-                hooks: vec![mixed_pinned, mixed_user],
-                project_trusted: true,
-                load_errors: Vec::new(),
-            });
-            s
-        };
-        let mixed_indices = vec![None, Some(0), Some(1)];
-        let mixed_keys = vec![Some("/mixed".to_string()), None, None];
-        assert!(!selected_hook_policy_enforced_at(
-            &mixed_state,
-            &mixed_indices,
-            &mixed_keys,
-            0
-        ));
-        // ...but a non-registered source is never removable.
-        for sel in 0..3 {
-            assert!(!selected_hook_source_removable_at(
-                &mixed_state,
-                &mixed_indices,
-                &mixed_keys,
-                sel
-            ));
-        }
-    }
-
-    /// The x hint must mirror the remove handler: a managed-policy member makes the whole source
-    /// unremovable even when the shell reports the directory as user-registered (`removable: true` —
-    /// older shells set it from registration alone).
-    #[test]
-    fn remove_hint_suppressed_for_registered_but_pinned_source() {
-        let mut pinned = make_hook("policy/a", "/reg/policy", false);
-        pinned.pinned = true;
-        pinned.removable = true;
-        let mut sibling = make_hook("user/b", "/reg/policy", false);
-        sibling.removable = true;
-
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Hooks);
-        state.hooks_data = TabDataState::Loaded(xai_hooks_plugins_types::HooksListResponse {
-            hooks: vec![pinned, sibling],
-            project_trusted: true,
-            load_errors: Vec::new(),
-        });
-        // 0: header, 1: pinned row, 2: unpinned sibling row.
-        let data_indices = vec![None, Some(0), Some(1)];
-        let group_keys = vec![Some("/reg/policy".to_string()), None, None];
-        for sel in 0..3 {
-            assert!(
-                !selected_hook_source_removable_at(&state, &data_indices, &group_keys, sel),
-                "selection {sel} must not offer x remove for a pinned source"
-            );
-        }
     }
 
     /// Regression: refetches must not re-collapse expanded groups.
@@ -6730,61 +6518,12 @@ mod tests {
     }
 
     #[test]
-    fn marketplace_is_group_expanded_collapsed_source() {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Marketplace);
-        state.marketplace_collapsed_sources.insert(0);
-        // Source "0" is now collapsed.
-        assert!(!state.is_group_expanded(0, "0"));
-    }
-
-    #[test]
     fn marketplace_is_group_expanded_forced_open_during_search() {
         let mut state = ExtensionsModalState::new(ExtensionsTab::Marketplace);
         state.marketplace_collapsed_sources.insert(0);
         state.picker_state.set_query("debug");
         // During search, collapsed sources are forced open.
         assert!(state.is_group_expanded(0, "0"));
-    }
-
-    /// The footer advertises only what the selected Marketplace row can do: source verbs on a
-    /// source header, install-status-matched plugin verbs on a plugin row, never the other set.
-    #[test]
-    fn marketplace_footer_follows_selected_row_kind() {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Marketplace);
-        state.marketplace_data =
-            TabDataState::Loaded(xai_hooks_plugins_types::MarketplaceListResponse {
-                sources: vec![superpowers_source()],
-            });
-        let footer = |state: &mut ExtensionsModalState, row: usize| -> Vec<&'static str> {
-            state.picker_state.selected = row;
-            let buf = render_marketplace_into_buffer(state, 120, 30);
-            // Key-prefixed footer form, so row badges like "[installed]" do not match.
-            [
-                "i install",
-                "u update",
-                "d uninstall",
-                "a add source",
-                "x remove source",
-                "r refresh",
-            ]
-            .into_iter()
-            .filter(|label| buffer_count(&buf, label) > 0)
-            .collect()
-        };
-        // Row 0: the source header.
-        assert_eq!(
-            footer(&mut state, 0),
-            vec!["a add source", "x remove source", "r refresh"]
-        );
-        // Plugin rows are alphabetical. Row 1: "brainstorming", installed.
-        assert_eq!(footer(&mut state, 1), vec!["d uninstall", "r refresh"]);
-        // Row 2: "subagent-driven-development", not installed.
-        assert_eq!(footer(&mut state, 2), vec!["i install", "r refresh"]);
-        // Row 4: "systematic-debugging", update available.
-        assert_eq!(
-            footer(&mut state, 4),
-            vec!["u update", "d uninstall", "r refresh"]
-        );
     }
 
     /// A row-scoped key on a collapsed header: no child row is visible, so the hint asks for the
@@ -6810,21 +6549,6 @@ mod tests {
                 "Expand this row (Enter), then select a plugin row to update.".into()
             ))
         );
-    }
-
-    #[test]
-    fn marketplace_error_source_renders_header_with_error_badge() {
-        let error_source = xai_hooks_plugins_types::MarketplaceScanResult {
-            source_name: "broken-source".into(),
-            source_kind: "git".into(),
-            source_url_or_path: "https://github.com/bad/repo".into(),
-            plugins: vec![],
-            error: Some("failed to clone: repository not found".into()),
-        };
-        let mut state = marketplace_modal_state(error_source);
-        let buf = render_marketplace_into_buffer(&mut state, 100, 40);
-        assert!(buffer_count(&buf, "broken-source") >= 1);
-        assert!(buffer_count(&buf, "[error]") >= 1);
     }
 
     fn component(name: &str, desc: Option<&str>) -> xai_hooks_plugins_types::ComponentItem {
@@ -6997,84 +6721,6 @@ mod tests {
                 sources: vec![source],
             });
         state
-    }
-
-    #[test]
-    fn marketplace_collapsed_row_shows_component_summary() {
-        let mut source = superpowers_source();
-        if let Some(plugin) = source.plugins.get_mut(0) {
-            plugin.components = Some(sample_components());
-        }
-        let mut state = marketplace_modal_state(source);
-        let buf = render_marketplace_into_buffer(&mut state, 100, 40);
-        assert!(
-            state.picker_state.expanded.is_empty(),
-            "rows must be collapsed by default for this test to pin anything"
-        );
-        assert_eq!(
-            buffer_count(&buf, "2 skills \u{b7} 1 command \u{b7} 1 hook"),
-            1,
-            "collapsed marketplace row must show the catalog component summary"
-        );
-    }
-
-    #[test]
-    fn marketplace_legacy_fields_never_render() {
-        let mut source = superpowers_source();
-        source.plugins.truncate(1);
-        let mut state = marketplace_modal_state(source);
-        let legacy_needle = "14 skills";
-
-        let collapsed_buf = render_marketplace_into_buffer(&mut state, 100, 40);
-        assert_eq!(
-            buffer_count(&collapsed_buf, legacy_needle),
-            0,
-            "legacy scan counts must not render on collapsed rows"
-        );
-
-        state.picker_state.expanded.insert(1);
-        let expanded_buf = render_marketplace_into_buffer(&mut state, 100, 40);
-        assert_eq!(
-            buffer_count(&expanded_buf, legacy_needle),
-            0,
-            "legacy scan counts must not render in the expanded view"
-        );
-        assert_eq!(
-            buffer_count(&expanded_buf, "contents shown after install"),
-            1,
-            "catalog-less URL entry shows the install hint in the provides field"
-        );
-    }
-
-    #[test]
-    fn marketplace_catalog_summary_not_duplicated_when_expanded() {
-        let mut source = superpowers_source();
-        source.plugins.truncate(1);
-        if let Some(plugin) = source.plugins.get_mut(0) {
-            plugin.components = Some(sample_components());
-        }
-        let mut state = marketplace_modal_state(source);
-        let summary = "2 skills \u{b7} 1 command \u{b7} 1 hook";
-
-        let collapsed_buf = render_marketplace_into_buffer(&mut state, 100, 40);
-        assert_eq!(
-            buffer_count(&collapsed_buf, summary),
-            1,
-            "collapsed row shows the catalog summary once"
-        );
-
-        state.picker_state.expanded.insert(1);
-        let expanded_buf = render_marketplace_into_buffer(&mut state, 100, 40);
-        assert_eq!(
-            buffer_count(&expanded_buf, summary),
-            0,
-            "expanded view replaces the summary with the enumeration"
-        );
-        assert_eq!(
-            buffer_count(&expanded_buf, "brainstorming, test-driven-development"),
-            1,
-            "expanded view enumerates component names once"
-        );
     }
 
     fn plugins_modal_state(
@@ -7404,55 +7050,6 @@ mod tests {
         assert_eq!(buffer_count(&buf, "User (Claude) (1 plugin)"), 1);
         assert_eq!(buffer_count(&buf, "off-tool"), 1);
         assert_eq!(buffer_count(&buf, "[disabled]"), 1);
-    }
-
-    #[test]
-    fn marketplace_placeholders_render_only_when_expanded() {
-        let mut source = superpowers_source();
-        source.plugins.truncate(2);
-        if let Some(plugin) = source.plugins.get_mut(0) {
-            plugin.components = Some(xai_hooks_plugins_types::PluginComponents::default());
-        }
-        if let Some(plugin) = source.plugins.get_mut(1) {
-            plugin.components = None;
-            plugin.skill_count = 0;
-            plugin.has_hooks = false;
-            plugin.has_agents = false;
-            plugin.has_mcp = false;
-        }
-        assert!(
-            source
-                .plugins
-                .get(1)
-                .is_some_and(|p| p.remote_url.is_some())
-        );
-        let mut state = marketplace_modal_state(source);
-
-        let collapsed_buf = render_marketplace_into_buffer(&mut state, 100, 40);
-        assert_eq!(
-            buffer_count(&collapsed_buf, "no detectable components"),
-            0,
-            "collapsed row must not show the empty-catalog placeholder"
-        );
-        assert_eq!(
-            buffer_count(&collapsed_buf, "contents shown after install"),
-            0,
-            "collapsed row must not show the install hint placeholder"
-        );
-
-        state.picker_state.expanded.insert(1);
-        state.picker_state.expanded.insert(2);
-        let expanded_buf = render_marketplace_into_buffer(&mut state, 100, 40);
-        assert_eq!(
-            buffer_count(&expanded_buf, "no detectable components"),
-            1,
-            "expanded view shows the empty-catalog placeholder exactly once"
-        );
-        assert_eq!(
-            buffer_count(&expanded_buf, "contents shown after install"),
-            1,
-            "expanded view shows the install hint placeholder exactly once"
-        );
     }
 
     #[test]
@@ -7996,31 +7593,6 @@ mod tests {
                 .map(|s| s.label()),
             Some("mmm")
         );
-    }
-
-    #[test]
-    fn workflows_sort_az_by_name() {
-        let mut state = ExtensionsModalState::new(ExtensionsTab::Workflows);
-        state.workflows_data = TabDataState::Loaded(vec![
-            WorkflowInfo {
-                name: "zeta-wf".into(),
-                description: "Z".into(),
-                when_to_use: None,
-                source: "builtin".into(),
-                path: None,
-            },
-            WorkflowInfo {
-                name: "alpha-wf".into(),
-                description: "A".into(),
-                when_to_use: None,
-                source: "builtin".into(),
-                path: None,
-            },
-        ]);
-        let area = Rect::new(0, 0, 100, 40);
-        let mut buf = Buffer::empty(area);
-        render_extensions_modal(&mut buf, area, &mut state, None, false, 0);
-        assert_eq!(state.entry_labels_cache, ["alpha-wf", "zeta-wf"]);
     }
 
     #[test]

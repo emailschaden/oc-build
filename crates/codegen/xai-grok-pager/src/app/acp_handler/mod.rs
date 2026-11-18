@@ -110,10 +110,7 @@ use session_notification::{
 #[cfg(test)]
 #[allow(unused_imports)]
 use settings::*;
-use settings::{
-    handle_announcements_update, handle_models_update, handle_sessions_changed,
-    handle_settings_update,
-};
+use settings::{handle_announcements_update, handle_models_update};
 pub(crate) use subagent_activity::finalize_killed_subagent;
 #[cfg(test)]
 #[allow(unused_imports)]
@@ -630,8 +627,8 @@ fn handle_ext_notification(notif: &acp::ExtNotification, app: &mut AppView) -> b
         "x.ai/task_backgrounded" => handle_task_backgrounded(notif, app),
         "x.ai/task_completed" => handle_task_completed(notif, app),
         "x.ai/models/update" => handle_models_update(notif, app),
-        "x.ai/settings/update" => handle_settings_update(notif, app),
-        "x.ai/sessions/changed" => handle_sessions_changed(notif, app),
+        // oc-build: opencode backend; `x.ai/settings/update` (xAI remote settings) and the
+        // leader's `x.ai/sessions/changed` roster broadcast are gone.
         "x.ai/queue/changed" => handle_queue_changed(notif, app),
         "x.ai/session/prompt_complete" => handle_prompt_complete(notif, app),
         "x.ai/session/interjection" => handle_interjection(notif, app),
@@ -641,7 +638,6 @@ fn handle_ext_notification(notif: &acp::ExtNotification, app: &mut AppView) -> b
         "x.ai/scheduled_task_deleted" => handle_scheduled_task_deleted(notif, app),
         "x.ai/announcements/update" => handle_announcements_update(notif, app),
         "x.ai/git_head_changed" => handle_git_head_changed(notif, app),
-        "x.ai/leader/version_mismatch" => handle_version_mismatch(notif, app),
         "x.ai/mcp/init_progress" => handle_mcp_init_progress(notif, app),
         "x.ai/session/setup" => handle_session_setup_phase(notif, app),
         "x.ai/mcp/tools_changed" | "x.ai/mcp_initialized" => handle_mcp_tools_changed(notif, app),
@@ -684,14 +680,6 @@ fn handle_session_setup_phase(notif: &acp::ExtNotification, app: &mut AppView) -
     };
     agent.session_new_phase = Some(phase);
     false
-}
-fn handle_version_mismatch(notif: &acp::ExtNotification, app: &mut AppView) -> bool {
-    let Some(banner) = crate::acp::version_mismatch_banner(notif.params.get()) else {
-        tracing::warn!("ignoring x.ai/leader/version_mismatch without usable versions");
-        return false;
-    };
-    app.show_toast(&banner);
-    true
 }
 fn user_message_text(update: &acp::SessionUpdate) -> Option<&str> {
     let acp::SessionUpdate::UserMessageChunk(chunk) = update else {

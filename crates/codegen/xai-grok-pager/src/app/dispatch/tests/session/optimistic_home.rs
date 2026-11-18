@@ -687,38 +687,6 @@ fn leave_home_is_a_no_op_behind_the_startup_gate() {
     assert!(dispatch(Action::LeaveHome, &mut app).is_empty());
     assert!(app.agents.is_empty());
 }
-/// The paywall / ZDR menus own every key on Welcome, so typing there never
-/// reaches the leave-home branch (the shared helper is deliberately not access-gated).
-#[test]
-fn typing_on_a_gated_welcome_does_not_leave_home() {
-    let mut app = test_app();
-    app.gate = Some(xai_grok_shell::auth::GateInfo {
-        message: "SuperGrok subscription required".into(),
-        url: Some("https://grok.com/supergrok".into()),
-        label: Some("Subscribe".into()),
-    });
-    app.welcome_prompt_focused = true;
-    let outcome = app.handle_input(&key_event(KeyCode::Char('h'), KeyModifiers::NONE));
-    assert!(
-        !matches!(
-            outcome,
-            InputOutcome::ActionThenForward(_) | InputOutcome::Action(_)
-        ),
-        "paywalled welcome must swallow text keys, got {outcome:?}"
-    );
-    let mut app = test_app();
-    app.is_zdr = true;
-    app.zdr_access_enabled = false;
-    app.welcome_prompt_focused = true;
-    let outcome = app.handle_input(&key_event(KeyCode::Char('h'), KeyModifiers::NONE));
-    assert!(
-        !matches!(
-            outcome,
-            InputOutcome::ActionThenForward(_) | InputOutcome::Action(_)
-        ),
-        "ZDR-blocked welcome must swallow text keys, got {outcome:?}"
-    );
-}
 #[test]
 fn welcome_enter_with_text_sends_prompt_and_leaves_home() {
     let mut app = test_app();

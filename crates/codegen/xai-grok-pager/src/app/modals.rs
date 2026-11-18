@@ -62,8 +62,6 @@ impl AgentView {
             models,
             cwd,
             has_session_announcements: slash_controller.has_session_announcements(),
-            billing_surface_visible: slash_controller.billing_surface_visible(),
-            usage_command_visible: slash_controller.usage_command_visible(),
             workflows_available: slash_controller.workflows_available(),
             saved_workflows: slash_controller.registry().saved_workflows(),
             workflow_runs: slash_controller.workflow_runs(),
@@ -721,7 +719,6 @@ impl AgentView {
                 // Build filtered entries for count and non-selectable indices.
                 let filtered = crate::views::modal::filter_palette_entries(
                     state.query(),
-                    self.sharing_enabled,
                     &self.prompt.slash_controller,
                 );
                 let non_sel: Vec<bool> = filtered
@@ -926,13 +923,11 @@ impl AgentView {
                     }
                     PickerOutcome::QueryChanged => {
                         // Re-filter entries based on updated query.
-                        let sharing_enabled = self.sharing_enabled;
                         if let Some(ActiveModal::CommandPalette { entries, state, .. }) =
                             self.active_modal.as_mut()
                         {
                             *entries = crate::views::modal::filter_palette_entries(
                                 state.query(),
-                                sharing_enabled,
                                 &self.prompt.slash_controller,
                             );
                             state.selected = state.selected.min(entries.len().saturating_sub(1));
@@ -1722,11 +1717,8 @@ impl AgentView {
             } = active_modal
             {
                 // Command palette: ModalWindow chrome and picker content
-                let filtered = modal::filter_palette_entries(
-                    state.query(),
-                    self.sharing_enabled,
-                    &self.prompt.slash_controller,
-                );
+                let filtered =
+                    modal::filter_palette_entries(state.query(), &self.prompt.slash_controller);
                 let non_sel: Vec<bool> = filtered
                     .iter()
                     .map(|e| matches!(e.command, modal::PaletteCommand::SectionHeader(_)))
@@ -2352,14 +2344,7 @@ impl AgentView {
                     );
                 }
             } else if let modal::ActiveModal::UsageInfo { state } = active_modal {
-                crate::views::usage_modal::render_usage_modal(
-                    buf,
-                    area,
-                    state,
-                    self.credit_balance.as_ref(),
-                    compact,
-                    &theme,
-                );
+                crate::views::usage_modal::render_usage_modal(buf, area, state, compact, &theme);
             } else if let modal::ActiveModal::MemoryBrowser { state: mem_state } = active_modal {
                 crate::views::memory_modal::render_memory_modal(buf, area, mem_state, compact);
             } else if let modal::ActiveModal::Settings {
@@ -3062,10 +3047,7 @@ mod command_palette_vim_input_tests {
     // Open the command palette exactly as the Ctrl+P handler does: type-to-find INPUT mode (`input_active`) over the full palette entries
     fn open_command_palette(agent: &mut AgentView) {
         agent.active_modal = Some(ActiveModal::CommandPalette {
-            entries: crate::views::modal::default_palette_entries(
-                agent.sharing_enabled,
-                &agent.prompt.slash_controller,
-            ),
+            entries: crate::views::modal::default_palette_entries(&agent.prompt.slash_controller),
             state: PickerState::input_active(),
             window: crate::views::modal_window::ModalWindowState::new(),
         });
@@ -3094,10 +3076,7 @@ mod command_palette_vim_input_tests {
             .prompt
             .set_screen_mode(crate::app::ScreenMode::Minimal);
         agent.active_modal = Some(ActiveModal::CommandPalette {
-            entries: crate::views::modal::default_palette_entries(
-                agent.sharing_enabled,
-                &agent.prompt.slash_controller,
-            ),
+            entries: crate::views::modal::default_palette_entries(&agent.prompt.slash_controller),
             state: {
                 let mut state = PickerState::input_active();
                 state.set_query("keyboard shortcuts");
@@ -3152,10 +3131,7 @@ mod command_palette_vim_input_tests {
             .set_screen_mode(crate::app::ScreenMode::Minimal);
         agent.prompt.set_text("keep this draft");
         agent.active_modal = Some(ActiveModal::CommandPalette {
-            entries: crate::views::modal::default_palette_entries(
-                agent.sharing_enabled,
-                &agent.prompt.slash_controller,
-            ),
+            entries: crate::views::modal::default_palette_entries(&agent.prompt.slash_controller),
             state: {
                 let mut state = PickerState::input_active();
                 // Contiguous substring of the label ("Edit Prompt in External Editor").

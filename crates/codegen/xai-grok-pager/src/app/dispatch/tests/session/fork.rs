@@ -393,75 +393,6 @@ fn slash_new_uses_worktree_cwd() {
 }
 
 #[test]
-fn auth_complete_dispatches_deferred_worktree() {
-    let mut app = test_app();
-    app.cwd_has_git_ancestor = true;
-    app.auth_state = AuthState::Authenticating {
-        request_seq: 1,
-        handle: None,
-        auth_url: None,
-        mode: AuthMode::Pending,
-    };
-    app.deferred_startup.worktree = true;
-
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::AuthComplete {
-            request_seq: 1,
-            meta: None,
-        }),
-        &mut app,
-    );
-
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::CreateWorktreeSession { .. }))
-    );
-    assert!(!app.deferred_startup.worktree);
-}
-
-#[test]
-fn auth_complete_resume_plus_worktree_creates_worktree_with_session() {
-    let mut app = test_app();
-    app.cwd_has_git_ancestor = true;
-    app.auth_state = AuthState::Authenticating {
-        request_seq: 1,
-        handle: None,
-        auth_url: None,
-        mode: AuthMode::Pending,
-    };
-    app.deferred_startup.session =
-        Some(crate::app::session_startup::DeferredSessionStartup::Load {
-            session_id: "test-session".into(),
-            session_cwd: None,
-            chat_kind: false,
-        });
-    app.deferred_startup.worktree = true;
-
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::AuthComplete {
-            request_seq: 1,
-            meta: None,
-        }),
-        &mut app,
-    );
-
-    // --resume and --worktree together: CreateWorktreeSession with the session ID
-    assert!(effects.iter().any(|e| matches!(
-        e,
-        Effect::CreateWorktreeSession {
-            load_session_id: Some(_),
-            ..
-        }
-    )));
-    assert!(
-        !effects
-            .iter()
-            .any(|e| matches!(e, Effect::LoadSession { .. }))
-    );
-}
-
-#[test]
 fn dispatch_fork_from_welcome_toasts_and_returns_no_effect() {
     let mut app = fork_test_app();
     app.active_view = ActiveView::Welcome;
@@ -935,36 +866,9 @@ fn dispatch_fork_inherits_appearance_sharing_and_plugin_visibility() {
     app.sharing_enabled = false;
     app.usage_visible = false;
     app.appearance.disable_plugins = true;
-    // Cached billing state must be inherited so the credits warning is correct from the first frame (not just after a billing fetch)
-    app.credit_balance = Some(crate::views::credit_bar::CreditBalance {
-        prepaid_balance_cents: Some(1500),
-        ..test_bal(50.0)
-    });
-    app.auto_topup = Some(crate::views::credit_bar::AutoTopupInfo {
-        enabled: true,
-        topup_amount_cents: Some(2000),
-        max_amount_cents: None,
-    });
     dispatch(Action::Fork(fork_args(Some(false), None)), &mut app);
     let new_agent = app.agents.get(&AgentId(1)).unwrap();
     assert!(!new_agent.sharing_enabled);
-    assert!(
-        new_agent
-            .prompt
-            .slash_controller
-            .registry()
-            .get("usage")
-            .is_some()
-    );
-    assert!(!new_agent.billing_surface_visible);
-    assert_eq!(
-        new_agent
-            .credit_balance
-            .as_ref()
-            .and_then(|b| b.prepaid_balance_cents),
-        Some(1500)
-    );
-    assert!(new_agent.auto_topup.as_ref().is_some_and(|at| at.enabled));
 }
 
 #[test]

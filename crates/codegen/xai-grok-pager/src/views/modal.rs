@@ -373,10 +373,7 @@ pub enum PaletteCommand {
     OpenFeedbackModal,
 }
 /// Build the default set of palette entries with section grouping.
-pub(crate) fn default_palette_entries(
-    sharing_enabled: bool,
-    slash: &crate::slash::SlashController,
-) -> Vec<PaletteEntry> {
+pub(crate) fn default_palette_entries(slash: &crate::slash::SlashController) -> Vec<PaletteEntry> {
     let screen_mode = slash.screen_mode();
     let mut entries = vec![
         PaletteEntry {
@@ -413,11 +410,6 @@ pub(crate) fn default_palette_entries(
             label: "Resume Session".into(),
             shortcut: "/resume".into(),
             command: PaletteCommand::SlashCommand("/resume".into()),
-        },
-        PaletteEntry {
-            label: "Share Session".into(),
-            shortcut: "/share".into(),
-            command: PaletteCommand::SlashCommand("/share".into()),
         },
         PaletteEntry {
             label: "Rename Session".into(),
@@ -577,11 +569,6 @@ pub(crate) fn default_palette_entries(
         },
     ];
     entries.retain(|entry| {
-        if !sharing_enabled
-            && matches!(&entry.command, PaletteCommand::SlashCommand(s) if s.trim() == "/share")
-        {
-            return false;
-        }
         if let PaletteCommand::SlashCommand(text) = &entry.command
             && let Some(invocation) = crate::slash::parse_invocation(text.trim())
             && !slash
@@ -591,16 +578,9 @@ pub(crate) fn default_palette_entries(
         {
             return false;
         }
-        // oc-build: opencode backend; drop tabs and commands opencode has no equivalent for.
+        // oc-build: opencode backend; drop tabs opencode has no equivalent for.
         if let PaletteCommand::OpenExtensionsTab(tab) = &entry.command
             && !crate::views::extensions_modal::ExtensionsTab::shown().contains(tab)
-        {
-            return false;
-        }
-        if crate::acp::opencode_shim::is_active()
-            && let PaletteCommand::SlashCommand(text) = &entry.command
-            && let Some(invocation) = crate::slash::parse_invocation(text.trim())
-            && crate::acp::opencode_shim::is_unavailable_command(invocation.token)
         {
             return false;
         }
@@ -619,10 +599,9 @@ pub(crate) fn default_palette_entries(
 /// Filter palette entries for search, preserving section headers when any item in the section matches.
 pub(crate) fn filter_palette_entries(
     query: &str,
-    sharing_enabled: bool,
     slash: &crate::slash::SlashController,
 ) -> Vec<PaletteEntry> {
-    let all = default_palette_entries(sharing_enabled, slash);
+    let all = default_palette_entries(slash);
     let query_lower = query.to_lowercase();
     if query_lower.is_empty() {
         return all;
@@ -1328,11 +1307,6 @@ mod doc_viewer_scroll_tests {
 #[cfg(test)]
 mod palette_sharing_tests {
     use super::*;
-    fn has_share(entries: &[PaletteEntry]) -> bool {
-        entries
-            .iter()
-            .any(|e| matches!(&e.command, PaletteCommand::SlashCommand(s) if s.trim() == "/share"))
-    }
     fn slash(mode: crate::app::ScreenMode) -> crate::slash::SlashController {
         let mut controller =
             crate::slash::SlashController::with_builtins(std::path::PathBuf::from("."));
@@ -1340,16 +1314,8 @@ mod palette_sharing_tests {
         controller
     }
     #[test]
-    fn default_palette_includes_share_when_enabled() {
-        let entries = default_palette_entries(true, &slash(crate::app::ScreenMode::Fullscreen));
-        assert!(
-            has_share(&entries),
-            "/share should be present when sharing_enabled=true"
-        );
-    }
-    #[test]
     fn default_palette_includes_dashboard() {
-        let entries = default_palette_entries(true, &slash(crate::app::ScreenMode::Fullscreen));
+        let entries = default_palette_entries(&slash(crate::app::ScreenMode::Fullscreen));
         let has_dashboard = entries.iter().any(
             |e| matches!(&e.command, PaletteCommand::SlashCommand(s) if s.trim() == "/dashboard"),
         );
@@ -1364,7 +1330,7 @@ mod palette_sharing_tests {
         );
     }
     fn slash_rows(mode: crate::app::ScreenMode) -> Vec<String> {
-        default_palette_entries(true, &slash(mode))
+        default_palette_entries(&slash(mode))
             .into_iter()
             .filter_map(|entry| match entry.command {
                 PaletteCommand::SlashCommand(text) => Some(text.trim().to_string()),
@@ -1391,23 +1357,6 @@ mod palette_sharing_tests {
         }
     }
     #[test]
-    fn workflows_hub_row_survives_minimal() {
-        for mode in [
-            crate::app::ScreenMode::Minimal,
-            crate::app::ScreenMode::Fullscreen,
-        ] {
-            let entries = default_palette_entries(true, &slash(mode));
-            assert!(
-                entries.iter().any(|e| e.label == "Workflows"),
-                "hub row missing in {mode:?}"
-            );
-            assert!(
-                !entries.iter().any(|e| e.label == "Workflow Runs"),
-                "Workflow Runs must stay off the palette in {mode:?}"
-            );
-        }
-    }
-    #[test]
     fn every_palette_slash_row_resolves_to_a_registered_command() {
         let builtins = crate::slash::commands::builtin_commands();
         for row in slash_rows(crate::app::ScreenMode::Fullscreen) {
@@ -1425,7 +1374,7 @@ mod palette_sharing_tests {
     #[test]
     fn edit_prompt_palette_entry_shows_mode_correct_hint() {
         let hint = |mode| {
-            default_palette_entries(true, &slash(mode))
+            default_palette_entries(&slash(mode))
                 .into_iter()
                 .find(|entry| matches!(entry.command, PaletteCommand::EditPromptExternal))
                 .expect("palette offers the external editor in every mode")
@@ -1435,46 +1384,12 @@ mod palette_sharing_tests {
         assert_eq!(hint(crate::app::ScreenMode::Fullscreen), "/edit-prompt");
     }
     #[test]
-    fn default_palette_omits_share_when_disabled() {
-        let entries = default_palette_entries(false, &slash(crate::app::ScreenMode::Fullscreen));
-        assert!(
-            !has_share(&entries),
-            "/share must not appear in palette when sharing_enabled=false"
-        );
-    }
-    #[test]
-    fn filter_palette_omits_share_when_disabled() {
-        let entries = filter_palette_entries("", false, &slash(crate::app::ScreenMode::Fullscreen));
-        assert!(
-            !has_share(&entries),
-            "/share must not appear in unfiltered palette when sharing_enabled=false"
-        );
-        let entries =
-            filter_palette_entries("share", false, &slash(crate::app::ScreenMode::Fullscreen));
-        assert!(
-            !has_share(&entries),
-            "/share must not appear when filtering for 'share' with sharing_enabled=false"
-        );
-    }
-    #[test]
-    fn filter_palette_includes_share_when_enabled_and_matched() {
-        let entries =
-            filter_palette_entries("share", true, &slash(crate::app::ScreenMode::Fullscreen));
-        assert!(
-            has_share(&entries),
-            "/share should match a 'share' query when sharing_enabled=true"
-        );
-    }
-    #[test]
     fn palette_tools_section_routes_each_tab_to_itself() {
         use crate::views::extensions_modal::ExtensionsTab;
-        let entries = default_palette_entries(true, &slash(crate::app::ScreenMode::Fullscreen));
+        let entries = default_palette_entries(&slash(crate::app::ScreenMode::Fullscreen));
         for (label, expected) in [
-            ("Hooks", ExtensionsTab::Hooks),
             ("Plugins", ExtensionsTab::Plugins),
-            ("Marketplace", ExtensionsTab::Marketplace),
             ("Skills", ExtensionsTab::Skills),
-            ("Workflows", ExtensionsTab::Workflows),
             ("MCP Servers", ExtensionsTab::McpServers),
         ] {
             let entry = entries
@@ -1489,7 +1404,7 @@ mod palette_sharing_tests {
                 "Tools entry {label:?} dispatches to the wrong tab",
             );
         }
-        let positions: Vec<usize> = ExtensionsTab::ALL
+        let positions: Vec<usize> = ExtensionsTab::shown()
             .iter()
             .map(|tab| {
                 entries

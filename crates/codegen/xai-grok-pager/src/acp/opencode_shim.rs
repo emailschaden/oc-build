@@ -60,9 +60,6 @@ pub const DEFAULT_MODEL: &str = "opencode/big-pickle";
 /// Server URL when neither `--opencode-url`, `OPENCODE_URL` nor `[opencode] url` is set
 /// (`opencode serve`'s default port).
 pub const DEFAULT_URL: &str = "http://127.0.0.1:4096";
-/// Auth method advertised so the pager's eager-auth step succeeds without a login screen
-/// (an empty list is treated as "needs login").
-const AUTH_METHOD_ID: &str = "opencode";
 /// Sent with a reject that has no typed feedback. opencode ends the run on a bare
 /// reject; with a message the model gets it as the tool error and continues.
 const DEFAULT_REJECT_MESSAGE: &str =
@@ -76,83 +73,8 @@ const EXECUTE_PLAN_PROMPT: &str = "The user approved the plan. Implement it now.
 /// How long a cancelled turn waits for `session.execution.interrupted` before giving up.
 const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
 
-/// Builtin slash commands with no opencode equivalent (canonical names). In opencode mode
-/// they are left out of the completion menu, and a typed one shows
-/// [`unavailable_message`] instead of running.
-pub const UNAVAILABLE_COMMANDS: &[&str] = &[
-    "login",
-    "logout",
-    "usage",
-    "privacy",
-    "feedback",
-    "marketplace",
-    "hooks",
-    "workflows",
-    "workflow",
-    "remember",
-    "context-window",
-    // Dictation goes to the xAI voice service.
-    "voice",
-];
 /// Error message for the `x.ai/*` list calls of features opencode can back later.
 const NOT_YET_MESSAGE: &str = "not available in opencode mode yet";
-
-static ACTIVE: OnceLock<()> = OnceLock::new();
-
-/// Mark the process as running against opencode. Called first thing by every entry point
-/// that starts the shim (TUI and headless), so it is always set in a real run.
-pub fn set_active() {
-    let _ = ACTIVE.set(());
-}
-
-/// True once the TUI or headless run has started; opencode is the only backend.
-/// TODO(oc-build PR b): drop this flag together with the xAI-only features it hides. It
-/// stays a runtime flag (not `true`) only so their unit tests, deleted in (b), keep running.
-pub fn is_active() -> bool {
-    ACTIVE.get().is_some()
-}
-
-/// True for a builtin command (canonical name) that has no opencode equivalent.
-pub fn is_unavailable_command(name: &str) -> bool {
-    UNAVAILABLE_COMMANDS.contains(&name)
-}
-
-/// Shown when the user types a command from [`UNAVAILABLE_COMMANDS`] in full.
-pub fn unavailable_message(name: &str) -> String {
-    format!("/{name} is not available in opencode mode")
-}
-
-/// True for a pager effect that only calls an xAI-only `x.ai/*` method (account, billing,
-/// consent, suggestions, bundle sync, marketplace, hooks, workflows), or that would save an
-/// opencode model id or effort into `~/.grok/config.toml`, which the built-in agent shares
-/// (preferred model, `default_model`, `fork_secondary_model`). In opencode mode the effect
-/// runner drops these, so they never reach the shim or the config file.
-pub(crate) fn skips_effect(effect: &crate::app::actions::Effect) -> bool {
-    use crate::app::actions::Effect;
-    matches!(
-        effect,
-        Effect::CheckSubscription { .. }
-            | Effect::HydrateTeamCapability { .. }
-            | Effect::CreditLimitRecheck { .. }
-            // Background refreshes only; a usage modal waiting on a nonce still gets its error.
-            | Effect::FetchBilling { silent: true, nonce: 0, .. }
-            | Effect::FetchAppBilling { nonce: 0 }
-            | Effect::RecordConsentUpstream { .. }
-            | Effect::FetchShellSuggestions { .. }
-            | Effect::FetchPromptSuggestion { .. }
-            | Effect::FetchBundleStatus
-            | Effect::FetchMarketplaceList { .. }
-            | Effect::FetchPluginCtaCatalog { .. }
-            | Effect::CheckMarketplaceUpdates { .. }
-            | Effect::FetchHooksList { .. }
-            | Effect::FetchWorkflowsList { .. }
-            | Effect::PersistPreferredModel { .. }
-            | Effect::PersistSetting {
-                key: "default_model" | "fork_secondary_model",
-                ..
-            }
-    )
-}
 
 /// Where and how to reach the opencode server.
 #[derive(Debug, Clone)]
@@ -175,15 +97,14 @@ pub fn resolve_server_url(cli: Option<&str>, config: Option<&str>) -> String {
         .to_owned()
 }
 
-/// Spawn the shim and run the standard initialize/authenticate sequence against it.
+/// Spawn the shim and send it the standard `initialize`.
 pub async fn connect(
     cancel: &CancellationToken,
     flags: ConnectFlags,
     config: OpencodeConfig,
 ) -> Result<AcpConnection> {
     let spawned = spawn_opencode_shim(cancel, config).await?;
-    let auth_manager = spawned.auth_manager.clone();
-    initialize_connection(AgentEndpoint::from(spawned), &flags, auth_manager).await
+    initialize_connection(AgentEndpoint::from(spawned), &flags).await
 }
 
 /// Start the shim on its own runtime thread and return the raw ACP channel pair
@@ -205,13 +126,6 @@ pub(crate) async fn spawn_opencode_shim(
         )
     })?;
     let directory = std::env::current_dir().context("failed to resolve cwd")?;
-    // Inert: constructed only because `SpawnedAgent` carries one. No refresher or
-    // refresh loop is started, so it never talks to xAI.
-    let auth_manager = std::sync::Arc::new(xai_grok_login::AuthManager::new_with_proxy_base_url(
-        &xai_grok_shell::util::grok_home::grok_home(),
-        xai_grok_login::GrokComConfig::default(),
-        xai_grok_shell::agent::config::EndpointsConfig::default().proxy_url(),
-    ));
     ext_log(&format!(
         "shim start url={} model={} dir={}",
         config.url,
@@ -253,7 +167,6 @@ pub(crate) async fn spawn_opencode_shim(
         thread_handle: handle,
         channel: acp_client,
         cancel: agent_cancel,
-        auth_manager,
     })
 }
 
@@ -1017,12 +930,7 @@ impl acp::Agent for ShimAgent {
             // No server-side rewind; keep the cancelled turn on screen.
             "cancelRewind": false,
         });
-        Ok(acp::InitializeResponse::new(acp::ProtocolVersion::V1)
-            .auth_methods(vec![acp::AuthMethod::Agent(acp::AuthMethodAgent::new(
-                AUTH_METHOD_ID,
-                "opencode server",
-            ))])
-            .meta(meta.as_object().cloned()))
+        Ok(acp::InitializeResponse::new(acp::ProtocolVersion::V1).meta(meta.as_object().cloned()))
     }
 
     async fn authenticate(

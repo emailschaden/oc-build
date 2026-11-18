@@ -1105,7 +1105,6 @@ impl AgentView {
         {
             self.active_modal = Some(crate::views::modal::ActiveModal::CommandPalette {
                 entries: crate::views::modal::default_palette_entries(
-                    self.sharing_enabled,
                     &self.prompt.slash_controller,
                 ),
                 state: crate::views::picker::PickerState::input_active(),
@@ -1256,7 +1255,6 @@ impl AgentView {
             ActionId::CommandPalette => {
                 self.active_modal = Some(crate::views::modal::ActiveModal::CommandPalette {
                     entries: crate::views::modal::default_palette_entries(
-                        self.sharing_enabled,
                         &self.prompt.slash_controller,
                     ),
                     state: crate::views::picker::PickerState::input_active(),
@@ -1662,10 +1660,6 @@ mod btw_focus_tests {
                 crate::views::usage_modal::UsageInfoTab::SessionInfo,
                 crate::views::usage_modal::UsageInfoContext {
                     session_id: Some("s".into()),
-                    usage_visible: true,
-                    chat_kind: false,
-                    billing_redirect_url: None,
-                    subscription_tier: None,
                 },
             )),
         }
@@ -2124,10 +2118,7 @@ mod focus_gained_restore_tests {
         agent.session.state = AgentState::TurnRunning;
         with_permission(&mut agent);
         agent.active_modal = Some(ActiveModal::CommandPalette {
-            entries: crate::views::modal::default_palette_entries(
-                false,
-                &agent.prompt.slash_controller,
-            ),
+            entries: crate::views::modal::default_palette_entries(&agent.prompt.slash_controller),
             state: crate::views::picker::PickerState::input_active(),
             window: crate::views::modal_window::ModalWindowState::new(),
         });

@@ -1,6 +1,6 @@
 //! Headless single-turn mode (`grok -p "prompt"`).
 //!
-//! Runs the agent in-process and drives the ACP lifecycle (init, auth, session, prompt).
+//! Runs the agent in-process and drives the ACP lifecycle (init, session, prompt).
 //! Streams to stdout and exits via `CancellationToken`.
 use crate::acp::model_state::{EffortTokenError, ModelState};
 use crate::acp::spawn::AgentShutdownGuard;
@@ -25,7 +25,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use xai_acp_lib::{AcpAgentTx, AcpClientMessageBox, AcpClientRx, acp_send};
-use xai_grok_shell::agent::auth_method::AuthMethodKind;
 use xai_grok_shell::agent::config::Config as AgentConfig;
 use xai_grok_shell::extensions::memory::MemoryFlushResponse;
 use xai_grok_shell::extensions::task::{CancelSubagentRequest, KillTaskRequest};
@@ -411,51 +410,6 @@ fn auto_respond_to_permissions(
     }
     None
 }
-/// "Not signed in" error message, tailored to the session type.
-fn auth_required_message(interactive: bool) -> String {
-    if interactive {
-        "Not signed in. Run `grok login` to authenticate \
-         (or `grok login --device-code` if no browser is available)."
-            .to_string()
-    } else {
-        "Not signed in. To authenticate without a browser, run:\n  \
-         grok login --device-code\n\n\
-         Alternatively, set the XAI_API_KEY environment variable \
-         or run `grok login` on a machine with a browser."
-            .to_string()
-    }
-}
-/// The same backend switch the TUI applies; the shell unless another backend is enabled.
-/// Authenticate via the agent's `defaultAuthMethodId`, failing closed when none is available.
-/// Returns whether the selected method is API-key auth.
-async fn authenticate(
-    acp_tx: &AcpAgentTx,
-    auths: &[acp::AuthMethod],
-    default_auth_method_id: Option<&acp::AuthMethodId>,
-) -> anyhow::Result<bool> {
-    let method_id = crate::acp::select_eager_auth_method(auths, default_auth_method_id)
-        .ok_or_else(|| {
-            use std::io::IsTerminal;
-            let interactive = std::io::stdin().is_terminal()
-                && !xai_grok_shell::util::clipboard::is_remote_session();
-            anyhow::anyhow!("{}", auth_required_message(interactive))
-        })?;
-    let kind = AuthMethodKind::from_id(&method_id);
-    if kind.needs_interactive_login() {
-        use std::io::IsTerminal;
-        let interactive =
-            std::io::stdin().is_terminal() && !xai_grok_shell::util::clipboard::is_remote_session();
-        anyhow::bail!("{}", auth_required_message(interactive));
-    }
-    let is_api_key_auth = kind.is_api_key();
-    let _resp: acp::AuthenticateResponse = acp_send(
-        acp::AuthenticateRequest::new(method_id)
-            .meta(serde_json::json!({"headless": true}).as_object().cloned()),
-        acp_tx,
-    )
-    .await?;
-    Ok(is_api_key_auth)
-}
 fn build_headless_init_request(
     rules: Option<&str>,
     system_prompt_override: Option<&str>,
@@ -799,7 +753,6 @@ pub async fn run_single_turn(
     verbatim: bool,
     options: HeadlessOptions,
 ) -> Result<()> {
-    crate::acp::opencode_shim::set_active(); // oc-build: opencode backend
     let signals = HeadlessSignals::install().await?;
     xai_grok_shell::http::set_process_client_mode_headless();
     let cwd = match options.cwd {
@@ -870,27 +823,8 @@ pub async fn run_single_turn(
         elapsed_ms = t_spawn.elapsed().as_millis() as u64,
         "headless: spawn + initialize complete"
     );
-    let t_auth = Instant::now();
-    xai_grok_telemetry::startup::enter(crate::acp::StartupPhase::EagerAuth);
-    let default_auth_method_id = crate::acp::parse_default_auth_method_id(init_resp.meta.as_ref());
-    let is_api_key_auth = match authenticate(
-        &acp_tx,
-        &init_resp.auth_methods,
-        default_auth_method_id.as_ref(),
-    )
-    .await
-    {
-        Ok(is_api_key) => is_api_key,
-        Err(e) => {
-            report_startup_failure(&timer);
-            emitter.on_error(&e.to_string(), None);
-            return Err(e);
-        }
-    };
-    tracing::debug!(
-        elapsed_ms = t_auth.elapsed().as_millis() as u64,
-        "headless: authenticate complete"
-    );
+    // oc-build: opencode backend; no xAI authenticate step.
+    let is_api_key_auth = false;
     timer.emit_telemetry(
         crate::acp::AgentKind::Embedded,
         crate::acp::StartupOutcome::Ok,

@@ -343,10 +343,6 @@ pub struct PromptInfo<'a> {
     pub flags: &'a [PromptFlag<'a>],
     /// Whether multiline mode is active (shown right-aligned).
     pub multiline: bool,
-    /// Optional usage warning displayed right-aligned (e.g. "5% usage left").
-    pub usage_warning: Option<&'a str>,
-    /// When true the warning uses the yellow warning color (5% or less left); when false it uses dim grey text (5-10% left).
-    pub usage_warning_critical: bool,
 }
 
 impl PromptInfo<'_> {
@@ -354,7 +350,6 @@ impl PromptInfo<'_> {
         self.model_name.is_empty()
             && self.flags.is_empty()
             && !self.multiline
-            && self.usage_warning.is_none()
     }
 }
 
@@ -1303,12 +1298,6 @@ impl PromptWidget {
         self.slash_controller.set_auto_mode_available(available);
     }
 
-    /// Replace the restricted slash-command deny list (see [`crate::slash::registry::CommandRegistry::set_restricted_commands`]).
-    pub(crate) fn set_restricted_commands(&mut self, names: &[String]) {
-        self.slash_controller
-            .registry_mut()
-            .set_restricted_commands(names);
-    }
 
     /// Access the current slash snapshot (for dropdown rendering).
     pub fn slash_snapshot(&self) -> crate::slash::SlashSnapshot {
@@ -3551,16 +3540,7 @@ impl PromptWidget {
         // the bottom-border fill. That gives 1 cell of visual padding on each side.
         let pad_style = Style::default().bg(bg);
         let mut left_spans = vec![Span::styled(" ", pad_style)];
-        if let Some(warning) = info.usage_warning {
-            let fg = if info.usage_warning_critical {
-                theme.warning
-            } else {
-                sep_fg
-            };
-            let warning_style = Style::default().fg(fg).bg(bg);
-            left_spans.push(Span::styled(warning.to_owned(), warning_style));
-        }
-        let mut needs_sep = info.usage_warning.is_some();
+        let mut needs_sep = false;
         if !info.model_name.is_empty() {
             if needs_sep {
                 left_spans.push(Span::styled(" · ", sep_style));

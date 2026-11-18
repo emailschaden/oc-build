@@ -2685,65 +2685,6 @@ mod extensions_action_target_tests {
         assert_eq!(state.picker_state.query(), "");
     }
 
-    /// Marketplace plugin row + `i` dispatches Install; the search query stays untouched.
-    #[test]
-    fn marketplace_plugin_row_install_key_dispatches_through_pipeline() {
-        let mut agent = marketplace_modal_agent();
-        press(&mut agent, KeyCode::Down); // source header -> first plugin row (alphabetical)
-        let outcome = press(&mut agent, KeyCode::Char('i'));
-        assert_marketplace_install_dispatched(outcome, &agent, "plugins/other-plugin");
-    }
-
-    /// Marketplace plugin row + `x`: removal is a source verb, so the row hint says so instead
-    /// of prompting to remove the parent source out from under the plugin.
-    #[test]
-    fn marketplace_plugin_row_remove_source_prompts_for_source_row() {
-        let mut agent = marketplace_modal_agent();
-        press(&mut agent, KeyCode::Down); // source header -> first plugin row
-        let outcome = press(&mut agent, KeyCode::Char('x'));
-        assert!(matches!(
-            outcome,
-            crate::app::app_view::InputOutcome::Changed
-        ));
-        let state = agent.extensions_modal.as_ref().unwrap();
-        assert_eq!(
-            state.modal_message,
-            Some(crate::views::extensions_modal::ModalMessage::Info(
-                "Select a source row to remove source.".to_string()
-            ))
-        );
-        assert_eq!(state.picker_state.query(), "");
-    }
-
-    /// Marketplace source row + a per-plugin key: the key stays bound while the footer hides it,
-    /// so a press posts the row hint naming the action instead of a silent no-op.
-    #[test]
-    fn marketplace_source_row_plugin_actions_prompt_for_plugin_row() {
-        for (key_char, verb) in [('i', "install"), ('u', "update"), ('d', "uninstall")] {
-            let mut agent = marketplace_modal_agent();
-            // Selection starts on the source header row.
-            let outcome = press(&mut agent, KeyCode::Char(key_char));
-            assert!(
-                matches!(outcome, crate::app::app_view::InputOutcome::Changed),
-                "{key_char}: no dispatch from a source row"
-            );
-            let state = agent.extensions_modal.as_ref().unwrap();
-            assert_eq!(
-                state.modal_message,
-                Some(crate::views::extensions_modal::ModalMessage::Info(format!(
-                    "Select a plugin row to {verb}."
-                ))),
-                "{key_char}: expected explicit feedback naming the action"
-            );
-            assert_eq!(state.pending_action, None);
-            assert_eq!(
-                state.picker_state.query(),
-                "",
-                "{key_char}: the action key must not become search input"
-            );
-        }
-    }
-
     /// Plugins modal with one grouped plugin (group header row + plugin row).
     fn plugins_modal_agent() -> super::AgentView {
         let mut modal = ExtensionsModalState::new(ExtensionsTab::Plugins);
@@ -2872,7 +2813,7 @@ mod extensions_action_target_tests {
             press(&mut agent, KeyCode::Down); // boundary: tab bar
             assert_tab_bar_focused(&agent);
             press(&mut agent, forward);
-            assert_on_tab(&agent, ExtensionsTab::Marketplace, "forward");
+            assert_on_tab(&agent, ExtensionsTab::Skills, "forward");
             press(&mut agent, backward);
             assert_on_tab(&agent, ExtensionsTab::Plugins, "backward");
         }
@@ -2883,7 +2824,12 @@ mod extensions_action_target_tests {
     /// focus indicators while the arrows follow the bar.
     #[test]
     fn mouse_tab_switch_focuses_the_list_not_the_tab_bar() {
-        let tab_index = |tab| ExtensionsTab::ALL.iter().position(|t| *t == tab).unwrap();
+        let tab_index = |tab| {
+            ExtensionsTab::shown()
+                .iter()
+                .position(|t| *t == tab)
+                .unwrap()
+        };
         let left_down = |column, row| crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column,
@@ -2910,19 +2856,19 @@ mod extensions_action_target_tests {
         };
 
         let mut agent = tab_bar_focused_agent();
-        let hooks_tab = agent
+        let skills_tab = agent
             .extensions_modal
             .as_ref()
             .unwrap()
             .window
             .tab_rects
-            .get(tab_index(ExtensionsTab::Hooks))
+            .get(tab_index(ExtensionsTab::Skills))
             .copied()
             .flatten()
-            .expect("Hooks tab rect");
-        agent.handle_extensions_modal_mouse(&left_down(hooks_tab.x, hooks_tab.y));
+            .expect("Skills tab rect");
+        agent.handle_extensions_modal_mouse(&left_down(skills_tab.x, skills_tab.y));
         render_modal(&mut agent);
-        assert_list_focused(&agent, ExtensionsTab::Hooks, "tab label click");
+        assert_list_focused(&agent, ExtensionsTab::Skills, "tab label click");
 
         let mut agent = tab_bar_focused_agent();
         let tab_hint = agent
@@ -2937,9 +2883,9 @@ mod extensions_action_target_tests {
             .expect("footer `Tab tabs` hint");
         agent.handle_extensions_modal_mouse(&left_down(tab_hint.x, tab_hint.y));
         render_modal(&mut agent);
-        let tabs = ExtensionsTab::ALL;
+        let tabs = ExtensionsTab::shown();
         let next = match tabs.len() {
-            0 => panic!("ExtensionsTab::ALL is empty"),
+            0 => panic!("ExtensionsTab::shown() is empty"),
             n => *tabs
                 .get((tab_index(ExtensionsTab::Plugins) + 1) % n)
                 .unwrap_or_else(|| panic!("next extensions tab")),
@@ -2972,54 +2918,6 @@ mod extensions_action_target_tests {
         }
     }
 
-    /// Hooks and Skills group headers advertise Space in the footer too, so they post the same
-    /// row hint as the Plugins/Marketplace headers instead of a silent no-op.
-    #[test]
-    fn hook_and_skill_toggle_on_group_header_posts_row_hint() {
-        let mut hooks = ExtensionsModalState::new(ExtensionsTab::Hooks);
-        hooks.hooks_data = TabDataState::Loaded(xai_hooks_plugins_types::HooksListResponse {
-            hooks: vec![hook_info("src/hook-a", "/tmp/hooks", false)],
-            project_trusted: true,
-            load_errors: Vec::new(),
-        });
-        let mut skills = ExtensionsModalState::new(ExtensionsTab::Skills);
-        skills.skills_data = TabDataState::Loaded(
-            vec![xai_grok_tools::implementations::skills::types::SkillInfo {
-                name: "my-skill".into(),
-                enabled: true,
-                ..Default::default()
-            }]
-            .into(),
-        );
-
-        for (noun, modal) in [("hook", hooks), ("skill", skills)] {
-            let mut agent = pipeline_agent(modal);
-            assert_eq!(
-                agent
-                    .extensions_modal
-                    .as_ref()
-                    .unwrap()
-                    .selected_data_index(),
-                None,
-                "{noun}: selection must start on the group header"
-            );
-            let outcome = press(&mut agent, KeyCode::Char(' '));
-            assert!(
-                matches!(outcome, crate::app::app_view::InputOutcome::Changed),
-                "{noun}: header row must not dispatch a toggle, got {outcome:?}"
-            );
-            let state = agent.extensions_modal.as_ref().unwrap();
-            assert_eq!(
-                state.modal_message,
-                Some(crate::views::extensions_modal::ModalMessage::Info(format!(
-                    "Select a {noun} row to enable/disable."
-                ))),
-                "{noun}"
-            );
-            assert_eq!(state.pending_action, None, "{noun}");
-        }
-    }
-
     /// With no plugin row to point at (nothing installed, a filter hiding everything, no sources,
     /// or a source header whose scan failed or found nothing) a row-scoped key stays silent
     /// instead of posting a hint that swallows the next keypress.
@@ -3034,30 +2932,10 @@ mod extensions_action_target_tests {
                 plugins: vec![plugin_info("disabled-plugin", false)],
             });
         all_filtered_out.plugins_filter = crate::views::extensions_modal::StatusFilter::Enabled;
-        let marketplace = |sources| {
-            let mut modal = ExtensionsModalState::new(ExtensionsTab::Marketplace);
-            modal.marketplace_data =
-                TabDataState::Loaded(xai_hooks_plugins_types::MarketplaceListResponse { sources });
-            modal
-        };
-        let source = |error: Option<&str>| xai_hooks_plugins_types::MarketplaceScanResult {
-            source_name: "qa-source".into(),
-            source_kind: "git".into(),
-            source_url_or_path: "https://example.com/plugins.git".into(),
-            plugins: vec![],
-            error: error.map(Into::into),
-        };
 
         for (label, modal, key_char) in [
             ("no plugins", no_plugins, 'u'),
             ("all filtered out", all_filtered_out, 'u'),
-            ("no sources", marketplace(vec![]), 'i'),
-            (
-                "errored source header",
-                marketplace(vec![source(Some("clone failed"))]),
-                'i',
-            ),
-            ("empty source header", marketplace(vec![source(None)]), 'i'),
         ] {
             let mut agent = pipeline_agent(modal);
             let outcome = press(&mut agent, KeyCode::Char(key_char));
@@ -3407,24 +3285,6 @@ mod extensions_action_target_tests {
         modal
     }
 
-    #[test]
-    fn hook_toggle_resolves_single_hook_when_group_expanded() {
-        let modal = hooks_modal(vec![
-            hook_info("src/hook-a", "/tmp/hooks", true),
-            hook_info("src/hook-b", "/tmp/hooks", false),
-        ]);
-
-        let (target, enabled) =
-            AgentView::extensions_action_target(&modal, &ButtonAction::ToggleSelectedHook);
-        assert_eq!(target.as_deref(), Some("src/hook-a"));
-        assert_eq!(enabled, Some(true));
-
-        let (target, enabled) =
-            AgentView::extensions_action_target(&modal, &ButtonAction::RemoveSelectedHook);
-        assert_eq!(target.as_deref(), Some("src/hook-a"));
-        assert_eq!(enabled, None);
-    }
-
     /// `x` on a source with a managed-policy member refuses without a confirm, even when the selected row is an unpinned sibling.
     #[test]
     fn remove_refuses_policy_source_without_confirm() {
@@ -3511,21 +3371,6 @@ mod extensions_action_target_tests {
         let expected_label = crate::views::extensions_modal::derive_source_label("/reg/user").0;
         assert_eq!(target.as_deref(), Some(expected_label.as_str()));
         assert_eq!(enabled, None);
-    }
-
-    #[test]
-    fn hook_toggle_resolves_group_state_when_group_collapsed() {
-        let mut modal = hooks_modal(vec![
-            hook_info("src/hook-a", "/tmp/hooks", true),
-            hook_info("src/hook-b", "/tmp/hooks", false),
-        ]);
-        modal.hooks_collapsed_groups.insert("/tmp/hooks".into());
-
-        let (target, enabled) =
-            AgentView::extensions_action_target(&modal, &ButtonAction::ToggleSelectedHook);
-        let expected_label = crate::views::extensions_modal::derive_source_label("/tmp/hooks").0;
-        assert_eq!(target.as_deref(), Some(expected_label.as_str()));
-        assert_eq!(enabled, Some(false));
     }
 
     /// Space on a hook row toggles that hook alone in the direction of its own state and marks the row pending; while its group sits in the collapsed set (a search query forces collapsed groups open) the same key toggles the whole source in the group's direction instead.
@@ -3745,7 +3590,7 @@ mod extensions_modal_search_key_tests {
             .extensions_modal
             .as_ref()
             .expect("Tab during search keeps the modal open");
-        assert_eq!(state.active_tab, ExtensionsTab::Marketplace);
+        assert_eq!(state.active_tab, ExtensionsTab::Skills);
         assert!(
             state.picker_state.search_active,
             "search stays active across a tab switch"
@@ -3767,7 +3612,7 @@ mod extensions_modal_search_key_tests {
 
         agent.handle_extensions_modal_key(&key(KeyCode::BackTab));
         let state = agent.extensions_modal.as_ref().unwrap();
-        assert_eq!(state.active_tab, ExtensionsTab::Hooks);
+        assert_eq!(state.active_tab, ExtensionsTab::McpServers);
         assert!(state.picker_state.search_active);
         assert_eq!(state.picker_state.query(), "g");
     }
@@ -3782,7 +3627,7 @@ mod extensions_modal_search_key_tests {
 
         agent.handle_extensions_modal_key(&shift_key(KeyCode::Tab));
         let state = agent.extensions_modal.as_ref().unwrap();
-        assert_eq!(state.active_tab, ExtensionsTab::Hooks);
+        assert_eq!(state.active_tab, ExtensionsTab::McpServers);
         assert!(state.picker_state.search_active);
         assert_eq!(state.picker_state.query(), "g");
     }
@@ -3795,7 +3640,7 @@ mod extensions_modal_search_key_tests {
         agent.handle_extensions_modal_key(&key(KeyCode::Char('/')));
         agent.handle_extensions_modal_key(&key(KeyCode::Tab));
         let state = agent.extensions_modal.as_ref().unwrap();
-        assert_eq!(state.active_tab, ExtensionsTab::Hooks);
+        assert_eq!(state.active_tab, ExtensionsTab::Plugins);
         assert!(state.picker_state.search_active);
     }
 }

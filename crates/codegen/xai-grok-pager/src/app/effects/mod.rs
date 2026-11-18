@@ -14,7 +14,7 @@ pub(super) use helpers::{
     parse_session_load_running_prompt_id, parse_session_memory_mode,
 };
 pub(crate) use helpers::{
-    EffectMeta, RestoreProgressMsg, SessionFlags, acp_send_bounded, compact_error,
+    RestoreProgressMsg, SessionFlags, acp_send_bounded, compact_error,
     is_disk_full_error, parse_worktree_restore_payload, parse_worktree_strategy_summary,
     persist_permission_mode_and_notify, persist_setting, sanitize_user_error,
 };
@@ -126,12 +126,7 @@ pub(crate) fn execute(
     cwd: &Path,
     session_flags: &SessionFlags,
     progress_tx: &tokio::sync::mpsc::UnboundedSender<RestoreProgressMsg>,
-) -> (bool, EffectMeta) {
-    let mut meta = EffectMeta::default();
-    // oc-build: opencode backend; xAI-only effects would only fetch `method_not_found`.
-    if crate::acp::opencode_shim::is_active() && crate::acp::opencode_shim::skips_effect(&effect) {
-        return (false, meta);
-    }
+) -> bool {
     let effect_is_send_now = matches!(effect, Effect::SendPromptNow { .. });
     match effect {
         Effect::RegisterActiveSession { session_id, cwd } => {
@@ -151,7 +146,7 @@ pub(crate) fn execute(
         }
         Effect::Quit => {
             ulog::info("pager quit", None, None);
-            return (true, meta);
+            return true;
         }
         Effect::ResetMouseReporting => {}
         Effect::SetWorkingDir { path } => {
@@ -168,67 +163,6 @@ pub(crate) fn execute(
                         outcome,
                     }
                 });
-        }
-        Effect::ScheduleClearAuthCopyFeedback { generation } => {
-            tasks
-                .spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    TaskResult::AuthCopyFeedbackTimeout {
-                        generation,
-                    }
-                });
-        }
-        Effect::Logout => {
-            let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    send_logout(&tx).await;
-                    TaskResult::LogoutComplete
-                });
-        }
-        Effect::CancelAuth { request_seq } => {
-            let tx = acp_tx.clone();
-            tasks.spawn(async move { send_auth_cancel(&tx, request_seq).await });
-        }
-        Effect::CheckSubscription { verify } => {
-            let tx = acp_tx.clone();
-            tasks.spawn(async move { send_check_subscription(&tx, verify).await });
-        }
-        Effect::HydrateTeamCapability { identity } => {
-            let tx = acp_tx.clone();
-            tasks
-                .spawn(async move { send_hydrate_team_capability(&tx, identity).await });
-        }
-        Effect::CreditLimitRecheck { agent_id } => {
-            let tx = acp_tx.clone();
-            tasks.spawn(async move { send_credit_limit_recheck(&tx, agent_id).await });
-        }
-        Effect::SchedulePaywallCheck => {
-            tasks
-                .spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    TaskResult::PaywallCheckTick
-                });
-        }
-        Effect::ScheduleGateVerifyTimeout { generation } => {
-            tasks
-                .spawn(async move {
-                    tokio::time::sleep(crate::app::subscription::GATE_VERIFY_TIMEOUT)
-                        .await;
-                    TaskResult::GateVerifyTimeout {
-                        generation,
-                    }
-                });
-        }
-        Effect::SwitchAccount { request_seq, method_id, use_oauth } => {
-            let tx = acp_tx.clone();
-            let abort_handle = tasks
-                .spawn(async move {
-                    send_logout(&tx).await;
-                    send_authenticate(&tx, request_seq, method_id, use_oauth, false)
-                        .await
-                });
-            meta.auth_abort_handle = Some((request_seq, abort_handle));
         }
         Effect::CreateSession {
             agent_id,
@@ -575,7 +509,7 @@ pub(crate) fn execute(
         }
         Effect::ScanForeignSessions { cwd, compat, grok_home, coordinator, seq } => {
             if coordinator.latest_seq() != seq {
-                return (false, meta);
+                return false;
             }
             let semaphore = coordinator.semaphore();
             let latest_seq = coordinator.latest_seq_handle();
@@ -817,43 +751,6 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::FetchRoster => {
-            let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    let request = acp::ExtRequest::new(
-                        "x.ai/sessions/list",
-                        serde_json::value::to_raw_value(&serde_json::json!({}))
-                            .expect("serialize roster list params")
-                            .into(),
-                    );
-                    match acp_send(request, &tx).await {
-                        Ok(resp) => {
-                            let parsed = crate::app::roster::parse_roster_list_response(
-                                resp.0.get(),
-                            );
-                            match parsed {
-                                Some(r) => {
-                                    TaskResult::RosterLoaded {
-                                        sessions: r.sessions,
-                                    }
-                                }
-                                None => {
-                                    tracing::warn!("failed to parse x.ai/sessions/list response");
-                                    TaskResult::RosterFailed {
-                                        error: "parse error".to_string(),
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            TaskResult::RosterFailed {
-                                error: sanitize_user_error(&format!("{e}")),
-                            }
-                        }
-                    }
-                });
-        }
         Effect::FetchDashboardSessions => {
             let tx = acp_tx.clone();
             let cwd = cwd.to_path_buf();
@@ -1074,7 +971,7 @@ pub(crate) fn execute(
                             error: format!("{error:#}"),
                         }
                     });
-                return (false, meta);
+                return false;
             }
             let setup_started = std::time::Instant::now();
             let raw_config = xai_grok_shell::config::load_effective_config();
@@ -2185,35 +2082,6 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::RecordConsentUpstream { notice_id, version } => {
-            let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    let request = acp::ExtRequest::new(
-                        "x.ai/consent/record",
-                        serde_json::value::to_raw_value(
-                                &serde_json::json!({
-                        "noticeId": notice_id,
-                        "version": version,
-                    }),
-                            )
-                            .expect("serialize params")
-                            .into(),
-                    );
-                    match acp_send(request, &tx).await {
-                        Ok(_) => {
-                            TaskResult::ConsentRecorded {
-                                notice_id,
-                                version,
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, %notice_id, "consent record not filed");
-                            TaskResult::CancelComplete
-                        }
-                    }
-                });
-        }
         Effect::PersistMemoryFullscreen { fullscreen } => {
             persist_hint(
                 tasks,
@@ -2245,24 +2113,6 @@ pub(crate) fn execute(
                 "unexpected worktree config_key"
             );
             persist_hint(tasks, config_key, mode.as_config_str(), "worktree mode");
-        }
-        Effect::PersistPreferredModel { model_id, reasoning_effort } => {
-            let model_id_str = model_id.0.to_string();
-            tasks
-                .spawn(async move {
-                    let result = xai_grok_shell::util::config::persist_models_default(
-                            Some(model_id_str),
-                            reasoning_effort,
-                        )
-                        .await
-                        .map_err(|e| e.to_string());
-                    if let Err(ref e) = result {
-                        tracing::warn!("failed to save default model preference: {e}");
-                    }
-                    TaskResult::PreferredModelPersisted {
-                        result,
-                    }
-                });
         }
         Effect::PersistPermissionMode { canonical, session_id, persist } => {
             let tx = acp_tx.clone();
@@ -2312,106 +2162,13 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::Authenticate {
-            request_seq,
-            method_id,
-            use_oauth,
-            force_interactive,
-        } => {
-            let tx = acp_tx.clone();
-            let abort_handle = tasks
-                .spawn(async move {
-                    send_authenticate(
-                            &tx,
-                            request_seq,
-                            method_id,
-                            use_oauth,
-                            force_interactive,
-                        )
-                        .await
-                });
-            meta.auth_abort_handle = Some((request_seq, abort_handle));
-        }
-        Effect::PollAuthUrl { request_seq } => {
-            let tx = acp_tx.clone();
-            let abort_handle = tasks
-                .spawn(async move {
-                    let mut auth_url: Option<String> = None;
-                    let mut external = false;
-                    let mut mode: Option<String> = None;
-                    for i in 0..60 {
-                        if i > 0 {
-                            tokio::time::sleep(std::time::Duration::from_millis(50))
-                                .await;
-                        }
-                        let params = serde_json::json!({});
-                        let req = acp::ExtRequest::new(
-                            "x.ai/auth/get_url",
-                            serde_json::value::to_raw_value(&params)
-                                .expect("serialize auth_url params")
-                                .into(),
-                        );
-                        if let Ok(resp) = acp_send(req, &tx).await {
-                            let v: serde_json::Value = serde_json::from_str(resp.0.get())
-                                .unwrap_or_default();
-                            external = v
-                                .get("external_provider")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
-                            mode = v
-                                .get("mode")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                            auth_url = v
-                                .get("auth_url")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                        }
-                        if auth_url.is_some() {
-                            break;
-                        }
-                    }
-                    TaskResult::AuthUrlReady {
-                        request_seq,
-                        auth_url,
-                        external,
-                        mode,
-                    }
-                });
-            meta.auth_url_poll_handle = Some((request_seq, abort_handle));
-        }
-        Effect::SubmitAuthCode { request_seq, code } => {
-            let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    let params = serde_json::json!({ "code": code });
-                    let req = acp::ExtRequest::new(
-                        "x.ai/auth/submit_code",
-                        serde_json::value::to_raw_value(&params)
-                            .expect("serialize auth code params")
-                            .into(),
-                    );
-                    match acp_send(req, &tx).await {
-                        Ok(_) => {
-                            TaskResult::AuthCodeSubmitted {
-                                request_seq,
-                            }
-                        }
-                        Err(e) => {
-                            let error = e.to_string();
-                            ulog::error(
-                                "auth failed",
-                                None,
-                                Some(serde_json::json!({"error": &error})),
-                            );
-                            TaskResult::AuthFailed {
-                                request_seq,
-                                error,
-                            }
-                        }
-                    }
-                });
-        }
+        // oc-build: opencode backend; these only reach xAI-only `x.ai/*` methods (hidden
+        // Extensions tabs, plugin CTA catalog, bash-mode shell suggestions).
+        Effect::FetchHooksList { .. }
+        | Effect::FetchMarketplaceList { .. }
+        | Effect::FetchPluginCtaCatalog { .. }
+        | Effect::FetchWorkflowsList { .. }
+        | Effect::FetchShellSuggestions { .. } => {}
         Effect::FetchMcpsList { agent_id, session_id, cache } => {
             let tx = acp_tx.clone();
             tasks
@@ -2563,43 +2320,6 @@ pub(crate) fn execute(
                     TaskResult::McpSetupSubmitDone {
                         agent_id,
                         server_name,
-                        result,
-                    }
-                });
-        }
-        Effect::FetchHooksList { agent_id, session_id } => {
-            let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    let params = serde_json::json!({
-                    "sessionId": session_id.0.to_string(),
-                });
-                    let req = acp::ExtRequest::new(
-                        "x.ai/hooks/list",
-                        serde_json::value::to_raw_value(&params)
-                            .expect("serialize hooks/list params")
-                            .into(),
-                    );
-                    let result = match acp_send(req, &tx).await {
-                        Ok(resp) => {
-                            let wrapper: serde_json::Value = serde_json::from_str(
-                                    resp.0.get(),
-                                )
-                                .unwrap_or_default();
-                            let inner = wrapper.get("result").unwrap_or(&wrapper);
-                            serde_json::from_value::<
-                                xai_hooks_plugins_types::HooksListResponse,
-                            >(inner.clone())
-                                .map_err(|_| "couldn't load hooks".to_string())
-                        }
-                        Err(e) => {
-                            Err(
-                                sanitize_user_error(&format!("couldn't load hooks: {e}")),
-                            )
-                        }
-                    };
-                    TaskResult::HooksListLoaded {
-                        agent_id,
                         result,
                     }
                 });
@@ -2872,88 +2592,6 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::FetchMarketplaceList { agent_id, session_id } => {
-            let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    let params = serde_json::json!({
-                    "sessionId": session_id.0.to_string(),
-                });
-                    let req = acp::ExtRequest::new(
-                        "x.ai/marketplace/list",
-                        serde_json::value::to_raw_value(&params)
-                            .expect("serialize marketplace/list params")
-                            .into(),
-                    );
-                    let result = match acp_send(req, &tx).await {
-                        Ok(resp) => {
-                            let wrapper: serde_json::Value = serde_json::from_str(
-                                    resp.0.get(),
-                                )
-                                .unwrap_or_default();
-                            let inner = wrapper.get("result").unwrap_or(&wrapper);
-                            serde_json::from_value::<
-                                xai_hooks_plugins_types::MarketplaceListResponse,
-                            >(inner.clone())
-                                .map_err(|_| "couldn't load marketplace".to_string())
-                        }
-                        Err(e) => {
-                            Err(
-                                sanitize_user_error(
-                                    &format!(
-                        "couldn't load marketplace: {e}"
-                    ),
-                                ),
-                            )
-                        }
-                    };
-                    TaskResult::MarketplaceListLoaded {
-                        agent_id,
-                        result,
-                    }
-                });
-        }
-        Effect::FetchPluginCtaCatalog { agent_id, session_id } => {
-            let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    let params = serde_json::json!({
-                    "sessionId": session_id.0.to_string(),
-                });
-                    let req = acp::ExtRequest::new(
-                        "x.ai/marketplace/list",
-                        serde_json::value::to_raw_value(&params)
-                            .expect("serialize marketplace/list params")
-                            .into(),
-                    );
-                    let result = match acp_send(req, &tx).await {
-                        Ok(resp) => {
-                            let wrapper: serde_json::Value = serde_json::from_str(
-                                    resp.0.get(),
-                                )
-                                .unwrap_or_default();
-                            let inner = wrapper.get("result").unwrap_or(&wrapper);
-                            serde_json::from_value::<
-                                xai_hooks_plugins_types::MarketplaceListResponse,
-                            >(inner.clone())
-                                .map_err(|_| "couldn't load marketplace".to_string())
-                        }
-                        Err(e) => {
-                            Err(
-                                sanitize_user_error(
-                                    &format!(
-                        "couldn't load marketplace: {e}"
-                    ),
-                                ),
-                            )
-                        }
-                    };
-                    TaskResult::PluginCtaCatalogLoaded {
-                        agent_id,
-                        result,
-                    }
-                });
-        }
         Effect::FetchSkillsList { agent_id, session_id, refresh, fetch } => {
             let tx = acp_tx.clone();
             tasks
@@ -2991,48 +2629,6 @@ pub(crate) fn execute(
                         agent_id,
                         session_id,
                         fetch,
-                        result,
-                    }
-                });
-        }
-        Effect::FetchWorkflowsList { agent_id, session_id } => {
-            let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    let params = serde_json::json!({
-                    "sessionId": session_id
-                });
-                    let req = acp::ExtRequest::new(
-                        "x.ai/workflows/list",
-                        serde_json::value::to_raw_value(&params)
-                            .expect("serialize workflows/list params")
-                            .into(),
-                    );
-                    let result = match acp_send(req, &tx).await {
-                        Ok(resp) => {
-                            let wrapper: serde_json::Value = serde_json::from_str(
-                                    resp.0.get(),
-                                )
-                                .unwrap_or_default();
-                            let inner = wrapper.get("result").unwrap_or(&wrapper);
-                            serde_json::from_value::<
-                                Vec<crate::views::extensions_modal::WorkflowInfo>,
-                            >(inner.get("workflows").cloned().unwrap_or_default())
-                                .map_err(|_| "couldn't load workflows".to_string())
-                        }
-                        Err(e) => {
-                            Err(
-                                sanitize_user_error(
-                                    &format!(
-                        "couldn't load workflows: {e}"
-                    ),
-                                ),
-                            )
-                        }
-                    };
-                    TaskResult::WorkflowsListLoaded {
-                        agent_id,
-                        session_id,
                         result,
                     }
                 });
@@ -3081,126 +2677,6 @@ pub(crate) fn execute(
                     TaskResult::SkillsToggleDone {
                         agent_id,
                         result,
-                    }
-                });
-        }
-        Effect::CheckMarketplaceUpdates { agent_id, session_id } => {
-            if xai_grok_workspace::permission::resolution::managed_settings()
-                .plugin_auto_update
-                .is_disabled()
-            {
-                tracing::info!("session-start plugin auto-update disabled by managed policy");
-                return (false, meta);
-            }
-            let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    let params = serde_json::json!({
-                    "sessionId": session_id.0.to_string(),
-                });
-                    let list_req = acp::ExtRequest::new(
-                        "x.ai/marketplace/list",
-                        serde_json::value::to_raw_value(&params)
-                            .expect("serialize marketplace/list params")
-                            .into(),
-                    );
-                    let outdated = match acp_send(list_req, &tx).await {
-                        Ok(resp) => {
-                            let wrapper: serde_json::Value = serde_json::from_str(
-                                    resp.0.get(),
-                                )
-                                .unwrap_or_default();
-                            let inner = wrapper.get("result").unwrap_or(&wrapper);
-                            serde_json::from_value::<
-                                xai_hooks_plugins_types::MarketplaceListResponse,
-                            >(inner.clone())
-                                .ok()
-                                .map(|r| {
-                                    r
-                                        .sources
-                                        .iter()
-                                        .flat_map(|s| {
-                                            let source_url = s.source_url_or_path.clone();
-                                            s.plugins
-                                                .iter()
-                                                .filter_map(move |p| {
-                                                    if p.install_status == "update_available" {
-                                                        Some((
-                                                            p.name.clone(),
-                                                            p.installed_version.clone().unwrap_or_else(|| "?".into()),
-                                                            p.version.clone().unwrap_or_else(|| "?".into()),
-                                                            source_url.clone(),
-                                                            p.relative_path.clone(),
-                                                        ))
-                                                    } else {
-                                                        None
-                                                    }
-                                                })
-                                        })
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default()
-                        }
-                        Err(_) => Vec::new(),
-                    };
-                    if outdated.is_empty() {
-                        return TaskResult::MarketplaceUpdatesAvailable {
-                            agent_id,
-                            updates: Vec::new(),
-                        };
-                    }
-                    let mut succeeded = Vec::new();
-                    for (name, old, new, source_url, rel_path) in outdated {
-                        let action = xai_hooks_plugins_types::MarketplaceAction::Update {
-                            source_url_or_path: source_url.clone(),
-                            plugin_relative_path: rel_path.clone(),
-                        };
-                        let req_body = xai_hooks_plugins_types::MarketplaceActionRequest {
-                            session_id: session_id.0.to_string(),
-                            action,
-                        };
-                        let update_req = acp::ExtRequest::new(
-                            "x.ai/marketplace/action",
-                            serde_json::value::to_raw_value(&req_body)
-                                .expect("serialize marketplace/action params")
-                                .into(),
-                        );
-                        let update_succeeded = match acp_send(update_req, &tx).await {
-                            Ok(resp) => {
-                                let wrapper: serde_json::Value = serde_json::from_str(
-                                        resp.0.get(),
-                                    )
-                                    .unwrap_or_default();
-                                let inner = wrapper.get("result").unwrap_or(&wrapper);
-                                serde_json::from_value::<
-                                    xai_hooks_plugins_types::ActionOutcome,
-                                >(inner.clone())
-                                    .is_ok_and(|outcome| marketplace_outcome_succeeded(
-                                        &outcome,
-                                    ))
-                            }
-                            Err(_) => false,
-                        };
-                        if update_succeeded {
-                            succeeded.push((name, old, new));
-                        }
-                    }
-                    if !succeeded.is_empty() {
-                        let notify_params = serde_json::json!({
-                        "sessionId": session_id.0.to_string(),
-                        "updates": succeeded,
-                    });
-                        let notify_req = acp::ExtRequest::new(
-                            "x.ai/plugins/notify-updates",
-                            serde_json::value::to_raw_value(&notify_params)
-                                .expect("serialize notify-updates params")
-                                .into(),
-                        );
-                        let _ = acp_send(notify_req, &tx).await;
-                    }
-                    TaskResult::MarketplaceUpdatesAvailable {
-                        agent_id,
-                        updates: succeeded,
                     }
                 });
         }
@@ -4551,64 +4027,6 @@ pub(crate) fn execute(
                 vec![(text, interjection_id, blocks)],
             );
         }
-        Effect::FetchBundleStatus => {
-            let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    let request = acp::ExtRequest::new(
-                        "x.ai/bundle/status",
-                        serde_json::value::to_raw_value(&serde_json::json!({}))
-                            .expect("serialize bundle/status params")
-                            .into(),
-                    );
-                    match acp_send(request, &tx).await {
-                        Ok(resp) => {
-                            let wrapper: serde_json::Value = serde_json::from_str(
-                                    resp.0.get(),
-                                )
-                                .unwrap_or_default();
-                            if let Some(err) = wrapper.get("error") {
-                                let msg = err
-                                    .as_str()
-                                    .map(String::from)
-                                    .unwrap_or_else(|| "unknown error".to_string());
-                                return TaskResult::BundleStatusFailed {
-                                    error: msg,
-                                };
-                            }
-                            let inner = wrapper.get("result").unwrap_or(&wrapper);
-                            match serde_json::from_value::<
-                                super::bundle::BundleStatusResult,
-                            >(inner.clone()) {
-                                Ok(r) => {
-                                    TaskResult::BundleStatusReady {
-                                        has_cache: r.has_cache,
-                                        version: r.version,
-                                        personas: r.personas,
-                                        roles: r.roles,
-                                        agents: r.agents,
-                                        skills: r.skills,
-                                        persona_details: r.persona_details,
-                                        role_details: r.role_details,
-                                    }
-                                }
-                                Err(_) => {
-                                    TaskResult::BundleStatusFailed {
-                                        error: "couldn't fetch bundle status".to_string(),
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            TaskResult::BundleStatusFailed {
-                                error: sanitize_user_error(
-                                    &format!("couldn't fetch bundle status: {e}"),
-                                ),
-                            }
-                        }
-                    }
-                });
-        }
         Effect::RefreshAvailableCommands { agent_id, session_id } => {
             let tx = acp_tx.clone();
             tasks
@@ -4902,149 +4320,6 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::FetchBilling { agent_id, silent, nonce } => {
-            let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    use xai_grok_shell::extensions::billing::BillingConfigResponse;
-                    let req = acp::ExtRequest::new(
-                        "x.ai/billing",
-                        serde_json::value::to_raw_value(&serde_json::json!({}))
-                            .expect("serialize billing params")
-                            .into(),
-                    );
-                    let parsed = match acp_send(req, &tx).await {
-                        Ok(resp) => {
-                            let wrapper: serde_json::Value = serde_json::from_str(
-                                    resp.0.get(),
-                                )
-                                .unwrap_or_default();
-                            let result = wrapper.get("result").unwrap_or(&wrapper);
-                            serde_json::from_value::<
-                                BillingConfigResponse,
-                            >(result.clone())
-                        }
-                        Err(e) => {
-                            return TaskResult::BillingError {
-                                agent_id,
-                                error: sanitize_user_error(&format!("{e}")),
-                                silent,
-                                nonce,
-                            };
-                        }
-                    };
-                    let billing = match parsed {
-                        Ok(billing) => billing,
-                        Err(e) => {
-                            return TaskResult::BillingError {
-                                agent_id,
-                                error: format!("Parse error: {e}"),
-                                silent,
-                                nonce,
-                            };
-                        }
-                    };
-                    let subscription_tier = billing.subscription_tier;
-                    let balance = billing.config.map(credit_balance_from_config);
-                    let autotopup = if has_prepaid_credits(balance.as_ref()) {
-                        fetch_auto_topup_info(&tx).await
-                    } else {
-                        crate::views::credit_bar::AutoTopupFetch::Cleared
-                    };
-                    TaskResult::BillingFetched {
-                        agent_id,
-                        balance,
-                        silent,
-                        subscription_tier,
-                        autotopup,
-                        nonce,
-                    }
-                });
-        }
-        Effect::RefreshGate => {
-            tasks
-                .spawn(async move {
-                    let settings = tokio::task::spawn_blocking(|| {
-                            if !xai_grok_shell::util::config::resolve_remote_fetch_enabled() {
-                                return None;
-                            }
-                            let grok_home = xai_grok_shell::util::grok_home::grok_home();
-                            let store = xai_grok_login::read_auth_json(
-                                    &grok_home.join("auth.json"),
-                                )
-                                .ok()?;
-                            let scope = xai_grok_login::GrokComConfig::default()
-                                .auth_scope();
-                            let auth = xai_grok_login::lookup_auth(&store, &scope)?;
-                            let proxy_base = std::env::var(
-                                    "GROK_CLI_CHAT_PROXY_BASE_URL",
-                                )
-                                .unwrap_or_else(|_| {
-                                    xai_grok_shell::agent::config::CLI_CHAT_PROXY_BASE_URL_DEFAULT
-                                        .to_owned()
-                                });
-                            xai_grok_shell::remote::fetch_settings_blocking(
-                                    &proxy_base,
-                                    &auth,
-                                    None,
-                                )
-                                .into_option()
-                        })
-                        .await
-                        .ok()
-                        .flatten();
-                    TaskResult::GateRefreshed {
-                        settings,
-                    }
-                });
-        }
-        Effect::FetchAppBilling { nonce } => {
-            let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    use xai_grok_shell::extensions::billing::BillingConfigResponse;
-                    let req = acp::ExtRequest::new(
-                        "x.ai/billing",
-                        serde_json::value::to_raw_value(&serde_json::json!({}))
-                            .expect("serialize billing params")
-                            .into(),
-                    );
-                    let resp = match acp_send(req, &tx).await {
-                        Ok(resp) => resp,
-                        Err(e) => {
-                            return TaskResult::AppBillingError {
-                                error: sanitize_user_error(&format!("{e}")),
-                                nonce,
-                            };
-                        }
-                    };
-                    let wrapper: serde_json::Value = serde_json::from_str(resp.0.get())
-                        .unwrap_or_default();
-                    let result = wrapper.get("result").unwrap_or(&wrapper);
-                    let billing = match serde_json::from_value::<
-                        BillingConfigResponse,
-                    >(result.clone()) {
-                        Ok(billing) => billing,
-                        Err(e) => {
-                            return TaskResult::AppBillingError {
-                                error: format!("Parse error: {e}"),
-                                nonce,
-                            };
-                        }
-                    };
-                    let balance = billing.config.map(credit_balance_from_config);
-                    let autotopup = if has_prepaid_credits(balance.as_ref()) {
-                        fetch_auto_topup_info(&tx).await
-                    } else {
-                        crate::views::credit_bar::AutoTopupFetch::Cleared
-                    };
-                    TaskResult::AppBillingFetched {
-                        balance,
-                        autotopup,
-                        nonce,
-                    }
-                });
-        }
         Effect::DebounceSuggestions { agent_id, generation } => {
             tasks
                 .spawn(async move {
@@ -5065,100 +4340,8 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::FetchShellSuggestions {
-            agent_id,
-            text,
-            cursor,
-            cwd,
-            generation,
-            limit,
-            include_ai,
-            ai_model,
-            session_id,
-            token_only,
-        } => {
-            let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    let params = serde_json::json!({
-                    // By reference: echoed back below as `request_text`.
-                    "text": &text,
-                    "cursor": cursor,
-                    "cwd": cwd,
-                    "includeAi": include_ai,
-                    "aiModel": ai_model,
-                    "sessionId": session_id,
-                    "limit": limit,
-                    "generation": generation,
-                    "tokenOnly": token_only,
-                });
-                    let req = acp::ExtRequest::new(
-                        "x.ai/suggest",
-                        serde_json::value::to_raw_value(&params)
-                            .expect("serialize suggest params")
-                            .into(),
-                    );
-                    match acp_send(req, &tx).await {
-                        Ok(resp) => {
-                            let wrapper: serde_json::Value = serde_json::from_str(
-                                    resp.0.get(),
-                                )
-                                .unwrap_or_default();
-                            let parsed = crate::views::suggestion_controller::SuggestResponseParsed::from_json(
-                                &wrapper,
-                            );
-                            match parsed {
-                                Some(response) => {
-                                    TaskResult::ShellSuggestionsLoaded {
-                                        agent_id,
-                                        response,
-                                        request_text: text,
-                                        request_cursor: cursor,
-                                    }
-                                }
-                                None => TaskResult::CancelComplete,
-                            }
-                        }
-                        Err(_) => TaskResult::CancelComplete,
-                    }
-                });
-        }
-        Effect::FetchPromptSuggestion { agent_id, generation, model, session_id } => {
-            let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    let params = serde_json::json!({
-                    "generation": generation,
-                    "model": model,
-                    "sessionId": session_id,
-                });
-                    let req = acp::ExtRequest::new(
-                        "x.ai/suggestPrompt",
-                        serde_json::value::to_raw_value(&params)
-                            .expect("serialize suggestPrompt params")
-                            .into(),
-                    );
-                    let suggestion = match acp_send(req, &tx).await {
-                        Ok(resp) => {
-                            serde_json::from_str::<serde_json::Value>(resp.0.get())
-                                .ok()
-                                .as_ref()
-                                .map(|v| v.get("result").unwrap_or(v))
-                                .and_then(|r| r.get("suggestion"))
-                                .and_then(|s| s.as_str())
-                                .map(str::to_owned)
-                        }
-                        Err(_) => None,
-                    };
-                    TaskResult::PromptSuggestionLoaded {
-                        agent_id,
-                        suggestion,
-                        generation,
-                    }
-                });
-        }
     }
-    (false, meta)
+    false
 }
 /// Fetch session info from ACP via `x.ai/session/info`.
 async fn fetch_session_info(

@@ -36,11 +36,11 @@ fn combine_queued_prompts_enabled() -> bool {
 /// We must also not be mid-edit, mid-model-switch, or mid-replay.
 /// **Server-busy (`is_turn_running() || !shared_queue.is_empty()`):** the immediate-send path is for prompts that must queue server-side rather than start a turn locally.
 /// **FIFO guard (`pending_prompts.is_empty()`):** a prompt may only jump onto the server queue when the local drip-feed queue is empty.
-pub(super) fn immediate_server_send_eligible(agent: &AgentView, leader_mode: bool) -> bool {
+pub(super) fn immediate_server_send_eligible(agent: &AgentView) -> bool {
     let wake_running = agent.running_wake_turn.is_some();
     let server_busy =
         agent.session.state.is_turn_running() || wake_running || !agent.shared_queue.is_empty();
-    (leader_mode || crate::appearance::cache::load_follow_up_steer() || wake_running)
+    (crate::appearance::cache::load_follow_up_steer() || wake_running)
         && server_busy
         && agent.session.session_id.is_some()
         && agent.session.pending_prompts.is_empty()
@@ -1482,13 +1482,9 @@ mod tests {
             kind: crate::app::agent::QueueEntryKind::Prompt,
         };
 
-        // Turn ends: must not drain "second" (user is editing it), only FetchBilling
+        // Turn ends: must not drain "second" (user is editing it)
         let effects = dispatch(end_turn(), &mut app);
-        assert_eq!(effects.len(), 1);
-        assert!(matches!(
-            effects.first(),
-            Some(Effect::FetchBilling { silent: true, .. })
-        ));
+        assert!(effects.is_empty());
         assert!(test_agent(&app, id).session.state.is_idle());
         assert_eq!(test_agent(&app, id).session.queue_len(), 2);
         assert_eq!(
@@ -1527,16 +1523,12 @@ mod tests {
             kind: crate::app::agent::QueueEntryKind::Prompt,
         };
 
-        // Turn ends: drains "second" (front, not being edited) plus FetchBilling
+        // Turn ends: drains "second" (front, not being edited)
         let effects = dispatch(end_turn(), &mut app);
-        assert_eq!(effects.len(), 2);
+        assert_eq!(effects.len(), 1);
         assert!(
             matches!(effects.first(), Some(Effect::SendPrompt { text, .. }) if text == "second")
         );
-        assert!(matches!(
-            effects.get(1),
-            Some(Effect::FetchBilling { silent: true, .. })
-        ));
         assert_eq!(test_agent(&app, id).session.queue_len(), 1);
         assert_eq!(
             test_agent(&app, id)
@@ -1629,100 +1621,6 @@ mod tests {
             "expected the command to run"
         );
         assert_eq!(test_agent(&app, id).session.queue_len(), 0);
-    }
-
-    /// Minimal hosts the feedback form, so a queued row edited into bare `/feedback` runs like any other
-    /// command: the row goes, the form opens, and the drafts list is requested.
-    #[test]
-    fn edited_queued_bare_feedback_opens_the_modal() {
-        use crate::views::feedback_modal::FeedbackDraftRequest;
-
-        let mut app = test_app_with_agent();
-        let id = AgentId(0);
-        app.screen_mode = crate::app::ScreenMode::Minimal;
-        app.agents.get_mut(&id).unwrap().session.state = AgentState::TurnRunning;
-        enqueue_local(&mut app, id, "original queued prompt");
-        let Some(local_id) = test_agent(&app, id)
-            .session
-            .pending_prompts
-            .front()
-            .map(|p| p.id)
-        else {
-            panic!("expected queued prompt");
-        };
-
-        let effects = run_edited_queued_command(&mut app, local_id, None, "/feedback");
-
-        assert!(
-            matches!(
-                effects.as_slice(),
-                [Effect::FeedbackDraftRequest {
-                    request: FeedbackDraftRequest::List { .. },
-                    ..
-                }]
-            ),
-            "opening the form lists drafts: {effects:?}"
-        );
-        assert!(test_agent(&app, id).feedback_modal.is_some());
-        assert_eq!(test_agent(&app, id).session.queue_len(), 0);
-    }
-
-    #[test]
-    fn run_edited_feedback_uses_row_text_and_attachments_not_the_restored_draft() {
-        let mut app = test_app_with_agent();
-        let id = AgentId(0);
-        app.agents.get_mut(&id).unwrap().session.state = AgentState::TurnRunning;
-        app.agents
-            .get_mut(&id)
-            .unwrap()
-            .prompt
-            .set_text("/feedback live draft");
-        enqueue_local(&mut app, id, "queued feedback");
-        let Some(local_id) = test_agent(&app, id)
-            .session
-            .pending_prompts
-            .front()
-            .map(|p| p.id)
-        else {
-            panic!("expected queued prompt");
-        };
-
-        let image = crate::prompt_images::from_clipboard_data(&crate::clipboard::ImageData {
-            data: vec![
-                0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0, 0, 0, 0, 0,
-            ],
-            mime_type: "image/png".to_owned(),
-        });
-        let placeholder = crate::prompt_images::display_text(1);
-        let submission = crate::views::prompt_widget::StashedPrompt::from_submission(
-            format!("/feedback row report {placeholder}"),
-            vec![image],
-            vec![crate::app::agent::ChipElement {
-                range: 21..21 + placeholder.len(),
-                kind: crate::views::prompt_widget::KIND_IMAGE,
-                display: None,
-            }],
-        );
-        let effects = run_edited_queued_submission(&mut app, local_id, None, submission);
-
-        // Inline `/feedback <text>` POSTs right away, even mid-turn, with the row's own attachment.
-        let [
-            Effect::SendFeedback {
-                feedback_text,
-                images,
-                ..
-            },
-        ] = effects.as_slice()
-        else {
-            panic!("edited inline /feedback must POST once, got {effects:?}");
-        };
-        assert_eq!("row report", feedback_text);
-        assert_eq!(1, images.len(), "the row attachment rides the POST");
-        assert_eq!("/feedback live draft", test_agent(&app, id).prompt.text());
-        assert!(
-            test_agent(&app, id).session.pending_prompts.is_empty(),
-            "the edited row is gone and nothing is queued in its place"
-        );
     }
 
     /// Server row: a versioned remove, then the command.
@@ -3369,16 +3267,9 @@ mod tests {
             kind: crate::app::agent::QueueEntryKind::Prompt,
         };
 
-        // End turn for p2: must not drain p3 (being edited), only FetchBilling
+        // End turn for p2: must not drain p3 (being edited)
         let effects = dispatch(end_turn(), &mut app);
-        assert_eq!(effects.len(), 1);
-        assert!(
-            matches!(
-                effects.first(),
-                Some(Effect::FetchBilling { silent: true, .. })
-            ),
-            "drain should be blocked, only billing refresh"
-        );
+        assert!(effects.is_empty(), "drain should be blocked");
         assert_eq!(test_agent(&app, id).session.queue_len(), 2); // p3, p4
 
         // Simulate user saving edited text.

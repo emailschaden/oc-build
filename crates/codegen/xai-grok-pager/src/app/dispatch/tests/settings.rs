@@ -267,7 +267,7 @@ fn set_default_model_allowed_when_agent_chat_kind() {
 }
 /// `/model <name>` dispatches `SetDefaultModel` which routes through both `PersistSetting` and `SwitchModel`.
 #[test]
-fn slash_model_valid_dispatches_set_default_model_with_switch_and_persist() {
+fn slash_model_valid_dispatches_set_default_model_with_switch() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     let model_id = acp::ModelId::new(std::sync::Arc::from("grok-4.5"));
@@ -282,26 +282,16 @@ fn slash_model_valid_dispatches_set_default_model_with_switch_and_persist() {
             acp::ModelInfo::new(model_id.clone(), "Grok 4.5".to_string()),
         );
     let effects = dispatch(Action::SendPrompt("/model Grok 4.5".into()), &mut app);
+    // oc-build: opencode backend; only the session switch, nothing is persisted.
     assert_eq!(
         effects.len(),
-        2,
-        "expected PersistSetting + SwitchModel effects, got {effects:?}",
+        1,
+        "expected SwitchModel only, got {effects:?}"
     );
     assert!(
-        matches!(
-            effects.first(),
-            Some(Effect::PersistSetting {
-                key: "default_model",
-                ..
-            })
-        ),
-        "first effect must be PersistSetting(default_model), got {:?}",
+        matches!(effects.first(), Some(Effect::SwitchModel { choice, .. }) if choice.model_id == model_id),
+        "effect must be SwitchModel(<resolved id>), got {:?}",
         effects.first(),
-    );
-    assert!(
-        matches!(effects.get(1), Some(Effect::SwitchModel { choice, .. }) if choice.model_id == model_id),
-        "second effect must be SwitchModel(<resolved id>), got {:?}",
-        effects.get(1),
     );
     assert!(expect_agent(&app, id).session.model_switch_pending);
 }
@@ -1302,7 +1292,7 @@ fn every_persisting_setting_has_rollback_arm() {
 /// `Action::ClearDefaultModel` persists `cfg.models.default = None` AND emits the "cleared" toast.
 /// It deliberately does NOT mutate `agent.session.models.current`.
 #[test]
-fn clear_default_model_persists_but_keeps_live_current() {
+fn clear_default_model_keeps_live_current() {
     use agent_client_protocol as acp;
     use std::sync::Arc;
     let mut app = test_app_with_agent();
@@ -1323,27 +1313,16 @@ fn clear_default_model_persists_but_keeps_live_current() {
         .models
         .set_current(id.clone(), None);
     let effects = dispatch(Action::ClearDefaultModel, &mut app);
-    assert_eq!(
-        effects.len(),
-        1,
-        "expected exactly one PersistSetting effect"
-    );
-    assert!(
-        matches!(effects.first(), Some(Effect::PersistSetting {
-                key: "default_model",
-                value: crate::settings::SettingValue::String(s),
-                .. }) if s.is_empty()),
-        "expected PersistSetting(default_model, ''), got {:?}",
-        effects.first(),
-    );
+    // oc-build: opencode backend; model ids are never saved to ~/.grok/config.toml.
+    assert!(effects.is_empty(), "expected no effects, got {effects:?}");
     assert_eq!(
         expect_agent(&app, agent_id).session.models.current,
         Some(id),
         "clear_default_model must NOT mutate live agent.session.models.current",
     );
 }
-/// `Action::SetDefaultModel(<known id>)` resolves the id against the live catalog, mutates current, and emits PersistSetting and SwitchModel effects.
-/// This is the dispatch-level analog of `slash_model_valid_dispatches_set_default_model_with_switch_and_persist`.
+/// `Action::SetDefaultModel(<known id>)` resolves the id against the live catalog, mutates current, and emits a SwitchModel effect.
+/// This is the dispatch-level analog of `slash_model_valid_dispatches_set_default_model_with_switch`.
 #[test]
 fn set_default_model_resolves_known_name() {
     use agent_client_protocol as acp;
@@ -1360,13 +1339,10 @@ fn set_default_model_resolves_known_name() {
         .available
         .insert(id.clone(), info);
     let effects = dispatch(Action::SetDefaultModel(id.clone()), &mut app);
-    assert_eq!(effects.len(), 2);
-    assert!(matches!(effects.first(), Some(Effect::PersistSetting {
-            key: "default_model",
-            value: crate::settings::SettingValue::String(s),
-            .. }) if s == "grok-4.5"));
+    // oc-build: opencode backend; only the session switch, nothing is persisted.
+    assert_eq!(effects.len(), 1);
     assert!(
-        matches!(effects.get(1), Some(Effect::SwitchModel { choice, .. }) if choice.model_id == id)
+        matches!(effects.first(), Some(Effect::SwitchModel { choice, .. }) if choice.model_id == id)
     );
     assert_eq!(
         expect_agent(&app, agent_id).session.models.current,

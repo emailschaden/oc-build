@@ -162,7 +162,7 @@ fn session_created_sets_session_id() {
         }),
         &mut app,
     );
-    assert_eq!(effects.len(), 7);
+    assert_eq!(effects.len(), 5);
     assert!(matches!(
         effects.first(),
         Some(Effect::FetchPromptHistory { session_id, .. }) if session_id == "new-session-123"
@@ -177,18 +177,10 @@ fn session_created_sets_session_id() {
     ));
     assert!(matches!(
         effects.get(3),
-        Some(Effect::CheckMarketplaceUpdates { .. })
-    ));
-    assert!(matches!(
-        effects.get(4),
         Some(Effect::FetchPluginCtaCatalog { .. })
     ));
     assert!(matches!(
-        effects.get(5),
-        Some(Effect::FetchBilling { silent: true, .. })
-    ));
-    assert!(matches!(
-        effects.get(6),
+        effects.get(4),
         Some(Effect::RegisterActiveSession { .. })
     ));
     assert_eq!(
@@ -223,7 +215,7 @@ fn session_created_omits_cta_catalog_when_disabled() {
     assert!(
         effects
             .iter()
-            .any(|e| matches!(e, Effect::CheckMarketplaceUpdates { .. }))
+            .any(|e| matches!(e, Effect::RefreshAvailableCommands { .. }))
     );
 }
 /// All System-block texts in an agent's scrollback, in order.
@@ -389,11 +381,6 @@ fn worktree_session_created_sets_session_and_cwd() {
         effects
             .iter()
             .any(|e| matches!(e, Effect::FetchSessionAgentName { .. }))
-    );
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::FetchBilling { silent: true, .. }))
     );
     assert!(
         effects
@@ -1145,13 +1132,7 @@ fn switch_model_deferred_when_no_session_id() {
         Action::SwitchModel(ModelChoice::new(model_id.clone())),
         &mut app,
     );
-    assert!(
-        matches!(
-            effects.as_slice(),
-            [Effect::PersistPreferredModel { model_id: m, .. }] if m == &model_id
-        ),
-        "expected persist-only, got {effects:?}"
-    );
+    assert!(effects.is_empty(), "expected no effects, got {effects:?}");
     assert_eq!(
         expect_agent(&app, id).session.models.current,
         Some(model_id.clone())
@@ -1389,80 +1370,6 @@ fn accept_is_refused_until_the_notice_paints() {
         "an unread notice must stay pending",
     );
 }
-#[test]
-fn accepting_records_the_answer_and_replays_deferred_startup() {
-    use crate::app::consent::ConsentState;
-    let mut app = test_app();
-    app.account_email = Some("user@example.com".to_string());
-    app.consent_state = painted_notice("tos-2026", 3);
-    app.deferred_startup.session =
-        Some(crate::app::session_startup::DeferredSessionStartup::Load {
-            session_id: "deferred-session".into(),
-            session_cwd: None,
-            chat_kind: false,
-        });
-    let effects = dispatch_accept_consent(&mut app);
-    assert!(matches!(app.consent_state, ConsentState::Done));
-    assert_eq!(
-        app.consent_answered,
-        Some(("tos-2026".to_string(), 3)),
-        "the answer must hold for this run even if the write is slow",
-    );
-    assert!(effects.iter().any(|e| matches!(
-        e,
-        Effect::PersistConsentAnswer { account, notice_id, version, acked }
-            if account.as_deref() == Some("user@example.com")
-                && notice_id == "tos-2026"
-                && *version == 3
-                && !acked
-    )));
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::RecordConsentUpstream { .. })),
-    );
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::LoadSession { .. })),
-        "deferred startup must replay once the notice is answered",
-    );
-    assert!(app.deferred_startup.session.is_none());
-}
-/// An api key carries no email, so an answer written under it would be filed against nobody.
-/// It would also overwrite the answer of whoever signed in on this machine, so both writes have to skip it.
-#[test]
-fn an_api_key_run_writes_no_answer_on_either_path() {
-    let mut app = test_app();
-    app.account_email = None;
-    app.consent_state = painted_notice("tos-2026", 3);
-    let accepted = dispatch_accept_consent(&mut app);
-    assert!(
-        !accepted
-            .iter()
-            .any(|e| matches!(e, Effect::PersistConsentAnswer { .. })),
-        "an answer under no account belongs to nobody",
-    );
-    assert!(
-        accepted
-            .iter()
-            .any(|e| matches!(e, Effect::RecordConsentUpstream { .. })),
-        "the acceptance still has to reach the server",
-    );
-    let acked = dispatch(
-        Action::TaskComplete(TaskResult::ConsentRecorded {
-            notice_id: "tos-2026".to_string(),
-            version: 3,
-        }),
-        &mut app,
-    );
-    assert!(
-        !acked
-            .iter()
-            .any(|e| matches!(e, Effect::PersistConsentAnswer { .. })),
-        "the server ack must not write the answer the accept path refused to",
-    );
-}
 /// The index a click or a number key carries is only worth anything if it reaches the right url.
 #[serial_test::serial(GROK_TEST_OPEN_URL_FILE)]
 #[test]
@@ -1592,7 +1499,6 @@ fn trust_folder_continues_session_only_when_embedded_and_persist_denied() {
     unsafe { std::env::set_var("GROK_HOME", &blocker) };
     simulate_release_build();
     let (_repo, workspace, mut app) = pending_trust_workspace();
-    app.leader_mode = false;
     let effects = dispatch(Action::TrustFolder, &mut app);
     assert!(
         !effects.iter().any(|e| matches!(e, Effect::Quit)),
@@ -1618,145 +1524,19 @@ fn trust_folder_continues_session_only_when_embedded_and_persist_denied() {
 }
 #[test]
 fn trust_gate_outcome_maps_every_case() {
-    use crate::app::dispatch::session::lifecycle::{
-        AgentLocation, TrustGateOutcome, trust_gate_outcome,
-    };
+    use crate::app::dispatch::session::lifecycle::{TrustGateOutcome, trust_gate_outcome};
     use xai_grok_workspace::folder_trust::GrantResolution;
     let cases = [
-        (
-            GrantResolution::Trusted,
-            AgentLocation::Embedded,
-            TrustGateOutcome::Finish,
-        ),
-        (
-            GrantResolution::Trusted,
-            AgentLocation::Leader,
-            TrustGateOutcome::Finish,
-        ),
+        (GrantResolution::Trusted, TrustGateOutcome::Finish),
         (
             GrantResolution::SessionLocal,
-            AgentLocation::Embedded,
             TrustGateOutcome::FinishSessionLocal,
         ),
-        (
-            GrantResolution::SessionLocal,
-            AgentLocation::Leader,
-            TrustGateOutcome::Quit,
-        ),
-        (
-            GrantResolution::Unrecorded,
-            AgentLocation::Embedded,
-            TrustGateOutcome::Quit,
-        ),
-        (
-            GrantResolution::Unrecorded,
-            AgentLocation::Leader,
-            TrustGateOutcome::Quit,
-        ),
+        (GrantResolution::Unrecorded, TrustGateOutcome::Quit),
     ];
-    for (resolution, agent, want) in cases {
-        assert_eq!(want, trust_gate_outcome(resolution, agent));
+    for (resolution, want) in cases {
+        assert_eq!(want, trust_gate_outcome(resolution));
     }
-}
-/// When BOTH auth and trust are pending, `AuthComplete` must NOT replay the deferred startup.
-/// The trust question renders next, and its answer drains it.
-/// Verifies the symmetric two-gate ordering.
-#[test]
-fn auth_complete_defers_startup_until_trust_resolved() {
-    let mut app = test_app();
-    app.auth_state = AuthState::Authenticating {
-        request_seq: 1,
-        handle: None,
-        auth_url: None,
-        mode: AuthMode::Pending,
-    };
-    app.trust_state = TrustState::Pending {
-        workspace: PathBuf::from("/x"),
-    };
-    app.deferred_startup.session =
-        Some(crate::app::session_startup::DeferredSessionStartup::Load {
-            session_id: "deferred-session".into(),
-            session_cwd: None,
-            chat_kind: false,
-        });
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::AuthComplete {
-            request_seq: 1,
-            meta: None,
-        }),
-        &mut app,
-    );
-    assert!(matches!(app.auth_state, AuthState::Done));
-    assert!(
-        matches!(app.trust_state, TrustState::Pending { .. }),
-        "trust stays pending after auth completes",
-    );
-    assert!(
-        app.deferred_startup.session.is_some(),
-        "startup must remain deferred while trust is pending",
-    );
-    assert!(
-        !effects
-            .iter()
-            .any(|e| matches!(e, Effect::LoadSession { .. })),
-        "no session may load before trust is answered",
-    );
-    let effects = finish_trust(&mut app);
-    assert!(app.deferred_startup.session.is_none());
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::LoadSession { .. })),
-        "trust answer must replay the deferred startup",
-    );
-}
-/// Symmetric to the above: trust answered FIRST while auth is still pending exercises `finish_trust`'s `else` (deferred) branch.
-/// It must NOT drain; the later `AuthComplete` (the last gate) drains.
-#[test]
-fn trust_answered_first_defers_startup_until_auth_completes() {
-    let mut app = test_app();
-    app.auth_state = AuthState::Authenticating {
-        request_seq: 1,
-        handle: None,
-        auth_url: None,
-        mode: AuthMode::Pending,
-    };
-    app.trust_state = TrustState::Pending {
-        workspace: PathBuf::from("/x"),
-    };
-    app.deferred_startup.session =
-        Some(crate::app::session_startup::DeferredSessionStartup::Load {
-            session_id: "deferred-session".into(),
-            session_cwd: None,
-            chat_kind: false,
-        });
-    let effects = finish_trust(&mut app);
-    assert!(matches!(app.trust_state, TrustState::Done));
-    assert!(
-        app.deferred_startup.session.is_some(),
-        "startup stays deferred while auth is still pending",
-    );
-    assert!(
-        !effects
-            .iter()
-            .any(|e| matches!(e, Effect::LoadSession { .. })),
-        "no session may load before auth completes",
-    );
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::AuthComplete {
-            request_seq: 1,
-            meta: None,
-        }),
-        &mut app,
-    );
-    assert!(matches!(app.auth_state, AuthState::Done));
-    assert!(app.deferred_startup.session.is_none());
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::LoadSession { .. })),
-        "auth completion replays the deferred startup",
-    );
 }
 /// Regression: the global `Ctrl+N` `NewSession` bypasses the welcome interceptor but must NOT create a session while `TrustState::Pending`.
 /// The dispatch chokepoint stashes it, and it replays exactly once when trust resolves.
@@ -2020,113 +1800,6 @@ fn gated_worktree_with_none_companions_preserves_stashed_label_and_ref() {
     assert!(app.deferred_startup.worktree_label.is_none());
     assert!(app.deferred_startup.session.is_none());
     assert!(!app.deferred_startup.worktree);
-}
-/// `/login` from inside a session must move to the welcome screen and stash the agent view for restoration.
-/// The welcome screen is the only view that renders the auth flow / external-provider URL.
-/// Regression: "external auth provider /login does nothing mid-session".
-#[test]
-fn login_mid_session_switches_to_welcome_and_stashes_view() {
-    let mut app = test_app_with_agent();
-    assert_eq!(app.active_view, ActiveView::Agent(AgentId(0)));
-    let effects = dispatch(Action::Login, &mut app);
-    assert_eq!(app.active_view, ActiveView::Welcome);
-    assert_eq!(app.auth_return_view, Some(ActiveView::Agent(AgentId(0))));
-    assert!(matches!(app.auth_state, AuthState::Authenticating { .. }));
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::Authenticate { .. })),
-        "must still kick off the auth flow",
-    );
-}
-/// A mid-session `/login` switches to the welcome view to host the auth flow.
-/// That transition must collapse any expanded announcement so it can't reappear stale if auth completion lands back on a welcome screen.
-#[test]
-fn login_mid_session_resets_welcome_announcement_expanded() {
-    let mut app = test_app_with_agent();
-    app.welcome_announcement.expanded = true;
-    dispatch(Action::Login, &mut app);
-    assert_eq!(app.active_view, ActiveView::Welcome);
-    assert!(
-        !app.welcome_announcement.expanded,
-        "mid-session login must reset the expanded announcement"
-    );
-}
-/// After a successful mid-session re-auth, the stale `ReAuthRequired` prompt (pushed when the 401 surfaced) is stripped.
-/// The user returns to a clean session.
-#[test]
-fn auth_complete_strips_reauth_prompt_after_mid_session_login() {
-    use crate::scrollback::block::RenderBlock;
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    app.agents
-        .get_mut(&id)
-        .unwrap()
-        .scrollback
-        .push_block(RenderBlock::session_event(SessionEvent::ReAuthRequired));
-    dispatch(Action::Login, &mut app);
-    let seq = authenticating_seq(&app);
-    dispatch(
-        Action::TaskComplete(TaskResult::AuthComplete {
-            request_seq: seq,
-            meta: None,
-        }),
-        &mut app,
-    );
-    assert_eq!(app.active_view, ActiveView::Agent(id));
-    let sb = &expect_agent(&app, id).scrollback;
-    let has_reauth = (0..sb.len()).any(|i| {
-        matches!(
-            sb.entry(i).map(|e| &e.block),
-            Some(RenderBlock::SessionEvent(ev)) if matches!(ev.event, SessionEvent::ReAuthRequired)
-        )
-    });
-    assert!(
-        !has_reauth,
-        "re-auth prompt must be stripped after successful re-auth"
-    );
-}
-/// After a successful mid-session re-auth, the prompt that failed on the expired login is auto-resubmitted so the user doesn't have to retype it.
-#[test]
-fn auth_complete_retries_stashed_prompt_after_mid_session_login() {
-    use crate::scrollback::block::RenderBlock;
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    {
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent
-            .scrollback
-            .push_block(RenderBlock::session_event(SessionEvent::ReAuthRequired));
-        agent.reauth_stashed_prompt = Some(crate::app::agent::InFlightPrompt {
-            text: "retry me".into(),
-            images: Vec::new(),
-            scrollback_entry: crate::scrollback::EntryId::new(0),
-            combined_scrollback_entries: Vec::new(),
-            chip_elements: Vec::new(),
-        });
-    }
-    dispatch(Action::Login, &mut app);
-    let seq = authenticating_seq(&app);
-    let effects = dispatch(
-        Action::TaskComplete(TaskResult::AuthComplete {
-            request_seq: seq,
-            meta: None,
-        }),
-        &mut app,
-    );
-    assert_eq!(app.active_view, ActiveView::Agent(id));
-    let agent = &expect_agent(&app, id);
-    assert!(
-        agent.reauth_stashed_prompt.is_none(),
-        "stashed prompt must be consumed on re-auth"
-    );
-    assert!(
-        effects.iter().any(|e| matches!(
-            e,
-            Effect::SendPrompt { text, .. } if text == "retry me"
-        )),
-        "the stashed prompt must be auto-resubmitted, got: {effects:?}"
-    );
 }
 #[test]
 fn dispatch_new_session_answered_with_persist_never_updates_mode_and_emits_effect() {
@@ -3142,7 +2815,6 @@ fn dashboard_stop_with_peek_open_moves_selection_and_peek_down_one() {
             crate::views::dashboard::WorkspaceRowInputs::default(),
             None,
             false,
-            None,
             None,
         );
     };

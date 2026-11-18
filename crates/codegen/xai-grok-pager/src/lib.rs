@@ -11,7 +11,6 @@
 #![deny(clippy::indexing_slicing)]
 pub mod acp;
 pub mod actions;
-pub mod agent_runtime;
 pub mod app;
 pub mod best_effort_stderr;
 pub mod client_identity;
@@ -48,14 +47,12 @@ pub mod recent_dirs;
 pub mod scrollback;
 pub mod sessions_cmd;
 pub mod settings;
-pub mod share_cmd;
 pub mod signal_streams;
 pub mod slash;
 pub mod startup;
 pub mod tips;
 pub mod tool_usage;
 pub mod tutorial_docs;
-pub mod usage_cmd;
 pub mod wrap_clipboard_image;
 pub mod wrap_cmd;
 pub(crate) mod wrap_filter;
@@ -68,7 +65,6 @@ pub use xai_grok_pager_render::{
 };
 #[cfg(test)]
 pub mod test_util;
-pub mod trace_cmd;
 pub mod tracing;
 pub mod unified_log;
 pub mod views;

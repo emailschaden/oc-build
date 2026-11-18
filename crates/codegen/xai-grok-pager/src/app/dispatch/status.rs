@@ -53,9 +53,6 @@ pub(super) fn open_usage_info_modal(
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
-    let usage_visible = app.usage_visible;
-    let redirect_url = app.usage_billing_redirect_url.clone();
-    let tier = app.subscription_tier.clone();
     let show_resolved_model = app.show_resolved_model;
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
@@ -67,16 +64,11 @@ pub(super) fn open_usage_info_modal(
         return vec![];
     }
 
-    let billing_reachable = usage_visible && !agent.chat_kind && redirect_url.is_none();
     let nonce = next_usage_fetch_nonce();
     let mut state = UsageInfoModalState::new(
         tab,
         UsageInfoContext {
             session_id: session_id.as_ref().map(|s| s.0.to_string()),
-            usage_visible,
-            chat_kind: agent.chat_kind,
-            billing_redirect_url: redirect_url,
-            subscription_tier: tier,
         },
     );
     state.fetch_nonce = nonce;
@@ -100,39 +92,21 @@ pub(super) fn open_usage_info_modal(
             nonce,
         });
     }
-    // Silently refresh the cached billing mirrors the modal renders from
-    if billing_reachable {
-        state.billing_loading = true;
-        effects.push(Effect::FetchBilling {
-            agent_id: id,
-            silent: true,
-            nonce,
-        });
-    }
     agent.active_modal = Some(ActiveModal::UsageInfo {
         state: Box::new(state),
     });
     effects
 }
 
-/// Session-less variant: no session tabs to fetch, so only the account allowance is refreshed (agent-less `FetchAppBilling`).
-/// `chat_kind` follows the process-wide `--chat` flag, which is what every session created from this dashboard would carry.
+/// Session-less variant: nothing to fetch.
+// oc-build: opencode backend; no xAI account allowance.
 fn open_dashboard_usage_modal(
     app: &mut AppView,
     tab: crate::views::usage_modal::UsageInfoTab,
 ) -> Vec<Effect> {
     use crate::views::usage_modal::{UsageInfoContext, UsageInfoModalState};
 
-    let chat_kind = app.chat_mode;
-    let billing_reachable =
-        app.usage_visible && !chat_kind && app.usage_billing_redirect_url.is_none();
-    let ctx = UsageInfoContext {
-        session_id: None,
-        usage_visible: app.usage_visible,
-        chat_kind,
-        billing_redirect_url: app.usage_billing_redirect_url.clone(),
-        subscription_tier: app.subscription_tier.clone(),
-    };
+    let ctx = UsageInfoContext { session_id: None };
     let Some(dashboard) = app.dashboard.as_mut() else {
         return vec![];
     };
@@ -140,16 +114,8 @@ fn open_dashboard_usage_modal(
         state.set_tab(tab);
         return vec![];
     }
-    let mut state = UsageInfoModalState::new(tab, ctx);
-    let mut effects = Vec::new();
-    if billing_reachable {
-        let nonce = next_usage_fetch_nonce();
-        state.fetch_nonce = nonce;
-        state.billing_loading = true;
-        effects.push(Effect::FetchAppBilling { nonce });
-    }
-    dashboard.usage_modal = Some(Box::new(state));
-    effects
+    dashboard.usage_modal = Some(Box::new(UsageInfoModalState::new(tab, ctx)));
+    vec![]
 }
 
 /// `/session-info`: open the usage modal on its "Session info" tab, or fetch-and-show in scrollback in minimal mode.
@@ -335,40 +301,6 @@ pub(super) fn dispatch_show_context_info(app: &mut AppView) -> Vec<Effect> {
     }]
 }
 
-/// `/usage`: open the usage modal on its "Usage limit" tab.
-/// Minimal mode keeps the scrollback flow: session token/cost, then consumer credits.
-pub(super) fn dispatch_show_usage(app: &mut AppView) -> Vec<Effect> {
-    if !app.screen_mode.is_minimal() {
-        return open_usage_info_modal(app, crate::views::usage_modal::UsageInfoTab::UsageLimit);
-    }
-    let ActiveView::Agent(id) = app.active_view else {
-        return vec![];
-    };
-    let session_id = {
-        let Some(agent) = app.agents.get_mut(&id) else {
-            return vec![];
-        };
-        agent.session.session_id.clone()
-    };
-    match session_id {
-        Some(session_id) => vec![Effect::FetchSessionUsage {
-            agent_id: id,
-            session_id,
-            nonce: Default::default(),
-        }],
-        None => {
-            if let Some(agent) = app.agents.get_mut(&id) {
-                push_and_page_flip(
-                    &mut agent.scrollback,
-                    RenderBlock::system(
-                        "Session usage is unavailable until the session starts.".to_string(),
-                    ),
-                );
-            }
-            append_consumer_billing_surface(app, id)
-        }
-    }
-}
 
 /// Route a session-usage result (success or failure text) into the open usage modal, or into scrollback in minimal mode.
 /// Stale results are dropped.
@@ -409,59 +341,11 @@ pub(super) fn commit_session_usage_block(
         return vec![];
     }
     push_and_page_flip(&mut agent.scrollback, RenderBlock::system(text));
-    append_consumer_billing_surface(app, agent_id)
+    vec![]
 }
 
-/// Consumer credit follow-up for `/usage` (redirect or non-silent billing fetch).
-pub(super) fn append_consumer_billing_surface(app: &mut AppView, agent_id: AgentId) -> Vec<Effect> {
-    if !app.usage_visible {
-        return vec![];
-    }
-    // Remote-settings kill switch (`grok_build_usage_redirect_url`): link out instead of fetching billing from the backend
-    if let Some(url) = app.usage_billing_redirect_url.clone() {
-        if let Some(agent) = app.agents.get_mut(&agent_id) {
-            agent.scrollback.push_block(RenderBlock::System(
-                crate::scrollback::blocks::SystemMessageBlock::new(format!(
-                    "Please check your usage on {url}"
-                )),
-            ));
-        }
-        return vec![];
-    }
-    if !app.agents.contains_key(&agent_id) {
-        return vec![];
-    }
-    // Non-silent: the effect also pulls the auto top-up rule so the summary renders usage, prepaid credits, and auto top-up together
-    vec![Effect::FetchBilling {
-        agent_id,
-        silent: false,
-        nonce: Default::default(),
-    }]
-}
 
-/// `/usage manage`: open consumer billing. No-op when the surface is hidden.
-pub(super) fn dispatch_manage_billing(app: &mut AppView) -> Vec<Effect> {
-    if !app.usage_visible {
-        return vec![];
-    }
-    super::router::dispatch(
-        crate::app::actions::Action::OpenUrl("https://grok.com/?_s=usage".to_string()),
-        app,
-    )
-}
 
-/// Commit a one-line "update available" notice into the active agent's scrollback.
-/// Minimal mode has no welcome screen (where the full TUI shows updates), so the background update check's result is shown here instead.
-/// No-op when there is no active agent.
-pub(crate) fn commit_minimal_update_notice(app: &mut AppView, latest_version: &str) {
-    if let ActiveView::Agent(id) = app.active_view
-        && let Some(agent) = app.agents.get_mut(&id)
-    {
-        agent.scrollback.push_block(RenderBlock::system(format!(
-            "Update available: v{latest_version}. Restart to apply."
-        )));
-    }
-}
 
 /// `/queue`: commit a read-only list of the queued prompts as a system block.
 /// The text is built by [`crate::app::status_blocks::queue_block_text`]; this just resolves the active agent and pushes it.

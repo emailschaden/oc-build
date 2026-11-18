@@ -4268,16 +4268,6 @@
         });
         assert!(row.contains(" plan · always-approve "), "{row:?}");
         assert_eq!(1, row.matches('·').count(), "{row:?}");
-
-        let flags = [flag("plan")];
-        let row = info_row(&PromptInfo {
-            model_name: "",
-            flags: &flags,
-            usage_warning: Some("5% usage left"),
-            ..Default::default()
-        });
-        assert!(row.contains(" 5% usage left · plan "), "{row:?}");
-        assert_eq!(1, row.matches('·').count(), "{row:?}");
     }
 
     /// Colorless info-line chrome (uncolored flags, the "multiline" label)
@@ -4298,7 +4288,6 @@
                 model_name: "grok",
                 flags: &flags,
                 multiline: true,
-                ..Default::default()
             };
             let mut pw = PromptWidget::new();
             let style = PromptStyle {

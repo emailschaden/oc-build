@@ -80,14 +80,8 @@ pub enum Action {
     DeleteCurrentSessionAnswered {
         confirmed: bool,
     },
-    /// Open grok.com in the browser for SuperGrok subscription upsell.
-    OpenSupergrokUrl,
-    /// Re-check subscription status via the shell's `x.ai/auth/check_subscription`.
-    CheckSubscription,
     /// Open an arbitrary URL in the system browser (with scheme validation).
     OpenUrl(String),
-    /// Resubmit the prompt that last hit the credit/usage limit.
-    RetryCreditLimitPrompt,
     /// Open a semantic scrollback link.
     OpenLink(crate::render::osc8::LinkTarget),
     /// Open grok.com managed connectors, appending session teamId when set.
@@ -429,8 +423,6 @@ pub enum Action {
     CancelScheduledTask(String),
     /// Demote the currently running execute tool to a background task.
     DemoteToBackground,
-    /// Request current bundle cache status via `x.ai/bundle/status`.
-    RequestBundleStatus,
     /// Hide the announcements banner.
     AnnouncementsHide,
     /// Show the announcements banner.
@@ -629,23 +621,6 @@ pub enum Action {
     PermissionFollowup(String),
     /// User cancelled the front permission request (Ctrl-C / Esc in Options mode).
     PermissionCancel,
-    /// Log out: remove credentials and return to the login screen.
-    Logout,
-    /// Log out and immediately start a new login flow.
-    SwitchAccount,
-    /// User pressed login on the welcome screen.
-    Login,
-    /// Cancel an in-progress login that was started from inside a session (`/login` or a 401 re-auth prompt) and return to the previous view.
-    /// Distinct from `Quit`: abandoning a mid-session re-auth must not exit the app or lose the open session.
-    CancelLogin,
-    /// User submitted a manually-pasted auth token (loopback mode).
-    SubmitAuthCode(String),
-    /// Copy the auth URL to the clipboard during authentication.
-    CopyAuthUrl,
-    /// Show the raw auth URL with mouse capture disabled for manual copy.
-    ShowRawAuthUrl,
-    /// Hide the raw auth URL and re-enable mouse capture.
-    HideRawAuthUrl,
     /// Persist the shown workspace key. `Done` only after a durable write, an already-durable key, or auto-trust. A process-local persist stays `Pending`.
     /// already-durable key, or auto-trust. A process-local persist stays `Pending`.
     /// (Declining quits via [`Action::Quit`]; there is no decline action.)
@@ -674,10 +649,6 @@ pub enum Action {
     ResetSessionTitleToAuto,
     /// Show detailed context usage (progress bar, token breakdown, stats).
     ShowContextInfo,
-    /// `/usage`: session token/cost, plus consumer credits when visible.
-    ShowUsage,
-    /// `/usage manage`: open consumer billing (a no-op when billing is hidden).
-    ManageBilling,
     /// Commit a read-only list of the queued prompts as a system block (`/queue`).
     /// This is what minimal mode uses in place of the `QueuePane`.
     ShowQueue,
@@ -1509,9 +1480,6 @@ pub enum Effect {
         query: String,
         seq: u64,
     },
-    /// Fetch the leader session roster (FleetView dashboard) via `x.ai/sessions/list`.
-    /// Only issued in leader mode while the dashboard is open.
-    FetchRoster,
     /// Fetch the local on-disk session list (dormant/idle sessions) for the dashboard via `x.ai/session/list`.
     /// This is the non-leader fallback for the FleetView roster.
     /// Issued while the dashboard is open and NOT in leader mode so the dashboard shows idle sessions instead of being empty.
@@ -1644,8 +1612,6 @@ pub enum Effect {
         version: i32,
         acked: bool,
     },
-    /// Files the acceptance server side; the local marker is what stops the re-prompt if it fails.
-    RecordConsentUpstream { notice_id: String, version: i32 },
     /// Persist memory modal fullscreen preference to `[hints]` in config.toml.
     PersistMemoryFullscreen { fullscreen: bool },
     /// Persist the dashboard's `[dashboard]` configuration to `~/.grok/config.toml`.
@@ -1657,11 +1623,6 @@ pub enum Effect {
     PersistWorktreeMode {
         mode: crate::app::app_view::WorktreeMode,
         config_key: &'static str,
-    },
-    /// Persist preferred model (and effort if Some) to config.toml.
-    PersistPreferredModel {
-        model_id: acp::ModelId,
-        reasoning_effort: Option<ReasoningEffort>,
     },
     /// Persist the permission mode to config.toml and notify the agent via ACP.
     /// See [`PermissionModePersist`] for rollback behavior.
@@ -1779,17 +1740,6 @@ pub enum Effect {
         agent_id: AgentId,
         session_id: acp::SessionId,
     },
-    /// Send AuthenticateRequest to the agent.
-    Authenticate {
-        request_seq: u64,
-        method_id: acp::AuthMethodId,
-        use_oauth: bool,
-        force_interactive: bool,
-    },
-    /// Poll for auth URL from the agent (ext request).
-    PollAuthUrl { request_seq: u64 },
-    /// Submit a manually-pasted auth code (ext request).
-    SubmitAuthCode { request_seq: u64, code: String },
     /// Fetch MCP server list from the shell (x.ai/mcp/list).
     FetchMcpsList {
         agent_id: AgentId,
@@ -1860,11 +1810,6 @@ pub enum Effect {
     },
     /// Fetch marketplace plugin list from the shell.
     FetchMarketplaceList {
-        agent_id: AgentId,
-        session_id: acp::SessionId,
-    },
-    /// Background check and auto-update for marketplace plugins on session start.
-    CheckMarketplaceUpdates {
         agent_id: AgentId,
         session_id: acp::SessionId,
     },
@@ -1981,8 +1926,6 @@ pub enum Effect {
         /// Usage-modal fetch generation; echoed back on the task result.
         nonce: u64,
     },
-    /// Fetch current bundle cache status via `x.ai/bundle/status`.
-    FetchBundleStatus,
     /// Send feedback about the current session (fire-and-forget POST).
     /// `origin` rides through to the completion so a modal send's parked consent can be matched or dropped.
     SendFeedback {
@@ -2068,35 +2011,6 @@ pub enum Effect {
         /// `None` for text-only interjections; the wire shape stays byte-identical to legacy.
         blocks: Option<Vec<acp::ContentBlock>>,
     },
-    /// Log out via `x.ai/auth/logout` (shell clears auth.json and in-memory state).
-    Logout,
-    /// Cancel an in-flight interactive auth on the shell (`x.ai/auth/cancel`).
-    /// Used when the user abandons mid-session `/login` so the device-code poll stops instead of running until the code expires.
-    /// `request_seq` scopes the cancel so a delayed RPC cannot tear down a successor login.
-    CancelAuth { request_seq: u64 },
-    /// Re-check subscription status via `x.ai/auth/check_subscription`.
-    /// `verify` scopes the result to a deferred-gate verification (see [`crate::app::subscription`]); `None` for generic checks.
-    CheckSubscription { verify: Option<u64> },
-    /// `x.ai/auth/hydrate_team_capability` for `identity`; the answer is dropped if the account changed meanwhile.
-    HydrateTeamCapability {
-        identity: crate::app::app_view::AuthIdentity,
-    },
-    /// One-shot subscription re-check triggered by a credit-limit 403.
-    /// If the tier changed, the stashed prompt is retried instead of showing the upsell modal.
-    CreditLimitRecheck { agent_id: AgentId },
-    /// Schedule a 5s timer that fires `TaskResult::PaywallCheckTick`.
-    SchedulePaywallCheck,
-    /// Schedule `TaskResult::GateVerifyTimeout { generation }` after [`crate::app::subscription::GATE_VERIFY_TIMEOUT`].
-    /// [`crate::app::subscription::GATE_VERIFY_TIMEOUT`].
-    ScheduleGateVerifyTimeout { generation: u64 },
-    /// Log out then authenticate sequentially in one task.
-    SwitchAccount {
-        request_seq: u64,
-        method_id: acp::AuthMethodId,
-        use_oauth: bool,
-    },
-    /// Clear the auth copy feedback after a delay if its generation is still current.
-    ScheduleClearAuthCopyFeedback { generation: u64 },
     /// Register the current session in the active-session registry
     /// (`~/.grok/active_sessions.json`).
     RegisterActiveSession {
@@ -2190,21 +2104,6 @@ pub enum Effect {
         session_id: acp::SessionId,
         target_prompt_index: usize,
     },
-    /// Fetch billing/credit usage from the agent's `x.ai/billing` extension.
-    /// When `silent` is true the result updates `credit_balance` without pushing a system message into scrollback.
-    /// The silent form is used for automatic refreshes on session init and after each turn.
-    FetchBilling {
-        agent_id: AgentId,
-        silent: bool,
-        /// Usage-modal fetch generation (`0` means a background refresh; those never touch the modal's loading/error flags).
-        nonce: u64,
-    },
-    /// Fetch billing data at the app level (no agent required).
-    /// Used on startup to populate the welcome-screen credit warning, and by the dashboard's `/usage` modal.
-    FetchAppBilling {
-        /// Usage-modal fetch generation (`0` means a background refresh that settles no modal).
-        nonce: u64,
-    },
     /// Fetch per-session token/cost via `x.ai/session/usage` (auth-agnostic).
     FetchSessionUsage {
         agent_id: AgentId,
@@ -2212,8 +2111,6 @@ pub enum Effect {
         /// Usage-modal fetch generation; echoed back on the task result.
         nonce: u64,
     },
-    /// Re-fetch remote settings to check subscription gate.
-    RefreshGate,
     /// Spawn a debounce sleep task for shell suggestions.
     /// `agent_id` rides to the expiry so the fetch is built from the arming agent, not whatever view is active when the timer fires.
     DebounceSuggestions { agent_id: AgentId, generation: u64 },
@@ -2233,16 +2130,6 @@ pub enum Effect {
         session_id: Option<String>,
         /// Deterministic Tab fetches run only the shell's token providers (path/file); the as-you-type pipeline keeps all of them.
         token_only: bool,
-    },
-    /// Send an ACP `x.ai/suggestPrompt` request to the shell.
-    /// It predicts the user's likely next prompt after a completed turn (tab autocomplete ghost text).
-    FetchPromptSuggestion {
-        agent_id: AgentId,
-        generation: u64,
-        /// Suggestion model resolved by the pager (`grok-4.6` when the catalog offers it).
-        /// `None` makes the shell fall back to the session model.
-        model: Option<String>,
-        session_id: Option<String>,
     },
     /// Probe the clipboard for an attachment off the event-loop thread (osascript image/file-url read, image decode, session persist).
     /// The chip then attaches via [`TaskResult::ClipboardAttachmentProbed`].
@@ -2536,14 +2423,6 @@ pub enum TaskResult {
         query: String,
         seq: u64,
     },
-    /// Leader session roster loaded via `x.ai/sessions/list`.
-    RosterLoaded {
-        sessions: Vec<crate::app::roster::RosterEntry>,
-    },
-    /// Leader session roster fetch failed (silent; no error modal).
-    RosterFailed {
-        error: String,
-    },
     /// Local on-disk session list loaded for the dashboard (non-leader fallback).
     /// Entries are pre-converted to `RosterEntry` (activity `Dormant`) so they reuse the roster-row rendering path.
     /// A fetch failure yields an empty list (silent; the next poll retries).
@@ -2638,11 +2517,6 @@ pub enum TaskResult {
     SetSessionModeFailed {
         session_id: acp::SessionId,
     },
-    /// The marker can stop advertising itself as unsent.
-    ConsentRecorded {
-        notice_id: String,
-        version: i32,
-    },
     /// The answer stands for this run, but nothing on disk holds it, so the notice returns at the next launch.
     ConsentPersistFailed {
         error: String,
@@ -2653,9 +2527,6 @@ pub enum TaskResult {
         subagent_id: String,
         attempt_id: Option<String>,
         outcome: SubagentKillOutcome,
-    },
-    PreferredModelPersisted {
-        result: Result<(), String>,
     },
     /// Manual `/compact` command completed.
     CompactComplete {
@@ -2701,30 +2572,6 @@ pub enum TaskResult {
     SessionAgentNameResolved {
         agent_id: AgentId,
         agent_name: Option<String>,
-    },
-    /// Authentication completed successfully.
-    AuthComplete {
-        request_seq: u64,
-        meta: Option<serde_json::Value>,
-    },
-    /// Authentication failed.
-    AuthFailed {
-        request_seq: u64,
-        error: String,
-    },
-    /// Auth URL is ready (from the provider).
-    AuthUrlReady {
-        request_seq: u64,
-        auth_url: Option<String>,
-        /// Deprecated: superseded by `mode` (authoritative).
-        /// Kept only as a back-compat fallback for older agents that don't send `mode`.
-        external: bool,
-        /// Presentation mode from `x.ai/auth/get_url`; `None` on older agents.
-        mode: Option<String>,
-    },
-    /// Auth code was submitted (fire-and-forget).
-    AuthCodeSubmitted {
-        request_seq: u64,
     },
     /// MCP server list fetched from shell.
     McpsListLoaded {
@@ -2814,11 +2661,6 @@ pub enum TaskResult {
     SkillsToggleDone {
         agent_id: AgentId,
         result: Result<xai_grok_shell::extensions::skills::SkillsListResponse, String>,
-    },
-    /// Background marketplace auto-update completed.
-    MarketplaceUpdatesAvailable {
-        agent_id: AgentId,
-        updates: Vec<(String, String, String)>,
     },
     /// Marketplace action completed.
     MarketplaceActionResult {
@@ -3016,21 +2858,6 @@ pub enum TaskResult {
         /// Nonce from the originating RewriteMemoryNote effect; must match the modal's `rewrite_nonce` before populating enhanced_content.
         nonce: u64,
     },
-    /// Bundle status fetched successfully.
-    BundleStatusReady {
-        has_cache: bool,
-        version: Option<String>,
-        personas: Vec<String>,
-        roles: Vec<String>,
-        agents: Vec<String>,
-        skills: Vec<String>,
-        persona_details: Vec<super::bundle::PersonaDetail>,
-        role_details: Vec<super::bundle::RoleDetail>,
-    },
-    /// Bundle status fetch failed.
-    BundleStatusFailed {
-        error: String,
-    },
     /// Side question (/btw) response received.
     BtwResponse {
         agent_id: AgentId,
@@ -3074,37 +2901,6 @@ pub enum TaskResult {
         session_id: acp::SessionId,
         commands: Vec<acp::AvailableCommand>,
     },
-    /// Shell acknowledged logout (auth cleared).
-    LogoutComplete,
-    /// Best-effort `x.ai/auth/cancel` finished (no UI update; state already left Authenticating).
-    AuthCancelComplete,
-    /// Shell responded to `x.ai/auth/check_subscription`.
-    /// `verify` echoes the generation from `Effect::CheckSubscription` for deferred-gate verifications.
-    CheckSubscriptionComplete {
-        verify: Option<u64>,
-        meta: Option<serde_json::Value>,
-    },
-    /// `None` is unresolved or a failed RPC; the next launch asks again.
-    TeamCapabilityHydrated {
-        identity: crate::app::app_view::AuthIdentity,
-        can_administer_team: Option<bool>,
-    },
-    /// Result of the credit-limit subscription re-check.
-    /// If the tier changed the stashed prompt is retried; otherwise the upsell is shown.
-    CreditLimitRecheckComplete {
-        agent_id: AgentId,
-        meta: Option<serde_json::Value>,
-    },
-    /// 5s paywall check timer fired: time to send another check.
-    PaywallCheckTick,
-    /// The deferred-gate verification window expired.
-    GateVerifyTimeout {
-        generation: u64,
-    },
-    /// The 2-second auth copy feedback timer expired.
-    AuthCopyFeedbackTimeout {
-        generation: u64,
-    },
     DeepSearchResults {
         /// Echo of [`Effect::DeepSearchSessions::host`].
         host: crate::views::session_picker_surface::SessionPickerHost,
@@ -3145,44 +2941,6 @@ pub enum TaskResult {
         agent_id: AgentId,
         error: String,
     },
-    /// Billing data fetched from the agent.
-    BillingFetched {
-        agent_id: AgentId,
-        balance: Option<crate::views::credit_bar::CreditBalance>,
-        /// When true, update `credit_balance` silently (no scrollback message).
-        silent: bool,
-        /// Subscription tier piggybacked from remote settings.
-        subscription_tier: Option<String>,
-        /// Auto top-up rule fetch result; `Unchanged` keeps any cached rule.
-        autotopup: crate::views::credit_bar::AutoTopupFetch,
-        /// Usage-modal fetch generation (`0` means a background refresh).
-        nonce: u64,
-    },
-    /// App-level billing data (welcome screen, dashboard usage modal).
-    AppBillingFetched {
-        balance: Option<crate::views::credit_bar::CreditBalance>,
-        autotopup: crate::views::credit_bar::AutoTopupFetch,
-        /// Usage-modal fetch generation (`0` means a background refresh).
-        nonce: u64,
-    },
-    /// App-level billing fetch failed (transport or parse); the cached balance is kept.
-    AppBillingError {
-        error: String,
-        /// Usage-modal fetch generation (`0` means a background refresh).
-        nonce: u64,
-    },
-    GateRefreshed {
-        settings: Option<xai_grok_shell::util::config::RemoteSettings>,
-    },
-    /// Billing fetch failed with an error message.
-    BillingError {
-        agent_id: AgentId,
-        error: String,
-        /// When true, swallow the error silently (background refresh).
-        silent: bool,
-        /// Usage-modal fetch generation (`0` means a background refresh).
-        nonce: u64,
-    },
     /// Debounce timer for shell suggestions expired.
     /// Routed by the arming `agent_id`, like the sibling `PluginCtaDebounceExpired`.
     SuggestionDebounceExpired {
@@ -3202,13 +2960,6 @@ pub enum TaskResult {
         response: crate::views::suggestion_controller::SuggestResponseParsed,
         request_text: String,
         request_cursor: usize,
-    },
-    /// Predicted next prompt loaded from ACP `x.ai/suggestPrompt`.
-    /// `suggestion` is `None` when the shell had nothing to suggest.
-    PromptSuggestionLoaded {
-        agent_id: AgentId,
-        suggestion: Option<String>,
-        generation: u64,
     },
     /// Setting persisted successfully. No reconciliation needed today.
     SettingPersisted {

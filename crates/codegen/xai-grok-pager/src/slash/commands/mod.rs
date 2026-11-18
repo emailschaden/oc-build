@@ -7,8 +7,8 @@ pub mod cd;
 pub mod compact;
 pub mod compact_mode;
 pub mod config_agents;
-pub mod context;
 pub mod context_window;
+pub mod context;
 pub mod copy;
 pub mod dashboard;
 pub mod debug;
@@ -21,7 +21,6 @@ pub mod effort_levels;
 pub mod exit;
 pub mod expand;
 pub mod export;
-pub mod feedback;
 pub mod find;
 pub mod fork;
 pub mod gboom;
@@ -32,8 +31,6 @@ pub mod imagine;
 pub mod imagine_video;
 pub mod import_claude;
 pub mod jump;
-pub mod login;
-pub mod logout;
 pub mod loop_cmd;
 pub mod mcps;
 pub mod memory;
@@ -44,18 +41,15 @@ pub mod new;
 pub mod personas;
 pub mod plan;
 pub mod plugin;
-pub mod privacy;
 pub mod queue;
 pub mod recap;
 pub mod release_notes;
-pub mod remember;
 pub mod rename;
 pub mod resume;
 pub mod rewind;
 pub mod screen_mode_switch;
 pub mod session_info;
 pub mod settings_cmd;
-pub mod share;
 pub mod tasks;
 pub mod theme;
 pub mod timeline;
@@ -63,12 +57,8 @@ pub mod timestamps;
 pub mod toggle_mouse_reporting;
 pub mod transcript;
 pub mod tutorial;
-pub mod usage;
 pub mod view_plan;
 pub mod vim_mode;
-pub mod voice;
-pub mod workflow;
-pub mod workflows;
 use super::command::SlashCommand;
 use std::sync::Arc;
 /// All pager-local builtin commands, in menu order: this vec breaks ties after MRU recency and tags, so moving an entry moves it in the menu.
@@ -80,14 +70,11 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(tutorial::TutorialCommand),
         Arc::new(settings_cmd::SettingsCommand),
         Arc::new(dashboard::DashboardCommand),
-        Arc::new(workflows::WorkflowsCommand),
         Arc::new(plugin::PluginsCommand),
         Arc::new(btw::BtwCommand),
-        Arc::new(voice::VoiceCommand),
         Arc::new(new::NewCommand),
         // Per turn.
         Arc::new(effort::EffortCommand),
-        Arc::new(context_window::ContextWindowCommand),
         Arc::new(model::ModelCommand),
         Arc::new(context::ContextCommand),
         Arc::new(compact::CompactCommand),
@@ -97,7 +84,6 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(loop_cmd::LoopCommand),
         Arc::new(plan::PlanCommand),
         Arc::new(view_plan::ViewPlanCommand),
-        Arc::new(remember::RememberCommand),
         Arc::new(memory::MemoryCommand),
         Arc::new(memory_ops::FlushCommand),
         Arc::new(memory_ops::DreamCommand),
@@ -109,21 +95,16 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(queue::QueueCommand),
         // This session and what came out of it.
         Arc::new(session_info::SessionInfoCommand),
-        Arc::new(share::ShareCommand),
         Arc::new(rename::RenameCommand),
         Arc::new(history::HistoryCommand),
         Arc::new(transcript::TranscriptCommand),
         Arc::new(export::ExportCommand),
         Arc::new(copy::CopyCommand),
         Arc::new(find::FindCommand),
-        Arc::new(usage::UsageCommand),
         Arc::new(tasks::TasksCommand),
         // Extending the agent.
         Arc::new(plugin::SkillsCommand),
         Arc::new(mcps::McpsCommand),
-        Arc::new(plugin::HooksCommand),
-        Arc::new(plugin::MarketplaceCommand),
-        Arc::new(workflow::WorkflowCommand),
         Arc::new(personas::PersonasCommand),
         Arc::new(config_agents::ConfigAgentsCommand),
         // Settings and display.
@@ -147,12 +128,8 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(docs::DocsCommand),
         Arc::new(release_notes::ReleaseNotesCommand),
         Arc::new(announcements::AnnouncementsCommand),
-        Arc::new(feedback::FeedbackCommand),
-        Arc::new(privacy::PrivacyCommand),
         Arc::new(doctor::DoctorCommand),
         Arc::new(import_claude::ImportClaudeCommand),
-        Arc::new(login::LoginCommand),
-        Arc::new(logout::LogoutCommand),
         Arc::new(home::HomeCommand),
         Arc::new(delete::DeleteCommand),
         Arc::new(help::HelpCommand),
@@ -204,8 +181,6 @@ mod tests {
             session_id: None,
             bundle_state: &DEFAULT_BUNDLE_STATE,
             screen_mode: crate::app::ScreenMode::Inline,
-            billing_surface_visible: true,
-            usage_command_visible: true,
             pager_state: crate::settings::PagerLocalSnapshot {
                 multiline_mode: false,
                 yolo_mode: false,
@@ -439,8 +414,6 @@ mod tests {
             models: &models,
             cwd: std::path::Path::new("."),
             has_session_announcements: false,
-            billing_surface_visible: true,
-            usage_command_visible: true,
             workflows_available: true,
             saved_workflows: &[],
             workflow_runs: &[],
@@ -468,8 +441,6 @@ mod tests {
             models: &models,
             cwd: std::path::Path::new("."),
             has_session_announcements: false,
-            billing_surface_visible: true,
-            usage_command_visible: true,
             workflows_available: true,
             saved_workflows: &[],
             workflow_runs: &[],
@@ -478,153 +449,6 @@ mod tests {
         };
         let cmd = model::ModelCommand;
         assert!(cmd.suggest_args(&ctx, "").is_none());
-    }
-    #[test]
-    fn remember_no_args_enters_remember_mode() {
-        let models = ModelState::default();
-        let mut ctx = make_ctx(&models);
-        let cmd = remember::RememberCommand;
-        let result = cmd.run(&mut ctx, "");
-        assert!(matches!(
-            result,
-            CommandResult::Action(Action::EnterRememberMode)
-        ));
-    }
-    #[test]
-    fn remember_with_args_sends_note() {
-        let models = ModelState::default();
-        let mut ctx = make_ctx(&models);
-        let cmd = remember::RememberCommand;
-        let result = cmd.run(&mut ctx, "important detail");
-        match result {
-            CommandResult::Action(Action::SendRememberNote(text)) => {
-                assert_eq!(text, "important detail");
-            }
-            other => panic!("expected SendRememberNote, got {other:?}"),
-        }
-    }
-    #[test]
-    fn remember_whitespace_only_enters_remember_mode() {
-        let models = ModelState::default();
-        let mut ctx = make_ctx(&models);
-        let cmd = remember::RememberCommand;
-        let result = cmd.run(&mut ctx, "   ");
-        assert!(matches!(
-            result,
-            CommandResult::Action(Action::EnterRememberMode)
-        ));
-    }
-    fn run_usage(args: &str, billing: bool) -> CommandResult {
-        run_usage_gated(args, billing, true)
-    }
-    fn run_usage_gated(args: &str, billing: bool, usage_cmd: bool) -> CommandResult {
-        let models = ModelState::default();
-        let mut ctx = make_ctx(&models);
-        ctx.billing_surface_visible = billing;
-        ctx.usage_command_visible = usage_cmd;
-        usage::UsageCommand.run(&mut ctx, args)
-    }
-    #[test]
-    fn usage_consumer_show_and_manage() {
-        assert!(matches!(
-            run_usage("", true),
-            CommandResult::Action(Action::ShowUsage)
-        ));
-        assert!(matches!(
-            run_usage("show", true),
-            CommandResult::Action(Action::ShowUsage)
-        ));
-        assert!(matches!(
-            run_usage("  manage  ", true),
-            CommandResult::Action(Action::ManageBilling)
-        ));
-        assert!(matches!(run_usage("delete", true), CommandResult::Error(_)));
-    }
-    #[test]
-    fn usage_non_consumer_is_bare_only() {
-        assert!(matches!(
-            run_usage("", false),
-            CommandResult::Action(Action::ShowUsage)
-        ));
-        assert!(matches!(
-            run_usage("manage", false),
-            CommandResult::Error(_)
-        ));
-        assert!(matches!(run_usage("show", false), CommandResult::Error(_)));
-    }
-    #[test]
-    fn usage_takes_args_only_for_consumer() {
-        let models = ModelState::default();
-        let mut ctx = crate::slash::command::AppCtx {
-            models: &models,
-            cwd: std::path::Path::new("."),
-            has_session_announcements: false,
-            billing_surface_visible: true,
-            usage_command_visible: true,
-            workflows_available: true,
-            saved_workflows: &[],
-            workflow_runs: &[],
-            screen_mode: crate::app::ScreenMode::Fullscreen,
-            current_title: None,
-        };
-        let cmd = usage::UsageCommand;
-        assert!(cmd.takes_args_now(&ctx));
-        ctx.billing_surface_visible = false;
-        assert!(!cmd.takes_args_now(&ctx));
-    }
-    #[test]
-    fn usage_suggest_args_consumer_only() {
-        let models = ModelState::default();
-        let mut ctx = crate::slash::command::AppCtx {
-            models: &models,
-            cwd: std::path::Path::new("."),
-            has_session_announcements: false,
-            billing_surface_visible: true,
-            usage_command_visible: true,
-            workflows_available: false,
-            saved_workflows: &[],
-            workflow_runs: &[],
-            screen_mode: crate::app::ScreenMode::Fullscreen,
-            current_title: None,
-        };
-        let items = usage::UsageCommand.suggest_args(&ctx, "").unwrap();
-        assert_eq!(
-            items.iter().map(|i| i.display.as_str()).collect::<Vec<_>>(),
-            ["show", "manage"]
-        );
-        ctx.billing_surface_visible = false;
-        assert!(usage::UsageCommand.suggest_args(&ctx, "").is_none());
-    }
-    #[test]
-    fn usage_registered_in_builtin_commands() {
-        assert!(
-            CommandRegistry::new(builtin_commands())
-                .get("usage")
-                .is_some()
-        );
-    }
-    #[test]
-    fn usage_hidden_when_command_not_visible() {
-        let models = ModelState::default();
-        let ctx = crate::slash::command::AppCtx {
-            models: &models,
-            cwd: std::path::Path::new("."),
-            has_session_announcements: false,
-            billing_surface_visible: true,
-            usage_command_visible: false,
-            workflows_available: false,
-            saved_workflows: &[],
-            workflow_runs: &[],
-            screen_mode: crate::app::ScreenMode::Fullscreen,
-            current_title: None,
-        };
-        assert!(!usage::UsageCommand.visible(&ctx));
-        assert!(!usage::UsageCommand.takes_args_now(&ctx));
-        assert!(usage::UsageCommand.suggest_args(&ctx, "").is_none());
-        assert!(matches!(
-            run_usage_gated("", true, false),
-            CommandResult::Error(msg) if msg.contains("not available")
-        ));
     }
     #[test]
     fn cd_registered_in_builtin_commands() {
@@ -651,11 +475,6 @@ mod tests {
         );
     }
     #[test]
-    fn cost_aliases_usage() {
-        let reg = CommandRegistry::new(builtin_commands());
-        assert_eq!(reg.get("cost").expect("/cost").name(), "usage");
-    }
-    #[test]
     fn debug_is_registered_and_executable() {
         let reg = CommandRegistry::new(builtin_commands());
         assert!(reg.get("debug").is_some(), "/debug must be executable");
@@ -672,8 +491,6 @@ mod tests {
             models: &models,
             cwd: std::path::Path::new("."),
             has_session_announcements: false,
-            billing_surface_visible: true,
-            usage_command_visible: true,
             workflows_available: true,
             saved_workflows: &[],
             workflow_runs: &[],
@@ -752,18 +569,6 @@ mod tests {
         assert!(reg.get("recap").is_some());
         reg.set_recap_visible(false);
         assert!(reg.get("recap").is_none());
-    }
-    #[test]
-    fn voice_hidden_by_default_in_registry_until_revealed() {
-        let mut reg = CommandRegistry::new(builtin_commands());
-        assert!(
-            reg.get("voice").is_none(),
-            "/voice must be fail-closed until set_voice_visible(true)"
-        );
-        reg.set_voice_visible(true);
-        assert!(reg.get("voice").is_some());
-        reg.set_voice_visible(false);
-        assert!(reg.get("voice").is_none());
     }
     /// Every pager builtin trigger key must appear in the shell's `PAGER_COMMAND_KEYS`.
     /// Add new names there when adding a pager builtin.

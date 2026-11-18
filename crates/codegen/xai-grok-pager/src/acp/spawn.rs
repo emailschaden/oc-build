@@ -10,7 +10,6 @@ use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
 
 use xai_acp_lib::AcpClientChannel;
-use xai_grok_login::AuthManager;
 use xai_grok_shell::agent::activity::SESSION_FLUSH_GRACE;
 
 /// Extra slack when joining the agent OS thread after cancel so the flush
@@ -56,9 +55,6 @@ pub struct SpawnedAgent {
     pub thread_handle: thread::JoinHandle<Result<()>>,
     pub channel: AcpClientChannel,
     pub cancel: CancellationToken,
-    /// The agent's `AuthManager`, shared so pager-side consumers (e.g. the voice
-    /// channel) resolve the same refreshing bearer as chat traffic.
-    pub auth_manager: std::sync::Arc<AuthManager>,
 }
 
 /// The single teardown mechanism for an in-process agent: cancels the worker and joins it on drop, so session

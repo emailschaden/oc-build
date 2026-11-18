@@ -1197,37 +1197,6 @@ mod tests {
     }
 
     #[test]
-    fn edit_local_feedback_carries_the_submitted_images() {
-        let mut agent = enter_edit_local_row();
-        agent.prompt.set_text("/feedback report ");
-        let end = agent.prompt.text().len();
-        agent.prompt.set_cursor(end);
-        agent
-            .prompt
-            .insert_image(crate::prompt_images::from_clipboard_data(
-                &crate::clipboard::ImageData {
-                    data: vec![
-                        0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0, 0, 0, 0, 0,
-                    ],
-                    mime_type: "image/png".to_owned(),
-                },
-            ))
-            .expect("chip");
-
-        let outcome = agent.handle_prompt_key_for_test(&enter_key());
-
-        match outcome {
-            InputOutcome::Action(Action::RunEditedQueuedCommand { submission, .. }) => {
-                assert_eq!(submission.images.len(), 1);
-                assert_eq!(submission.text_without_image_chips(), "/feedback report  ");
-            }
-            other => panic!("expected RunEditedQueuedCommand, got {other:?}"),
-        }
-        assert!(matches!(agent.prompt_mode, PromptMode::Normal));
-        assert!(agent.prompt.images.is_empty());
-    }
-
-    #[test]
     fn builtin_accepted_from_dropdown_mid_edit_runs_on_the_next_enter() {
         let mut agent = enter_edit_local_row();
         agent.prompt.set_text("/btw");
@@ -1859,10 +1828,7 @@ mod tests {
         // Re-enter edit mode so the guarded body (not the idempotency early-return) is what leaves the palette alone
         agent.prompt_mode = editing_lone_local();
         agent.active_modal = Some(ActiveModal::CommandPalette {
-            entries: crate::views::modal::default_palette_entries(
-                agent.sharing_enabled,
-                &agent.prompt.slash_controller,
-            ),
+            entries: crate::views::modal::default_palette_entries(&agent.prompt.slash_controller),
             state: crate::views::picker::PickerState::input_active(),
             window: crate::views::modal_window::ModalWindowState::new(),
         });

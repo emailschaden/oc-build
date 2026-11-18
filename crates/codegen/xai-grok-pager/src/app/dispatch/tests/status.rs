@@ -2,59 +2,6 @@
 
 use super::*;
 
-/// Regression for the leader-mode turn-end race: this client is briefly Idle while the server still has queued prompts.
-/// Idle here means `is_turn_running() == false` with `current_prompt_id` cleared; the server's queue is visible as a non-empty `shared_queue` mirror.
-/// A newly-sent prompt must route to the server (immediate-send), not drain locally as a phantom running turn.
-#[test]
-fn send_while_idle_with_nonempty_shared_queue_routes_to_server() {
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    // Two prompts already queued on the server (as a broadcast would leave things): populate the authoritative map and mirror it into the agent
-    app.push_optimistic_prompt_echo("test-session", "q1", "a", "prompt");
-    app.push_optimistic_prompt_echo("test-session", "q2", "b", "prompt");
-    {
-        let snapshot = app.shared_prompt_queue("test-session").cloned().unwrap();
-        let agent = app.agents.get_mut(&id).unwrap();
-        // Turn-end window: locally Idle with no current prompt, but the server's queue (mirrored from the last broadcast) still has work
-        agent.session.state = AgentState::Idle;
-        agent.session.current_prompt_id = None;
-        agent.shared_queue = snapshot;
-        assert!(agent.session.pending_prompts.is_empty());
-    }
-
-    let effects = dispatch(Action::SendPrompt("c".into()), &mut app);
-
-    // Routed to the server (immediate-send), keyed by a fresh prompt_id.
-    let pid = effects
-        .iter()
-        .find_map(|e| match e {
-            Effect::SendPrompt {
-                text, prompt_id, ..
-            } if text == "c" => Some(prompt_id.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("expected immediate SendPrompt for 'c', got {effects:?}"));
-    // The dispatch did not start a local turn or adopt "c" as the running prompt
-    let Some(agent) = app.agents.get(&id) else {
-        panic!("expected agent {id:?}");
-    };
-    assert!(
-        !agent.session.state.is_turn_running(),
-        "must not promote 'c' to a local running turn"
-    );
-    assert!(
-        agent.session.current_prompt_id.is_none(),
-        "must not set current_prompt_id locally for a server-queued prompt"
-    );
-    // Echoed into the shared queue behind the existing entries (position 3)
-    let q = app
-        .shared_prompt_queue("test-session")
-        .expect("optimistic echo present");
-    assert_eq!(q.len(), 3, "c queued behind q1, q2");
-    assert_eq!(q.last().map(|e| e.id.as_str()), Some(pid.as_str()));
-    assert_eq!(q.last().map(|e| e.text.as_str()), Some("c"));
-}
-
 // coding data sharing dispatch tests
 // The dispatcher mutates optimistically and rolls back on failure, matching the `set_yolo_mode` pattern minus its toasts
 // Guards (ZDR, non-admin team) toast and short-circuit; they are the only paths that still speak up, because nothing else on screen would
@@ -730,137 +677,6 @@ fn personal_account_sees_the_banner_without_a_capability() {
     );
 }
 
-/// A personal account carries a `team_id` yet gets `null` from `/user` forever, so only the principal type decides; without an email there is no identity to bind the answer to.
-#[test]
-fn hydration_asks_only_for_unresolved_team_principals() {
-    let mut app = test_app_with_agent();
-    app.team_id = Some("team-a".into());
-    for (team_principal, capability, api_key, email, asks) in [
-        (false, None, false, Some("a@acme.test"), false),
-        (true, None, false, Some("a@acme.test"), true),
-        (true, Some(false), false, Some("a@acme.test"), false),
-        (true, None, true, Some("a@acme.test"), false),
-        (true, None, false, None, false),
-    ] {
-        app.is_team_principal = team_principal;
-        app.can_administer_team = capability;
-        app.is_api_key_auth = api_key;
-        app.account_email = email.map(str::to_owned);
-        assert_eq!(
-            asks,
-            app.needs_team_capability_hydration(),
-            "team_principal={team_principal} {capability:?} api_key={api_key} {email:?}"
-        );
-    }
-}
-
-/// The open modal renders from a copied snapshot: the row must lock there too and a chooser open on it must close; a slower answer after that changes nothing.
-#[test]
-fn hydrated_denial_locks_open_settings_row_and_closes_chooser() {
-    use crate::settings::CodingDataSharingLock;
-    use crate::views::modal::ActiveModal;
-    use crate::views::settings_modal::SettingsModalMode;
-
-    let mut app = test_app_with_agent();
-    app.account_email = Some("a@acme.test".into());
-    app.coding_data_retention_opt_out = true;
-    let _ = dispatch(
-        Action::OpenSettingsFocus {
-            key: "coding_data_sharing",
-        },
-        &mut app,
-    );
-    let chooser_open = |app: &AppView| {
-        let Some(ActiveModal::Settings { state }) =
-            &app.agents.get(&AgentId(0)).unwrap().active_modal
-        else {
-            panic!("settings modal must stay open")
-        };
-        (
-            state.row_lock("coding_data_sharing"),
-            matches!(state.mode(), SettingsModalMode::PickingEnum { .. }),
-        )
-    };
-    assert_eq!(chooser_open(&app), (None, true));
-
-    for late in [Some(false), Some(true)] {
-        let _ = dispatch(
-            Action::TaskComplete(TaskResult::TeamCapabilityHydrated {
-                identity: app.auth_identity(),
-                can_administer_team: late,
-            }),
-            &mut app,
-        );
-        assert_eq!(
-            chooser_open(&app),
-            (Some(CodingDataSharingLock::TeamManaged), false)
-        );
-    }
-    assert!(app.coding_data_retention_opt_out);
-}
-
-/// A late answer for the previous account must not land on the new one; two users without an email are not the same account, nor is the same user re-signed-in as a User principal.
-#[test]
-fn hydration_answer_for_another_account_is_dropped() {
-    for (asked_email, now_email, now_team_principal) in [
-        (Some("a@acme.test"), Some("b@acme.test"), true),
-        (None, None, true),
-        (Some("a@acme.test"), Some("a@acme.test"), false),
-    ] {
-        let mut app = test_app_with_agent();
-        app.is_team_principal = true;
-        app.account_email = asked_email.map(str::to_owned);
-        let asked_as = app.auth_identity();
-        app.account_email = now_email.map(str::to_owned);
-        app.is_team_principal = now_team_principal;
-        let _ = dispatch(
-            Action::TaskComplete(TaskResult::TeamCapabilityHydrated {
-                identity: asked_as,
-                can_administer_team: Some(false),
-            }),
-            &mut app,
-        );
-        assert_eq!(
-            app.can_administer_team, None,
-            "{asked_email:?} -> {now_email:?} team_principal={now_team_principal}"
-        );
-    }
-}
-
-/// A re-check snapshot built before hydration must not clear the capability for the same account and must replace it for another, or a personal account would inherit a team denial.
-#[test]
-fn recheck_keeps_hydrated_capability_only_for_the_same_account() {
-    let team = xai_grok_login::AuthMeta {
-        email: Some("a@acme.test".into()),
-        team_id: Some("team-a".into()),
-        is_team_principal: true,
-        ..xai_grok_login::AuthMeta::default()
-    };
-    let personal = xai_grok_login::AuthMeta {
-        is_team_principal: false,
-        ..team.clone()
-    };
-    for (snapshot, expected) in [(team, Some(false)), (personal, None)] {
-        let mut app = test_app_with_agent();
-        app.account_email = Some("a@acme.test".into());
-        app.team_id = Some("team-a".into());
-        app.is_team_principal = true;
-        app.can_administer_team = Some(false);
-        let _ = dispatch(
-            Action::TaskComplete(TaskResult::CheckSubscriptionComplete {
-                verify: None,
-                meta: Some(serde_json::to_value(&snapshot).unwrap()),
-            }),
-            &mut app,
-        );
-        assert_eq!(
-            app.can_administer_team, expected,
-            "team_principal={}",
-            snapshot.is_team_principal
-        );
-    }
-}
-
 /// `[Opt in]` success: ACP confirmation acks the banner.
 #[test]
 fn privacy_banner_opt_in_success_acks() {
@@ -966,56 +782,6 @@ fn privacy_banner_opt_out_noop_while_opt_in_inflight() {
     );
 }
 
-/// Coalescing and the idle opt-in shortcut key on the pending write's choice, not the mirror a subscription check can
-/// rewrite mid-flight. Otherwise a pending opt-in lands as the answer to Opt out, or Opt in acks with nothing sent.
-#[test]
-fn stale_mirror_does_not_coalesce_an_opposite_choice() {
-    for pending in [true, false] {
-        let mut app = privacy_banner_ready_app();
-        app.coding_data_retention_opt_out = pending;
-        let _ = dispatch(Action::SetCodingDataSharing { opted_in: pending }, &mut app);
-
-        // Background refresh still carries the pre-write value
-        let meta = serde_json::to_value(xai_grok_login::AuthMeta {
-            coding_data_retention_opt_out: pending,
-            ..Default::default()
-        })
-        .unwrap();
-        let _ = dispatch(
-            Action::TaskComplete(TaskResult::CheckSubscriptionComplete {
-                verify: None,
-                meta: Some(meta),
-            }),
-            &mut app,
-        );
-        assert_eq!(
-            app.coding_data_retention_opt_out, pending,
-            "mirror rewritten"
-        );
-        assert_eq!(
-            app.coding_data_pending_opted_in(),
-            Some(pending),
-            "pending untouched"
-        );
-
-        let effects = dispatch(
-            Action::SetCodingDataSharing { opted_in: !pending },
-            &mut app,
-        );
-        assert!(
-            matches!(
-                effects.as_slice(),
-                [Effect::SetCodingDataSharing { opted_in, seq: 2, .. }] if *opted_in != pending
-            ),
-            "pending={pending}: the opposite choice must write: {effects:?}"
-        );
-        assert!(
-            app.privacy_banner_acked.is_none(),
-            "pending={pending}: no local ack"
-        );
-    }
-}
-
 /// Already-out opt-out, from the banner or Settings, still writes: the local "out" may be the unconfirmed fail-safe default.
 #[test]
 fn already_out_opt_out_writes_and_acks_on_success() {
@@ -1087,73 +853,6 @@ fn settings_opt_out_does_not_reveal_banner_while_inflight() {
     );
     assert!(app.privacy_banner_acked.is_some(), "the reply acks");
     assert!(!app.privacy_banner_should_show());
-}
-
-/// The always-write opt-out starts with the unconfirmed fail-safe value as its rollback.
-/// An auth-meta refresh mid-flight replaces it: reverting to the snapshot on failure would show an opt-out the server never made.
-#[test]
-fn opt_out_failure_keeps_a_mid_flight_auth_meta_value() {
-    let mut app = privacy_banner_ready_app();
-    let _ = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
-    let seq = app.coding_data_write_seq;
-
-    app.apply_auth_meta(&xai_grok_login::AuthMeta {
-        coding_data_retention_opt_out: false,
-        ..Default::default()
-    });
-
-    let fail = dispatch(
-        Action::TaskComplete(TaskResult::CodingDataSharingFailed {
-            agent_id: AgentId(0),
-            error: "server error".into(),
-            seq,
-        }),
-        &mut app,
-    );
-
-    assert!(fail.is_empty());
-    assert!(
-        !app.coding_data_retention_opt_out,
-        "the refresh is newer than the click-time snapshot"
-    );
-}
-
-/// A superseded write's success becomes the rollback of the write that replaced it.
-/// Otherwise: pending opt-in, refresh restores the old "out", user opts out, opt-in succeeds (dropped as stale), opt-out
-/// fails and reverts to "out" while the server retains.
-#[test]
-fn superseded_opt_in_success_is_kept_when_later_opt_out_fails() {
-    let mut app = privacy_banner_ready_app();
-    let _ = dispatch(Action::SetCodingDataSharing { opted_in: true }, &mut app);
-    app.apply_auth_meta(&xai_grok_login::AuthMeta {
-        coding_data_retention_opt_out: true,
-        ..Default::default()
-    });
-    let _ = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
-    assert_eq!(app.coding_data_write_seq, 2);
-
-    let _ = dispatch(
-        Action::TaskComplete(TaskResult::CodingDataSharingUpdated {
-            agent_id: AgentId(0),
-            opted_in: true,
-            seq: 1,
-        }),
-        &mut app,
-    );
-    let _ = dispatch(
-        Action::TaskComplete(TaskResult::CodingDataSharingFailed {
-            agent_id: AgentId(0),
-            error: "server error".into(),
-            seq: 2,
-        }),
-        &mut app,
-    );
-
-    assert!(
-        !app.coding_data_retention_opt_out,
-        "the failed opt-out must fall back to the opt-in the server confirmed"
-    );
-    assert!(app.coding_data_pending_write.is_none());
 }
 
 /// A refused opt-out must not dismiss the banner: the server is still retaining, and the user has to see that.
@@ -1910,52 +1609,6 @@ fn session_usage_keeps_scroll_when_page_flip_off() {
     crate::appearance::cache::set_page_flip_on_send(prev);
 }
 
-#[test]
-fn show_usage_on_welcome_screen_is_noop() {
-    let mut app = test_app();
-    let effects = dispatch(Action::ShowUsage, &mut app);
-    assert!(
-        effects.is_empty(),
-        "ShowUsage with no active agent should be a no-op"
-    );
-}
-
-#[test]
-fn show_usage_with_redirect_url_fetches_session_only() {
-    // Redirect link is deferred until SessionUsageComplete (see billing tests).
-    let mut app = test_app_with_agent();
-    app.screen_mode = crate::app::ScreenMode::Minimal;
-    app.usage_billing_redirect_url = Some("https://billing.example.com/me".to_string());
-    let before = agent_scrollback_len(&app);
-    let effects = dispatch(Action::ShowUsage, &mut app);
-    assert!(
-        matches!(
-            effects.as_slice(),
-            [Effect::FetchSessionUsage { agent_id, .. }] if *agent_id == AgentId(0)
-        ),
-        "got: {effects:?}"
-    );
-    assert_eq!(agent_scrollback_len(&app), before);
-}
-
-#[test]
-fn minimal_update_notice_commits_a_system_block() {
-    let mut app = test_app_with_agent();
-    let before = agent_scrollback_len(&app);
-    commit_minimal_update_notice(&mut app, "9.9.9");
-    assert_eq!(agent_scrollback_len(&app), before + 1);
-    let text = last_system_text(&app, AgentId(0));
-    assert!(text.contains("Update available: v9.9.9"), "got: {text:?}");
-    assert!(text.contains("Restart to apply."), "got: {text:?}");
-}
-
-#[test]
-fn minimal_update_notice_no_active_agent_is_noop() {
-    let mut app = test_app();
-    // Must not panic and must not require an agent.
-    commit_minimal_update_notice(&mut app, "9.9.9");
-}
-
 /// `/tutorial` (and the palette entry) open the overlay; dispatching again while open toggles it closed.
 /// No side effects either way.
 #[test]
@@ -1982,43 +1635,6 @@ fn usage_modal_state(app: &AppView) -> &crate::views::usage_modal::UsageInfoModa
 }
 
 #[test]
-fn show_usage_opens_modal_on_usage_limit_tab_with_fetches() {
-    let mut app = test_app_with_agent();
-    let effects = dispatch(Action::ShowUsage, &mut app);
-    let state = usage_modal_state(&app);
-    assert_eq!(
-        state.active_tab,
-        crate::views::usage_modal::UsageInfoTab::UsageLimit
-    );
-    assert_eq!(state.ctx.session_id.as_deref(), Some("test-session"));
-    assert!(state.billing_loading);
-    assert!(
-        matches!(
-            effects.as_slice(),
-            [
-                Effect::ShowContextInfo { .. },
-                Effect::ShowSessionInfo { .. },
-                Effect::FetchSessionUsage { .. },
-                Effect::FetchBilling { silent: true, .. },
-            ]
-        ),
-        "got: {effects:?}"
-    );
-}
-
-#[test]
-fn show_context_info_retabs_open_modal_without_refetching() {
-    let mut app = test_app_with_agent();
-    dispatch(Action::ShowUsage, &mut app);
-    let effects = dispatch(Action::ShowContextInfo, &mut app);
-    assert!(effects.is_empty(), "got: {effects:?}");
-    assert_eq!(
-        usage_modal_state(&app).active_tab,
-        crate::views::usage_modal::UsageInfoTab::ContextUsage
-    );
-}
-
-#[test]
 fn show_session_info_opens_modal_on_session_tab() {
     let mut app = test_app_with_agent();
     dispatch(Action::ShowSessionInfo, &mut app);
@@ -2026,54 +1642,6 @@ fn show_session_info_opens_modal_on_session_tab() {
         usage_modal_state(&app).active_tab,
         crate::views::usage_modal::UsageInfoTab::SessionInfo
     );
-}
-
-#[test]
-fn usage_results_populate_open_modal_not_scrollback() {
-    let mut app = test_app_with_agent();
-    dispatch(Action::ShowUsage, &mut app);
-    let before = agent_scrollback_len(&app);
-
-    let nonce = current_usage_nonce(&app);
-    complete_session_usage(&mut app);
-    dispatch(
-        Action::TaskComplete(TaskResult::SessionInfoComplete {
-            agent_id: AgentId(0),
-            session_id: "test-session".into(),
-            info: Box::new(context_info_response()),
-            text: "  Session ID: test-session".to_string(),
-            fields: vec![crate::views::usage_modal::SessionInfoField {
-                label: "Session ID",
-                value: "test-session".to_string(),
-                compact: false,
-            }],
-            nonce,
-        }),
-        &mut app,
-    );
-    dispatch(
-        Action::TaskComplete(TaskResult::ContextInfoComplete {
-            agent_id: AgentId(0),
-            session_id: "test-session".into(),
-            info: Box::new(context_info_response()),
-            nonce,
-        }),
-        &mut app,
-    );
-
-    assert_eq!(agent_scrollback_len(&app), before);
-    let state = usage_modal_state(&app);
-    assert!(state.session_usage_text.is_some());
-    let fields = state
-        .session_fields
-        .as_ref()
-        .expect("session fields populated");
-    assert_eq!(fields.len(), 1);
-    let Some(field) = fields.first() else {
-        panic!("expected a session field: {fields:?}");
-    };
-    assert_eq!(field.value, "test-session");
-    assert!(state.context.is_some());
 }
 
 #[test]
@@ -2103,34 +1671,6 @@ fn usage_results_without_open_modal_are_dropped_in_full_mode() {
 }
 
 #[test]
-fn reply_from_previous_modal_open_is_dropped() {
-    let mut app = test_app_with_agent();
-    dispatch(Action::ShowUsage, &mut app);
-    let old_nonce = current_usage_nonce(&app);
-    // Close and reopen on the same session: a new fetch generation.
-    app.agents.get_mut(&AgentId(0)).unwrap().active_modal = None;
-    dispatch(Action::ShowUsage, &mut app);
-    assert_ne!(current_usage_nonce(&app), old_nonce);
-    // The first open's reply lands late; it must not populate the modal
-    dispatch(
-        Action::TaskComplete(TaskResult::SessionInfoComplete {
-            agent_id: AgentId(0),
-            session_id: "test-session".into(),
-            info: Box::new(context_info_response()),
-            text: "  Session ID: from-old-open".to_string(),
-            fields: vec![crate::views::usage_modal::SessionInfoField {
-                label: "Session ID",
-                value: "from-old-open".to_string(),
-                compact: false,
-            }],
-            nonce: old_nonce,
-        }),
-        &mut app,
-    );
-    assert!(usage_modal_state(&app).session_fields.is_none());
-}
-
-#[test]
 fn stale_session_info_does_not_populate_modal() {
     let mut app = test_app_with_agent();
     dispatch(Action::ShowSessionInfo, &mut app);
@@ -2151,32 +1691,4 @@ fn stale_session_info_does_not_populate_modal() {
         &mut app,
     );
     assert!(usage_modal_state(&app).session_fields.is_none());
-}
-
-#[test]
-fn fetch_failures_surface_in_open_modal() {
-    let mut app = test_app_with_agent();
-    dispatch(Action::ShowUsage, &mut app);
-    let nonce = current_usage_nonce(&app);
-    dispatch(
-        Action::TaskComplete(TaskResult::SessionInfoFailed {
-            agent_id: AgentId(0),
-            session_id: "test-session".into(),
-            error: "info boom".to_string(),
-            nonce,
-        }),
-        &mut app,
-    );
-    dispatch(
-        Action::TaskComplete(TaskResult::ContextInfoFailed {
-            agent_id: AgentId(0),
-            session_id: "test-session".into(),
-            error: "ctx boom".to_string(),
-            nonce,
-        }),
-        &mut app,
-    );
-    let state = usage_modal_state(&app);
-    assert_eq!(state.session_error.as_deref(), Some("info boom"));
-    assert_eq!(state.context_error.as_deref(), Some("ctx boom"));
 }

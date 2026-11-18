@@ -5089,23 +5089,6 @@ fn default_selected_permission_mouse_click_on_indicator_opens_picker_in_one_clic
     }
 }
 
-/// `/privacy` takes no arguments: it opens the settings page and nothing else. The alias parser it used to carry
-/// (`opt-in`, `share`, `out`, …) is gone. The ambiguous forms (`on`/`off`) risked landing on the opposite of the
-/// intent.
-#[test]
-fn pr9_privacy_slash_command_takes_no_arguments() {
-    use xai_grok_pager::slash::commands::builtin_commands;
-    use xai_grok_pager::slash::registry::CommandRegistry;
-
-    let reg = CommandRegistry::new(builtin_commands());
-    let cmd = reg.get("privacy").expect("/privacy must be registered");
-    assert!(
-        !cmd.takes_args(),
-        "/privacy must not advertise an argument slot"
-    );
-    assert_eq!(cmd.usage(), "/privacy");
-}
-
 /// `plan_mode` lives under the `Agent` section: pins the category against drift.
 #[test]
 fn pr10_plan_mode_renders_under_agent_category() {

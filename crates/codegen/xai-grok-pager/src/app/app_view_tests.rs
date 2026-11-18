@@ -295,12 +295,7 @@ pub(crate) fn test_app() -> AppView {
         usage_visible: true,
         has_external_auth_provider: false,
         backend_billed: false,
-        tier_restricted_commands: Vec::new(),
-        leader_mode: true,
-        credit_balance: None,
-        auto_topup: None,
         billing_poll_wanted: false,
-        leader_roster: Vec::new(),
         dashboard_local_sessions: Vec::new(),
         dashboard_sessions_loading: false,
         workspace_membership: Default::default(),
@@ -1638,10 +1633,6 @@ fn tick_demand_dashboard_fast_for_animated_roster_row() {
     let mut app = test_app();
     app.active_view = ActiveView::AgentDashboard;
     app.dashboard = Some(crate::views::dashboard::DashboardState::new());
-    assert!(
-        app.leader_mode,
-        "fixture: dashboard_roster() must read leader_roster"
-    );
     let entry = |activity| roster_entry("remote-1", activity);
     for (activity, expected) in [
         (RosterActivity::Dormant, TickDemand::None),
@@ -1651,14 +1642,14 @@ fn tick_demand_dashboard_fast_for_animated_roster_row() {
         (RosterActivity::Working, TickDemand::Fast),
         (RosterActivity::NeedsInput, TickDemand::Fast),
     ] {
-        app.leader_roster = vec![entry(activity)];
+        app.dashboard_local_sessions = vec![entry(activity)];
         assert_eq!(
             expected,
             painted_tick_demand(&mut app, &mut terminal),
             "{activity:?}"
         );
     }
-    app.leader_roster = vec![entry(RosterActivity::Working)];
+    app.dashboard_local_sessions = vec![entry(RosterActivity::Working)];
     app.workspace_dashboard_enabled = true;
     assert_eq!(
         TickDemand::None,
@@ -2085,97 +2076,6 @@ fn resize_event_closes_tip_show_gate_until_redraw() {
     assert!(agent.show_ephemeral_tip(tip(), &mut counts));
     assert_eq!(counts.get("t_seen"), Some(&2));
 }
-#[test]
-fn external_auth_provider_keeps_billing_off_after_auth_meta() {
-    let mut app = test_app();
-    app.has_external_auth_provider = true;
-    app.usage_visible = false;
-    app.apply_auth_meta(&xai_grok_login::AuthMeta::default());
-    assert!(!app.usage_visible);
-    assert!(app.tier_restricted_commands.is_empty());
-    assert!(
-        !app.welcome_prompt
-            .slash_controller
-            .registry()
-            .is_restricted("usage")
-    );
-    assert!(!app.welcome_prompt.slash_controller.usage_command_visible());
-}
-#[test]
-fn apply_auth_meta_disables_billing_surface_for_team_users() {
-    let mut app = test_app();
-    assert!(app.usage_visible);
-    let meta = xai_grok_login::AuthMeta {
-        team_id: Some("team-uuid".into()),
-        team_name: Some("Acme Corp".into()),
-        ..Default::default()
-    };
-    app.apply_auth_meta(&meta);
-    assert!(!app.usage_visible);
-    assert_eq!(app.team_id.as_deref(), Some("team-uuid"));
-    assert!(
-        !app.welcome_prompt
-            .slash_controller
-            .billing_surface_visible()
-    );
-}
-#[test]
-fn apply_auth_meta_enables_billing_surface_for_personal_users() {
-    let mut app = test_app();
-    app.usage_visible = false;
-    let meta = xai_grok_login::AuthMeta::default();
-    app.apply_auth_meta(&meta);
-    assert!(app.usage_visible);
-}
-#[test]
-fn apply_auth_meta_clears_api_key_flag_and_restores_billing_on_personal_login() {
-    let mut app = test_app();
-    app.is_api_key_auth = true;
-    app.usage_visible = false;
-    app.apply_auth_meta(&xai_grok_login::AuthMeta::default());
-    assert!(!app.is_api_key_auth);
-    assert!(app.usage_visible);
-}
-#[test]
-fn apply_auth_meta_api_key_enables_voice_and_skips_tier_gate() {
-    let mut app = test_app();
-    advertise_media_tools(&mut app);
-    assert!(!app.voice_mode_enabled);
-    app.apply_auth_meta(&xai_grok_login::AuthMeta {
-        auth_mode: Some("ApiKey".into()),
-        subscription_tier: Some("API Key".into()),
-        ..Default::default()
-    });
-    assert!(app.is_api_key_auth);
-    assert!(!app.usage_visible);
-    assert!(app.tier_restricted_commands.is_empty());
-    assert_tier_restricted_commands_present(&app);
-    assert!(!app.is_voice_tier_restricted());
-    assert!(app.voice_mode_enabled);
-    let mut app = test_app();
-    app.apply_auth_meta(&xai_grok_login::AuthMeta {
-        subscription_tier: Some("api_key".into()),
-        ..Default::default()
-    });
-    assert!(app.is_api_key_auth);
-    assert!(app.voice_mode_enabled);
-    assert!(app.tier_restricted_commands.is_empty());
-    app.apply_auth_meta(&xai_grok_login::AuthMeta {
-        auth_mode: Some("Oidc".into()),
-        subscription_tier: Some("Free".into()),
-        ..Default::default()
-    });
-    assert!(!app.is_api_key_auth);
-    assert!(!app.voice_mode_enabled);
-    assert!(app.usage_visible);
-    assert!(!app.tier_restricted_commands.is_empty());
-}
-fn expected_tier_restricted_commands() -> Vec<String> {
-    TIER_RESTRICTED_COMMANDS
-        .iter()
-        .map(|n| (*n).to_string())
-        .collect()
-}
 /// The present/absent assertions must exercise the deny list, not incidental fail-closed hiding:
 /// `/imagine`, `/imagine-video` are `required_tools()`-gated, so advertise their tools (otherwise the registry fail-closes them).
 /// `/voice` is fail-closed hidden until the remote flag turns it on, so reveal it via the registry directly.
@@ -2190,137 +2090,6 @@ fn advertise_media_tools(app: &mut AppView) {
                 .collect(),
         );
     app.welcome_prompt.set_voice_visible(true);
-}
-fn assert_tier_restricted_commands_absent(app: &AppView) {
-    let reg = app.welcome_prompt.slash_controller.registry();
-    for name in TIER_RESTRICTED_COMMANDS {
-        assert!(
-            reg.get(name).is_none(),
-            "/{name} must be denied on a restricted tier"
-        );
-    }
-    assert!(reg.get("cost").is_none(), "/cost alias must be denied");
-}
-fn assert_tier_restricted_commands_present(app: &AppView) {
-    let reg = app.welcome_prompt.slash_controller.registry();
-    for name in TIER_RESTRICTED_COMMANDS {
-        assert!(
-            reg.get(name).is_some(),
-            "/{name} must be available when not tier-restricted (tools advertised)"
-        );
-    }
-}
-#[test]
-fn apply_auth_meta_restricts_usage_for_free_tier() {
-    let mut app = test_app();
-    advertise_media_tools(&mut app);
-    app.apply_auth_meta(&xai_grok_login::AuthMeta::default());
-    assert_eq!(
-        app.tier_restricted_commands,
-        expected_tier_restricted_commands()
-    );
-    assert_tier_restricted_commands_absent(&app);
-    assert!(app.usage_visible);
-}
-#[test]
-fn apply_auth_meta_restricts_usage_for_x_basic_tier() {
-    let mut app = test_app();
-    advertise_media_tools(&mut app);
-    let meta = xai_grok_login::AuthMeta {
-        subscription_tier: Some("X Basic".into()),
-        ..Default::default()
-    };
-    app.apply_auth_meta(&meta);
-    assert_eq!(
-        app.tier_restricted_commands,
-        expected_tier_restricted_commands()
-    );
-    assert_tier_restricted_commands_absent(&app);
-}
-#[test]
-fn apply_auth_meta_lifts_restrictions_for_paid_tiers_and_teams() {
-    let mut app = test_app();
-    advertise_media_tools(&mut app);
-    let meta = xai_grok_login::AuthMeta {
-        subscription_tier: Some("SuperGrok".into()),
-        ..Default::default()
-    };
-    app.apply_auth_meta(&meta);
-    assert!(app.tier_restricted_commands.is_empty());
-    assert_tier_restricted_commands_present(&app);
-    let mut app = test_app();
-    advertise_media_tools(&mut app);
-    app.apply_auth_meta(&xai_grok_login::AuthMeta::default());
-    assert!(!app.tier_restricted_commands.is_empty());
-    app.subscription_tier = Some("SuperGrok".into());
-    app.apply_tier_restrictions();
-    assert!(app.tier_restricted_commands.is_empty());
-    assert_tier_restricted_commands_present(&app);
-    let mut app = test_app();
-    let meta = xai_grok_login::AuthMeta {
-        team_id: Some("team-uuid".into()),
-        team_name: Some("Acme Corp".into()),
-        ..Default::default()
-    };
-    app.apply_auth_meta(&meta);
-    assert!(app.tier_restricted_commands.is_empty());
-}
-#[test]
-fn is_restricted_tier_classification() {
-    assert!(is_restricted_tier(None));
-    assert!(is_restricted_tier(Some("")));
-    assert!(is_restricted_tier(Some("Free")));
-    assert!(is_restricted_tier(Some("X Basic")));
-    assert!(is_restricted_tier(Some("x_basic")));
-    assert!(!is_restricted_tier(Some("SuperGrok")));
-    assert!(!is_restricted_tier(Some("SuperGrok Heavy")));
-    assert!(!is_restricted_tier(Some("X Premium")));
-    assert!(!is_restricted_tier(Some("X Premium+")));
-    assert!(!is_restricted_tier(Some("SomeFutureTier")));
-}
-#[test]
-fn is_voice_tier_restricted_tracks_tier() {
-    let mut app = test_app();
-    app.apply_auth_meta(&xai_grok_login::AuthMeta::default());
-    assert!(app.is_voice_tier_restricted());
-    let mut app = test_app();
-    let meta = xai_grok_login::AuthMeta {
-        subscription_tier: Some("SuperGrok".into()),
-        ..Default::default()
-    };
-    app.apply_auth_meta(&meta);
-    assert!(!app.is_voice_tier_restricted());
-}
-#[test]
-fn apply_auth_meta_clears_gate_on_subscription() {
-    let mut app = test_app();
-    app.gate = Some(xai_grok_login::GateInfo {
-        message: "Subscribe to use Grok Build".into(),
-        url: Some("https://grok.com/supergrok?referrer=grok-build".into()),
-        label: None,
-    });
-    assert!(app.is_access_blocked());
-    let meta = xai_grok_login::AuthMeta::default();
-    app.apply_auth_meta(&meta);
-    assert!(app.gate.is_none());
-    assert!(app.has_access());
-}
-#[test]
-fn apply_auth_meta_gate_unchanged_when_still_gated() {
-    let mut app = test_app();
-    let gate = xai_grok_login::GateInfo {
-        message: "Subscribe".into(),
-        url: None,
-        label: None,
-    };
-    app.gate = Some(gate.clone());
-    let meta = xai_grok_login::AuthMeta {
-        gate: Some(gate),
-        ..Default::default()
-    };
-    app.apply_auth_meta(&meta);
-    assert!(app.gate.is_some());
-    assert!(app.is_access_blocked());
 }
 #[test]
 fn welcome_ctrl_q_requires_confirmation() {
@@ -3262,27 +3031,6 @@ fn menu_action_indices_with_import_and_changelog() {
         dispatch_menu_action(4, true, true, md),
         InputOutcome::Action(Action::Quit)
     ));
-}
-#[test]
-fn welcome_pending_ctrl_c_quits_instantly() {
-    let mut app = test_app();
-    app.auth_state = AuthState::Pending { error: None };
-    let outcome = app.handle_input(&ctrl_c());
-    assert!(matches!(outcome, InputOutcome::Action(Action::Quit)));
-    assert!(app.pending_action.is_none());
-}
-#[test]
-fn welcome_authenticating_ctrl_c_quits_instantly() {
-    let mut app = test_app();
-    app.auth_state = AuthState::Authenticating {
-        request_seq: 1,
-        handle: None,
-        auth_url: None,
-        mode: AuthMode::Command,
-    };
-    let outcome = app.handle_input(&ctrl_c());
-    assert!(matches!(outcome, InputOutcome::Action(Action::Quit)));
-    assert!(app.pending_action.is_none());
 }
 #[test]
 fn page_keys_from_prompt_page_conversation_without_mutating_prompt() {
@@ -4819,22 +4567,6 @@ fn prompt_focused_bare_text_chars_promote_no_action() {
     }
 }
 #[test]
-fn welcome_pending_l_triggers_login() {
-    let mut app = test_app();
-    app.auth_state = AuthState::Pending { error: None };
-    app.welcome_prompt_focused = false;
-    let outcome = app.handle_input(&key_event(KeyCode::Char('l'), KeyModifiers::NONE));
-    assert!(matches!(outcome, InputOutcome::Action(Action::Login)));
-}
-#[test]
-fn welcome_pending_enter_triggers_login() {
-    let mut app = test_app();
-    app.auth_state = AuthState::Pending { error: None };
-    app.welcome_prompt_focused = false;
-    let outcome = app.handle_input(&key_event(KeyCode::Enter, KeyModifiers::NONE));
-    assert!(matches!(outcome, InputOutcome::Action(Action::Login)));
-}
-#[test]
 fn welcome_pending_n_is_unchanged() {
     let mut app = test_app();
     app.auth_state = AuthState::Pending { error: None };
@@ -5012,47 +4744,6 @@ fn worktree_dialog_paste_is_scoped_away_from_welcome_prompt() {
     assert_eq!(app.new_worktree_dialog.as_ref().unwrap().label(), "a中b");
     assert!(app.welcome_prompt.text().is_empty());
 }
-#[test]
-fn authenticating_loopback_esc_quits() {
-    let mut app = test_app();
-    app.auth_state = AuthState::Authenticating {
-        request_seq: 1,
-        handle: None,
-        auth_url: None,
-        mode: AuthMode::Loopback,
-    };
-    let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
-    assert!(matches!(outcome, InputOutcome::Action(Action::Quit)));
-}
-#[test]
-fn authenticating_command_esc_quits() {
-    let mut app = test_app();
-    app.auth_state = AuthState::Authenticating {
-        request_seq: 1,
-        handle: None,
-        auth_url: None,
-        mode: AuthMode::Command,
-    };
-    let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
-    assert!(matches!(outcome, InputOutcome::Action(Action::Quit)));
-}
-/// Regression (user report): 'q' must type into the auth-code input, not quit.
-#[test]
-fn authenticating_loopback_q_types_into_code_input() {
-    let mut app = test_app();
-    app.auth_state = AuthState::Authenticating {
-        request_seq: 1,
-        handle: None,
-        auth_url: None,
-        mode: AuthMode::Loopback,
-    };
-    let outcome = app.handle_input(&key_event(KeyCode::Char('q'), KeyModifiers::NONE));
-    assert!(
-        matches!(outcome, InputOutcome::Changed),
-        "typing 'q' must edit the auth code input, got {outcome:?}"
-    );
-    assert_eq!(app.auth_code_input.text(), "q");
-}
 /// Users reflex-type the displayed device code; bare 'q' must not abort.
 #[test]
 fn authenticating_device_and_command_q_does_not_quit() {
@@ -5069,59 +4760,6 @@ fn authenticating_device_and_command_q_does_not_quit() {
             matches!(outcome, InputOutcome::Unchanged),
             "bare 'q' must not quit during {mode:?} auth, got {outcome:?}"
         );
-    }
-}
-/// Advertised cancel keys must survive the bare-'q' removal.
-#[test]
-fn authenticating_advertised_cancel_keys_still_quit() {
-    for mode in [AuthMode::Loopback, AuthMode::Device, AuthMode::Command] {
-        for (code, mods) in [
-            (KeyCode::Char('q'), KeyModifiers::CONTROL),
-            (KeyCode::Char('c'), KeyModifiers::CONTROL),
-            (KeyCode::Esc, KeyModifiers::NONE),
-        ] {
-            let mut app = test_app();
-            app.auth_state = AuthState::Authenticating {
-                request_seq: 1,
-                handle: None,
-                auth_url: None,
-                mode,
-            };
-            let outcome = app.handle_input(&key_event(code, mods));
-            assert!(
-                matches!(outcome, InputOutcome::Action(Action::Quit)),
-                "{code:?}+{mods:?} must still quit during {mode:?} auth, got {outcome:?}"
-            );
-        }
-    }
-}
-#[test]
-fn authenticating_loopback_char_mutates_input() {
-    let mut app = test_app();
-    app.auth_state = AuthState::Authenticating {
-        request_seq: 1,
-        handle: None,
-        auth_url: None,
-        mode: AuthMode::Loopback,
-    };
-    let outcome = app.handle_input(&key_event(KeyCode::Char('a'), KeyModifiers::NONE));
-    assert!(matches!(outcome, InputOutcome::Changed));
-    assert_eq!(app.auth_code_input.text(), "a");
-}
-#[test]
-fn authenticating_loopback_readline_control_chords_are_ignored() {
-    for code in [KeyCode::Char('u'), KeyCode::Char('d')] {
-        let mut app = test_app();
-        app.auth_state = AuthState::Authenticating {
-            request_seq: 1,
-            handle: None,
-            auth_url: None,
-            mode: AuthMode::Loopback,
-        };
-        app.auth_code_input.set_text("token");
-        let outcome = app.handle_input(&key_event(code, KeyModifiers::CONTROL));
-        assert!(matches!(outcome, InputOutcome::Changed));
-        assert_eq!(app.auth_code_input.text(), "token");
     }
 }
 #[cfg(target_os = "windows")]
@@ -5142,69 +4780,6 @@ fn authenticating_loopback_altgr_char_mutates_input() {
     assert_eq!(app.auth_code_input.text(), "@");
 }
 #[test]
-fn authenticating_loopback_backspace_removes_char() {
-    let mut app = test_app();
-    app.auth_state = AuthState::Authenticating {
-        request_seq: 1,
-        handle: None,
-        auth_url: None,
-        mode: AuthMode::Loopback,
-    };
-    app.auth_code_input.set_text("ab");
-    let outcome = app.handle_input(&key_event(KeyCode::Backspace, KeyModifiers::NONE));
-    assert!(matches!(outcome, InputOutcome::Changed));
-    assert_eq!(app.auth_code_input.text(), "a");
-}
-#[test]
-fn authenticating_loopback_paste_appends_text() {
-    let mut app = test_app();
-    app.auth_state = AuthState::Authenticating {
-        request_seq: 1,
-        handle: None,
-        auth_url: None,
-        mode: AuthMode::Loopback,
-    };
-    app.auth_code_input.set_text("tok");
-    let outcome = app.handle_input(&Event::Paste("en_value".to_string()));
-    assert!(matches!(outcome, InputOutcome::Changed));
-    assert_eq!(app.auth_code_input.text(), "token_value");
-}
-#[test]
-fn authenticating_loopback_cursor_edit_and_paste_stay_scoped() {
-    let mut app = test_app();
-    app.auth_state = AuthState::Authenticating {
-        request_seq: 1,
-        handle: None,
-        auth_url: None,
-        mode: AuthMode::Loopback,
-    };
-    app.auth_code_input.set_text("ab");
-    let _ = app.handle_input(&key_event(KeyCode::Left, KeyModifiers::NONE));
-    let _ = app.handle_input(&Event::Paste("中\r\n".to_owned()));
-    assert_eq!(app.auth_code_input.text(), "a中b");
-    assert!(app.welcome_prompt.text().is_empty());
-    let _ = app.handle_input(&key_event(KeyCode::Delete, KeyModifiers::NONE));
-    assert_eq!(app.auth_code_input.text(), "a中");
-}
-#[test]
-fn authenticating_loopback_uses_canonical_super_v_paste() {
-    let mut app = test_app();
-    app.auth_state = AuthState::Authenticating {
-        request_seq: 1,
-        handle: None,
-        auth_url: None,
-        mode: AuthMode::Loopback,
-    };
-    crate::clipboard::set_clipboard_probe_hook(crate::clipboard::ClipboardProbeHook::no_raster(
-        Some("secret\r\n"),
-    ));
-    let outcome = app.handle_input(&key_event(KeyCode::Char('v'), KeyModifiers::SUPER));
-    crate::clipboard::clear_clipboard_probe_hook();
-    assert!(matches!(outcome, InputOutcome::Changed));
-    assert_eq!(app.auth_code_input.text(), "secret");
-    assert!(app.welcome_prompt.text().is_empty());
-}
-#[test]
 fn authenticating_loopback_enter_empty_is_noop() {
     let mut app = test_app();
     app.auth_state = AuthState::Authenticating {
@@ -5216,24 +4791,6 @@ fn authenticating_loopback_enter_empty_is_noop() {
     app.auth_code_input.set_text("   ");
     let outcome = app.handle_input(&key_event(KeyCode::Enter, KeyModifiers::NONE));
     assert!(matches!(outcome, InputOutcome::Unchanged));
-}
-#[test]
-fn authenticating_loopback_enter_with_content_submits() {
-    let mut app = test_app();
-    app.auth_state = AuthState::Authenticating {
-        request_seq: 1,
-        handle: None,
-        auth_url: None,
-        mode: AuthMode::Loopback,
-    };
-    app.auth_code_input.set_text(" token123 ");
-    let outcome = app.handle_input(&key_event(KeyCode::Enter, KeyModifiers::NONE));
-    match outcome {
-        InputOutcome::Action(Action::SubmitAuthCode(code)) => {
-            assert_eq!(code, "token123");
-        }
-        other => panic!("expected SubmitAuthCode, got {:?}", other),
-    }
 }
 /// A bare `Moved` after a press means the release was lost: the press must end, never promote into a selection.
 #[test]
@@ -5816,33 +5373,6 @@ fn dashboard_shortcuts_modal_is_scroll_blocking() {
         "wheel must not reach the background scroll path while the cheatsheet is open",
     );
 }
-#[test]
-fn dashboard_usage_modal_is_scroll_blocking() {
-    use crate::views::usage_modal::{UsageInfoContext, UsageInfoModalState, UsageInfoTab};
-    let mut app = test_app();
-    app.active_view = ActiveView::AgentDashboard;
-    let mut d = crate::views::dashboard::DashboardState::new();
-    d.usage_modal = Some(Box::new(UsageInfoModalState::new(
-        UsageInfoTab::UsageLimit,
-        UsageInfoContext {
-            session_id: None,
-            usage_visible: true,
-            chat_kind: false,
-            billing_redirect_url: None,
-            subscription_tier: None,
-        },
-    )));
-    app.dashboard = Some(d);
-    assert!(
-        app.is_scroll_blocking_modal_open(),
-        "an open dashboard usage modal must block background scroll",
-    );
-    let _ = app.handle_input(&scroll_event(MouseEventKind::ScrollDown, 42, 17));
-    assert!(
-        app.last_scroll_pos.is_none(),
-        "wheel must not reach the background scroll path while the usage modal is open",
-    );
-}
 /// Ctrl+C on the session-less dashboard arms the quit confirmation (like the agent view) and a second press confirms.
 /// Regression for "Ctrl+C/D/Q do nothing on the dashboard prompt".
 #[test]
@@ -6111,7 +5641,6 @@ fn dashboard_picker_esc_after_search_click_restores_the_selection() {
         },
         Some(surface),
         false,
-        None,
         None,
     );
     let overlay = theme.selection_overlay();
@@ -8165,7 +7694,6 @@ fn welcome_ctrl_e_ignored_when_zdr_blocked() {
 #[test]
 fn popup_dashboard_button_dismisses_the_popup_not_the_dashboard() {
     let mut app = test_app_with_agent();
-    app.leader_mode = false;
     let id = attach_popup(&mut app);
     if let Some(agent) = app.agents.get_mut(&id) {
         agent

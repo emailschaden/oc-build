@@ -1,4 +1,4 @@
-use super::{ConnectAttempt, Context, EarlierAttempt, Reason, StartupFailure};
+use super::{Reason, StartupFailure};
 use crate::app::connect_timeout::CONNECT_UI_TIMEOUT_TRY_COMMAND;
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -7,16 +7,14 @@ const WRAP_WIDTH: usize = 76;
 pub(super) fn render(failure: &StartupFailure) -> String {
     let context = &failure.context;
     let mut rows = vec![
-        ("Mode", attempted_agents(context)),
+        ("Mode", agent_name(context.target).to_owned()),
         ("Version", context.version.clone()),
     ];
     let mut report = match &failure.reason {
         Reason::TimedOut { waited, timings } => {
-            let advice = advice_for(timings, context.attempt);
+            let advice = advice_for(timings);
             rows.push(("Steps", format_steps(timings)));
-            if let Some(command) = advice.next_step.command() {
-                rows.push(("Try", command.to_owned()));
-            }
+            rows.push(("Try", CONNECT_UI_TIMEOUT_TRY_COMMAND.to_owned()));
             let explanation = fill_indented(&advice.explanation(), "  ", "  ");
             format!(
                 "Couldn't start Grok: startup timed out after {}.\n\n{explanation}",
@@ -36,21 +34,13 @@ pub(super) fn render(failure: &StartupFailure) -> String {
 }
 struct Advice {
     doing: Option<&'static str>,
-    earlier: Option<EarlierAttempt>,
     next_step: NextStep,
 }
-/// A wedged leader is only ever the earlier attempt: the fallback that renders this message never enters `LeaderConnect` itself.
-fn advice_for(timings: &PhaseSnapshot, attempt: ConnectAttempt) -> Advice {
+fn advice_for(timings: &PhaseSnapshot) -> Advice {
     let step = timings.longest_step().map(step_advice);
-    let earlier = attempt.earlier();
     Advice {
         doing: step.map(|(doing, _)| doing),
-        earlier: earlier.filter(|earlier| earlier.shaped_the_wait()),
-        next_step: if earlier.is_some_and(|earlier| earlier.wedged_leader()) {
-            NextStep::RestartSharedLeader
-        } else {
-            step.map_or(NextStep::Retry, |(_, next_step)| next_step)
-        },
+        next_step: step.map_or(NextStep::Retry, |(_, next_step)| next_step),
     }
 }
 impl Advice {
@@ -59,25 +49,12 @@ impl Advice {
             Some(doing) => format!("The longest step was {doing}."),
             None => "No startup step had begun.".to_owned(),
         };
-        if let Some(earlier) = self.earlier {
-            let target = agent_name(earlier.target);
-            let _ = write!(
-                explanation,
-                " Grok spent the first {} on the {target}.",
-                whole_seconds(earlier.wait)
-            );
-        }
-        let _ = write!(explanation, " {}", self.next_step.text());
-        if matches!(
-            self.next_step,
-            NextStep::Retry | NextStep::CheckNetworkThenRetry
-        ) {
-            let _ = write!(
-                explanation,
-                " On a slow machine or network filesystem, a larger startup \
-                 budget can help. Set it with the command below."
-            );
-        }
+        let _ = write!(
+            explanation,
+            " {} On a slow machine or network filesystem, a larger startup \
+             budget can help. Set it with the command below.",
+            self.next_step.text()
+        );
         explanation
     }
 }
@@ -132,50 +109,29 @@ fn fill_indented(text: &str, initial_indent: &str, subsequent_indent: &str) -> S
 enum NextStep {
     Retry,
     CheckNetworkThenRetry,
-    RestartSharedLeader,
 }
 impl NextStep {
     fn text(self) -> &'static str {
         match self {
             Self::Retry => "Start Grok again.",
             Self::CheckNetworkThenRetry => "Check your network connection, then start Grok again.",
-            Self::RestartSharedLeader => {
-                "Stop it with the command below, which also stops any other Grok \
-                 session using it, then start Grok again."
-            }
-        }
-    }
-    /// Kept out of the prose so wrapping can never split it.
-    fn command(self) -> Option<&'static str> {
-        match self {
-            Self::Retry | Self::CheckNetworkThenRetry => Some(CONNECT_UI_TIMEOUT_TRY_COMMAND),
-            Self::RestartSharedLeader => Some("grok leader kill"),
         }
     }
 }
 /// Reads as the object of "The longest step was".
 fn step_advice(phase: StartupPhase) -> (&'static str, NextStep) {
-    use NextStep::{CheckNetworkThenRetry as Network, RestartSharedLeader, Retry};
+    use NextStep::{CheckNetworkThenRetry as Network, Retry};
     match phase {
         StartupPhase::ConfigLoad => ("reading your local configuration", Retry),
         StartupPhase::ManagedPolicy => ("checking your organization's managed policy", Network),
         StartupPhase::Bootstrap => ("loading your account settings", Network),
         StartupPhase::ModelCatalog => ("reading the list of available models", Retry),
         StartupPhase::WorkerSpawn => ("starting the local agent", Retry),
-        StartupPhase::LeaderConnect => ("connecting to the shared leader", RestartSharedLeader),
+        StartupPhase::LeaderConnect => ("connecting to the shared leader", Retry),
         StartupPhase::AcpInitialize => ("waiting for the agent to respond", Retry),
         StartupPhase::EagerAuth => ("refreshing your sign-in", Network),
         StartupPhase::AppInit => ("preparing the interface", Retry),
         StartupPhase::SessionCreate => ("creating the session", Retry),
-    }
-}
-fn attempted_agents(context: &Context) -> String {
-    let target = agent_name(context.target);
-    match context.attempt {
-        ConnectAttempt::First => target.to_owned(),
-        ConnectAttempt::AfterFallback(earlier) => {
-            format!("{}, then {target}", agent_name(earlier.target))
-        }
     }
 }
 fn agent_name(agent: AgentKind) -> &'static str {

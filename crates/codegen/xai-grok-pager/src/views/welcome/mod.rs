@@ -729,9 +729,6 @@ pub struct WelcomeRenderParams<'a> {
     /// Live working directory (tracks `Effect::SetWorkingDir`), used to pin the current repo's session group to the top of the picker.
     pub cwd: &'a std::path::Path,
     /// App-level credit balance for showing the usage warning on the welcome screen.
-    pub credit_balance: Option<&'a crate::views::credit_bar::CreditBalance>,
-    /// Auto top-up rule paired with `credit_balance` for the welcome warning.
-    pub auto_topup: Option<&'a crate::views::credit_bar::AutoTopupInfo>,
     /// Whether the consumer billing UI applies (false for team / API-key, which get no credit warning).
     pub usage_visible: bool,
     /// Cached changelog bullets for the welcome screen (up to 3).
@@ -801,8 +798,6 @@ pub fn render_welcome(
                 model_name: params.model_name,
                 flags: params.flags,
                 multiline: false,
-                usage_warning: None,
-                usage_warning_critical: false,
             };
             let (menu_rects, post_flush_escapes) = render_welcome_blocked(
                 content_area,
@@ -2243,19 +2238,10 @@ fn render_welcome_done(
                 .render(tip_inset, buf);
         }
 
-        let warning = p.credit_balance.and_then(|bal| {
-            crate::views::credit_bar::usage_warning(bal, p.auto_topup, p.usage_visible)
-        });
-        let (usage_warning_text, usage_warning_critical) = match warning {
-            Some((text, critical)) => (Some(text), critical),
-            None => (None, false),
-        };
         let usage_info = PromptInfo {
             model_name: p.model_name,
             flags: p.flags,
             multiline: false,
-            usage_warning: usage_warning_text.as_deref(),
-            usage_warning_critical,
         };
 
         if let Some(notice) = p.model_notice {
@@ -2922,8 +2908,6 @@ mod tests {
             session_picker_pending_delete: false,
             chat_mode: false,
             cwd: std::path::Path::new("/repo"),
-            credit_balance: None,
-            auto_topup: None,
             usage_visible: true,
             changelog_bullets: &[],
             changelog_has_full_notes: false,
